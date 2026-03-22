@@ -7,19 +7,28 @@ Design intent:
 - Snapshot may be overwritten for the SAME run_id (intentional).
 - Used to prevent stale dashboards and cross-run contamination.
 
+Eviction:
+- Maximum _STORE_MAX_SIZE snapshots kept in memory.
+- Oldest entry (FIFO) evicted when capacity is reached.
+- Prevents unbounded memory growth on servers that process many uploads.
+
 Scope:
 - Single-process / lab / SOC simulation use.
 - NOT thread-safe or multi-worker safe by design.
 - In production, replace with Redis / task-result store.
 """
 
-from typing import Dict, Optional
+import threading
+from typing import Dict, List, Optional
 
 # -------------------------------------------------------------------
 # Internal store
 # -------------------------------------------------------------------
 
-_ANALYSIS_STORE: Dict[str, dict] = {}  # { run_id: analysis_context }
+_ANALYSIS_STORE: Dict[str, dict] = {}   # { run_id: analysis_context }
+_STORE_ORDER:    List[str]        = []   # insertion-order list for FIFO eviction
+_STORE_LOCK      = threading.Lock()      # protects both store and order list
+_STORE_MAX_SIZE  = 20                    # max snapshots in memory before eviction
 
 
 # -------------------------------------------------------------------
@@ -32,15 +41,24 @@ def set_analysis_snapshot(run_id: str, snapshot: dict) -> None:
 
     Behavior:
     - Overwrites snapshot if the same run_id is reused.
-    - This is intentional: dashboard is the single source of truth.
+    - Evicts the oldest snapshot (FIFO) when over capacity.
     """
-    if not run_id:
+    if not run_id or snapshot is None:
         return
 
-    if snapshot is None:
-        return
+    with _STORE_LOCK:
+        # If it's a new run_id and we're at capacity, evict the oldest
+        if run_id not in _ANALYSIS_STORE and len(_ANALYSIS_STORE) >= _STORE_MAX_SIZE:
+            if _STORE_ORDER:
+                oldest = _STORE_ORDER.pop(0)
+                _ANALYSIS_STORE.pop(oldest, None)
 
-    _ANALYSIS_STORE[run_id] = snapshot
+        _ANALYSIS_STORE[run_id] = snapshot
+
+        # Maintain insertion order (re-inserting moves to end)
+        if run_id in _STORE_ORDER:
+            _STORE_ORDER.remove(run_id)
+        _STORE_ORDER.append(run_id)
 
 
 def get_analysis_snapshot(run_id: str) -> Optional[dict]:
@@ -53,8 +71,8 @@ def get_analysis_snapshot(run_id: str) -> Optional[dict]:
     """
     if not run_id:
         return None
-
-    return _ANALYSIS_STORE.get(run_id)
+    with _STORE_LOCK:
+        return _ANALYSIS_STORE.get(run_id)
 
 
 def clear_analysis_snapshot(run_id: Optional[str] = None, *, clear_all: bool = False) -> None:
@@ -64,29 +82,29 @@ def clear_analysis_snapshot(run_id: Optional[str] = None, *, clear_all: bool = F
     Modes:
     - run_id provided → clears only that run's snapshot
     - clear_all=True  → clears ALL snapshots (explicit only)
-
-    Safety:
-    - Global wipe requires explicit clear_all=True
-    - Prevents accidental cross-session destruction
     """
-    if run_id:
-        _ANALYSIS_STORE.pop(run_id, None)
-        return
+    with _STORE_LOCK:
+        if run_id:
+            _ANALYSIS_STORE.pop(run_id, None)
+            if run_id in _STORE_ORDER:
+                _STORE_ORDER.remove(run_id)
+            return
 
-    if clear_all:
-        _ANALYSIS_STORE.clear()
+        if clear_all:
+            _ANALYSIS_STORE.clear()
+            _STORE_ORDER.clear()
 
 
 # -------------------------------------------------------------------
-# Diagnostics / Debug (optional but useful)
+# Diagnostics / Debug
 # -------------------------------------------------------------------
 
 def _debug_cache_state() -> dict:
-    """
-    INTERNAL USE ONLY.
-    Returns cache metadata for debugging.
-    """
-    return {
-        "total_runs": len(_ANALYSIS_STORE),
-        "run_ids": list(_ANALYSIS_STORE.keys()),
-    }
+    """INTERNAL USE ONLY. Returns cache metadata for debugging."""
+    with _STORE_LOCK:
+        return {
+            "total_runs":  len(_ANALYSIS_STORE),
+            "max_size":    _STORE_MAX_SIZE,
+            "run_ids":     list(_ANALYSIS_STORE.keys()),
+            "evict_order": list(_STORE_ORDER),
+        }

@@ -7,19 +7,6 @@ Real correlation:
   - Temporal decay for distant events
   - Automatic campaign persistence
   - Human-readable campaign narratives
-
-FIXES applied (v2.1):
-  1. _cross_signal_amplify was dead code trapped after the return in
-     _apply_direction_score. Separated into its own static method and
-     called correctly in build_edges().
-  2. is_anchor added to EventNode — anchors require confidence>=70,
-     injection, persistence, network, OR high-risk EIDs. Used to
-     strengthen cross-signal amplification for anchor-anchor edges.
-  3. process_reuse edge type added — catches same-image reuse by same
-     user (e.g. powershell.exe called multiple times in campaign).
-  4. _cross_signal_amplify now counts 4 shared signals (injection,
-     network, persistence, high-stage) and scales up to 2.0×.
-  5. Adaptive threshold: scales with node count (30-45) instead of flat 0.50.
 """
 
 from __future__ import annotations
@@ -55,6 +42,8 @@ KILL_CHAIN_ORDER = [
 
 _KC_INDEX: Dict[str, int] = {k: i for i, k in enumerate(KILL_CHAIN_ORDER)}
 
+# Chain depth → confidence multiplier
+# 1 stage = 1.0×, 2 stages = 1.5×, 3 stages = 2.5×, 4+ = 4.0×
 _CHAIN_MULTIPLIERS = [1.0, 1.0, 1.5, 2.5, 4.0]
 
 
@@ -70,29 +59,19 @@ def _higher_stage(a: Optional[str], b: Optional[str]) -> str:
 # Temporal decay
 # ---------------------------------------------------------------------------
 
-DECAY_TAU_SECONDS = 1800
-FORWARD_KC_BONUS  = 0.20
-BACKWARD_KC_PENALTY = 0.30
+DECAY_TAU_SECONDS    = 1800   # Half-life ≈ 30 minutes
+EDGE_WEIGHT_THRESHOLD = 0.50  # Raised from 0.30 → tighter clustering.
+                               # At 0.30 a single temporal coincidence 29 minutes
+                               # apart could merge unrelated clusters.
+                               # At 0.50 we only link events within ~20 minutes
+                               # that also share structural or cross-signal evidence.
+FORWARD_KC_BONUS     = 0.20   # Weight boost for edges that advance kill-chain stage
+BACKWARD_KC_PENALTY  = 0.30   # Weight penalty for edges that go backward (anomalous)
 
 
 def _temporal_weight(delta_seconds: float) -> float:
+    """Exponential decay: weight → 0 as events grow apart."""
     return math.exp(-abs(delta_seconds) / DECAY_TAU_SECONDS)
-
-
-def _adaptive_threshold(node_count: int) -> float:
-    """
-    FIX: adaptive threshold scales with dataset size instead of flat 0.50.
-    Small datasets (few nodes) get a lower threshold so legitimate short
-    campaigns still get linked. Large datasets get a higher threshold to
-    prevent noise clusters.
-    """
-    if node_count < 20:
-        return 0.30
-    elif node_count < 100:
-        return 0.35
-    elif node_count < 500:
-        return 0.40
-    return 0.45
 
 
 # ---------------------------------------------------------------------------
@@ -100,36 +79,26 @@ def _adaptive_threshold(node_count: int) -> float:
 # ---------------------------------------------------------------------------
 
 class EventNode:
+    """Lightweight wrapper around a parsed event dict for graph operations."""
+
     __slots__ = (
         "uid", "image", "parent_image", "computer", "user",
         "kill_chain_stage", "confidence", "ts", "event_id",
-        "has_network", "has_persistence", "has_injection", "is_anchor",
+        "has_network", "has_persistence", "has_injection",
     )
 
     def __init__(self, event: Dict[str, Any]):
-        self.uid              = event.get("event_uid") or event.get("burst_id") or str(uuid.uuid4().hex[:8])
-        self.image            = (event.get("image") or "unknown").lower()
-        self.parent_image     = (event.get("parent_image") or "").lower()
-        self.computer         = (event.get("computer") or "unknown_host").lower()
-        self.user             = (event.get("user") or "").upper()
+        self.uid             = event.get("event_uid") or event.get("burst_id") or str(uuid.uuid4().hex[:8])
+        self.image           = (event.get("image") or "unknown").lower()
+        self.parent_image    = (event.get("parent_image") or "").lower()
+        self.computer        = (event.get("computer") or "unknown_host").lower()
+        self.user            = (event.get("user") or "").upper()
         self.kill_chain_stage = event.get("kill_chain_stage") or "Background"
-        self.confidence       = float(event.get("confidence_score") or event.get("risk_score") or 0.0)
-        self.has_network      = bool(event.get("has_net") or event.get("destination_ip"))
-        self.has_persistence  = bool(event.get("has_persistence"))
-        self.has_injection    = bool(event.get("has_injection"))
-        self.event_id         = int(event.get("event_id") or 0)
-
-        # FIX: is_anchor captures high-value events that should strongly
-        # attract correlation edges. Broader than just confidence score.
-        self.is_anchor = any([
-            self.confidence >= 70,
-            self.has_injection,
-            self.has_persistence,
-            self.has_network,
-            self.event_id in {8, 9, 10, 25},
-            self.image in {"powershell.exe", "cmd.exe", "wscript.exe",
-                           "cscript.exe", "mshta.exe", "regsvr32.exe"},
-        ])
+        self.confidence      = float(event.get("confidence_score") or event.get("risk_score") or 0.0)
+        self.has_network     = bool(event.get("has_net") or event.get("destination_ip"))
+        self.has_persistence = bool(event.get("has_persistence"))
+        self.has_injection   = bool(event.get("has_injection"))
+        self.event_id        = int(event.get("event_id") or 0)
 
         ts_raw = event.get("start_time") or event.get("utc_time") or event.get("event_time")
         try:
@@ -147,10 +116,9 @@ class CorrelationGraph:
     Directed graph of event nodes linked by relationship edges.
 
     Edge types:
-      - parent_child   : same host, parent->child image relationship
-      - temporal       : same host, same image, within time window
-      - host_lateral   : different hosts, same user, close in time
-      - process_reuse  : same image + same user (FIX: new edge type)
+      - parent_child  : same host, parent→child image relationship
+      - temporal      : same host, same image, within time window
+      - host_lateral  : different hosts, same user, close in time
     """
 
     def __init__(self, time_window_seconds: int = 900):
@@ -169,21 +137,17 @@ class CorrelationGraph:
 
     def build_edges(self) -> None:
         """
-        Compute all edges.
-
-        FIX: _cross_signal_amplify is now correctly called as a static method
-        on EVERY edge type (was dead code before — trapped after return).
-        FIX: process_reuse edge type added.
-        FIX: adaptive threshold based on node count.
+        Compute all edges with three improvements over v1:
+          1. Edge weight threshold — prune weak links before clustering
+          2. reason field — every edge carries a human-readable explanation
+          3. Cross-signal amplification — shared suspicious properties
+             (high entropy + external IP + injection) multiply edge weight
         """
         self.edges.clear()
         node_list = sorted(
             self.nodes.values(),
             key=lambda n: n.ts if pd.notna(n.ts) else pd.Timestamp.min.tz_localize("UTC"),
         )
-
-        # FIX: compute threshold based on graph size
-        threshold = _adaptive_threshold(len(node_list))
 
         for i, a in enumerate(node_list):
             for j in range(i + 1, len(node_list)):
@@ -192,15 +156,14 @@ class CorrelationGraph:
                     continue
                 delta = (b.ts - a.ts).total_seconds()
                 if delta > self.time_window * 4:
-                    break   # sorted by time — safe early exit
+                    break   # Sorted by time → safe early exit
 
                 # ── Cross-host lateral movement edge ─────────────────────
                 if a.computer != b.computer:
                     if a.user and a.user == b.user and abs(delta) <= self.time_window:
                         w = _temporal_weight(delta) * 0.6
-                        # FIX: _cross_signal_amplify now properly called
-                        w = CorrelationGraph._cross_signal_amplify(w, a, b)
-                        if w >= threshold:
+                        w = self._cross_signal_amplify(w, a, b)
+                        if w >= EDGE_WEIGHT_THRESHOLD:
                             self.edges.append({
                                 "from": a.uid, "to": b.uid,
                                 "type": "host_lateral",
@@ -208,7 +171,8 @@ class CorrelationGraph:
                                 "delta_sec": delta,
                                 "reason": (
                                     f"Same user '{a.user}' on different hosts "
-                                    f"({a.computer} → {b.computer}) within {int(abs(delta))}s"
+                                    f"({a.computer} → {b.computer}) within "
+                                    f"{int(abs(delta))}s"
                                 ),
                                 "confidence_type": "behavioral",
                             })
@@ -217,11 +181,10 @@ class CorrelationGraph:
                 # ── Parent → Child structural edge ───────────────────────
                 if a.image == b.parent_image and abs(delta) <= self.time_window:
                     w = _temporal_weight(delta)
-                    # FIX: both methods called correctly in order
-                    w = CorrelationGraph._cross_signal_amplify(w, a, b)
-                    w = CorrelationGraph._apply_direction_score(w, a, b)
-                    if w >= threshold:
-                        direction = "forward" if _kc_index(b.kill_chain_stage) >= _kc_index(a.kill_chain_stage) else "backward"
+                    w = self._cross_signal_amplify(w, a, b)
+                    # Directional kill-chain flow scoring
+                    w = self._apply_direction_score(w, a, b)
+                    if w >= EDGE_WEIGHT_THRESHOLD:
                         self.edges.append({
                             "from": a.uid, "to": b.uid,
                             "type": "parent_child",
@@ -232,16 +195,15 @@ class CorrelationGraph:
                                 f"{int(abs(delta))}s later (parent-child)"
                             ),
                             "confidence_type": "structural",
-                            "direction": direction,
+                            "direction": "forward" if _kc_index(b.kill_chain_stage) >= _kc_index(a.kill_chain_stage) else "backward",
                         })
 
                 # ── Temporal co-occurrence edge (same image, same host) ───
                 elif a.image == b.image and abs(delta) <= self.time_window:
                     w = _temporal_weight(delta) * 0.5
-                    w = CorrelationGraph._cross_signal_amplify(w, a, b)
-                    w = CorrelationGraph._apply_direction_score(w, a, b)
-                    if w >= threshold:
-                        direction = "forward" if _kc_index(b.kill_chain_stage) >= _kc_index(a.kill_chain_stage) else "backward"
+                    w = self._cross_signal_amplify(w, a, b)
+                    w = self._apply_direction_score(w, a, b)
+                    if w >= EDGE_WEIGHT_THRESHOLD:
                         self.edges.append({
                             "from": a.uid, "to": b.uid,
                             "type": "temporal",
@@ -252,87 +214,73 @@ class CorrelationGraph:
                                 f"{int(abs(delta))}s on {a.computer}"
                             ),
                             "confidence_type": "temporal",
-                            "direction": direction,
-                        })
-
-                # FIX: process_reuse edge — same image, same user, different PID
-                # Catches attackers reusing tools (powershell, cmd) across campaign
-                elif (a.image == b.image and a.user and a.user == b.user
-                      and abs(delta) <= self.time_window):
-                    w = _temporal_weight(delta) * 0.7
-                    w = CorrelationGraph._cross_signal_amplify(w, a, b)
-                    if w >= threshold:
-                        self.edges.append({
-                            "from": a.uid, "to": b.uid,
-                            "type": "process_reuse",
-                            "weight": w,
-                            "delta_sec": delta,
-                            "reason": (
-                                f"Same process '{a.image}' reused by '{a.user}' "
-                                f"within {int(abs(delta))}s"
-                            ),
-                            "confidence_type": "behavioral",
-                            "direction": "forward",
+                            "direction": "forward" if _kc_index(b.kill_chain_stage) >= _kc_index(a.kill_chain_stage) else "backward",
                         })
 
     @staticmethod
     def _apply_direction_score(weight: float, a: "EventNode", b: "EventNode") -> float:
         """
-        Reward forward kill-chain progression; penalize backward links.
-        FIX: this is now a clean standalone method — _cross_signal_amplify
-        no longer hides inside it as dead code.
+        Real attacks are directional — they advance through the kill chain.
+        Reward forward progression; penalize backward links.
+
+        forward: b's stage index ≥ a's stage index  (Execution → Persistence → C2)
+        backward: b's stage index < a's stage index  (suspicious — possibly noise)
+
+        A backward link (e.g. C2 → Execution in time) is structurally odd;
+        it slightly reduces the edge weight to prevent weak backward chains
+        from merging unrelated clusters.
         """
         a_idx = _kc_index(a.kill_chain_stage)
         b_idx = _kc_index(b.kill_chain_stage)
         if b_idx > a_idx:
-            return weight * (1.0 + FORWARD_KC_BONUS)
+            return weight * (1.0 + FORWARD_KC_BONUS)    # Kill-chain advance → boost
         elif b_idx < a_idx:
-            return weight * (1.0 - BACKWARD_KC_PENALTY)
-        return weight
-
-    @staticmethod
-    def _cross_signal_amplify(weight: float, a: "EventNode", b: "EventNode") -> float:
+            return weight * (1.0 - BACKWARD_KC_PENALTY)  # Backward → slight penalty
+        return weight   # Same stage → neutral
         """
-        FIX: This was previously dead code trapped inside _apply_direction_score
-        after its return statement. Now a proper static method called explicitly
-        in build_edges() for every edge type.
-
         Boost edge weight when both nodes share suspicious properties.
-        Anchor-to-anchor edges get an extra 1.5× multiplier.
+        This is the cross-signal correlation the v1 engine lacked entirely:
+        injection + external network + high stage together means much more
+        than each does alone.
         """
         shared_signals = sum([
             a.has_injection and b.has_injection,
             a.has_network   and b.has_network,
             a.has_persistence and b.has_persistence,
+            # High kill-chain stage on both ends
             _kc_index(a.kill_chain_stage) >= 5 and _kc_index(b.kill_chain_stage) >= 5,
         ])
-
         if shared_signals >= 3:
-            w = weight * 2.0
-        elif shared_signals == 2:
-            w = weight * 1.5
-        elif shared_signals == 1:
-            w = weight * 1.2
-        else:
-            w = weight
-
-        # Anchor-to-anchor bonus — both nodes are high-value signals
-        if a.is_anchor and b.is_anchor:
-            w *= 1.5
-
-        return w
+            return weight * 2.0   # Very strong shared signal → double weight
+        if shared_signals == 2:
+            return weight * 1.5
+        if shared_signals == 1:
+            return weight * 1.2
+        return weight
 
     def connected_components(self) -> List[Set[str]]:
+        """Union-Find connected components with path compression + union-by-rank."""
         parent: Dict[str, str] = {uid: uid for uid in self.nodes}
+        rank:   Dict[str, int] = {uid: 0   for uid in self.nodes}
 
         def find(x: str) -> str:
+            # Path halving — points every other node directly at root
+            # Amortized O(α(n)) — practically constant for any realistic dataset
             while parent[x] != x:
-                parent[x] = parent[parent[x]]
+                parent[x] = parent[parent[x]]   # grandparent hop
                 x = parent[x]
             return x
 
         def union(x: str, y: str) -> None:
-            parent[find(x)] = find(y)
+            # Union by rank — attach shorter tree under taller to keep trees flat
+            rx, ry = find(x), find(y)
+            if rx == ry:
+                return
+            if rank[rx] < rank[ry]:
+                rx, ry = ry, rx          # ensure rx has higher rank
+            parent[ry] = rx              # attach ry under rx
+            if rank[rx] == rank[ry]:
+                rank[rx] += 1            # only increment when ranks were equal
 
         for edge in self.edges:
             if edge["from"] in parent and edge["to"] in parent:
@@ -350,6 +298,10 @@ class CorrelationGraph:
 # ---------------------------------------------------------------------------
 
 class CampaignBuilder:
+    """
+    Converts connected components into scored, annotated campaigns.
+    """
+
     def build_campaigns(
         self,
         graph: CorrelationGraph,
@@ -362,6 +314,7 @@ class CampaignBuilder:
             nodes = [graph.nodes[uid] for uid in component_uids if uid in graph.nodes]
             if not nodes:
                 continue
+
             campaign = self._score_component(nodes, graph, run_id)
             if campaign:
                 campaigns.append(campaign)
@@ -377,25 +330,34 @@ class CampaignBuilder:
         if not nodes:
             return None
 
-        stages        = list({n.kill_chain_stage for n in nodes})
+        # ── Kill chain analysis ───────────────────────────────────────────
+        stages = list({n.kill_chain_stage for n in nodes})
         stage_indices = sorted([_kc_index(s) for s in stages], reverse=True)
         highest_stage = KILL_CHAIN_ORDER[stage_indices[0]] if stage_indices else "Execution"
         chain_depth   = len(set(stage_indices))
         multiplier    = _CHAIN_MULTIPLIERS[min(chain_depth, len(_CHAIN_MULTIPLIERS) - 1)]
 
+        # ── Base confidence ───────────────────────────────────────────────
         base = max((n.confidence for n in nodes), default=0.0)
         if base == 0:
-            base = 30.0
+            base = 30.0   # Structural correlation even without prior score
 
+        # ── Behavioral bonuses ────────────────────────────────────────────
         bonus = 0.0
-        if any(n.has_persistence for n in nodes): bonus += 15.0
-        if any(n.has_injection for n in nodes):   bonus += 25.0
-        if any(n.has_network for n in nodes):     bonus += 10.0
-        if any(n.event_id in {8, 9, 25} for n in nodes): bonus += 20.0
+        if any(n.has_persistence for n in nodes):
+            bonus += 15.0
+        if any(n.has_injection for n in nodes):
+            bonus += 25.0
+        if any(n.has_network for n in nodes):
+            bonus += 10.0
+        if any(n.event_id in {8, 9, 25} for n in nodes):   # Critical EIDs
+            bonus += 20.0
 
+        # ── Edge weight sum + directional flow bonus ──────────────────────
         node_uids = {n.uid for n in nodes}
-        forward_count = backward_count = 0
-        edge_weight   = 0.0
+        forward_count  = 0
+        backward_count = 0
+        edge_weight    = 0.0
         for e in graph.edges:
             if e["from"] in node_uids and e["to"] in node_uids:
                 edge_weight += e["weight"]
@@ -404,50 +366,60 @@ class CampaignBuilder:
                 elif e.get("direction") == "backward":
                     backward_count += 1
 
-        edge_bonus      = min(edge_weight * 5.0, 20.0)
+        edge_bonus = min(edge_weight * 5.0, 20.0)
+
+        # Pure forward kill-chain flow → additional confidence bonus
         direction_bonus = 0.0
         if forward_count > 0 and backward_count == 0:
             direction_bonus = min(forward_count * 5.0, 15.0)
+            # Perfect forward chain is a very strong attack indicator
 
+        # ── Final score ───────────────────────────────────────────────────
         final = min((base + bonus + edge_bonus + direction_bonus) * multiplier, 100.0)
 
-        valid_ts   = [n.ts for n in nodes if pd.notna(n.ts)]
+        # ── Temporal metadata ─────────────────────────────────────────────
+        valid_ts = [n.ts for n in nodes if pd.notna(n.ts)]
         first_seen = min(valid_ts).isoformat() if valid_ts else None
         last_seen  = max(valid_ts).isoformat() if valid_ts else None
 
+        # ── Computers / users ─────────────────────────────────────────────
         computers = sorted({n.computer for n in nodes})
         users     = sorted({n.user for n in nodes if n.user})
         images    = sorted({n.image for n in nodes})
 
+        # ── Narrative ─────────────────────────────────────────────────────
         narrative = self._build_narrative(nodes, highest_stage, chain_depth, multiplier)
 
-        day      = datetime.datetime.utcnow().strftime("%Y%m%d")
-        base_img = nodes[0].image
-        corr_id  = f"CAMP-{base_img[:12]}-{computers[0][:8]}-{day}".replace(" ", "_").lower()
+        # ── Correlation ID ────────────────────────────────────────────────
+        import re as _re
+        day = datetime.datetime.utcnow().strftime("%Y%m%d")
+        base_image = nodes[0].image
+        # Sanitize: strip everything except alphanumeric and underscore
+        _safe_img  = _re.sub(r"[^a-z0-9]", "_", base_image[:12].lower())
+        _safe_host = _re.sub(r"[^a-z0-9]", "_", computers[0][:8].lower())
+        corr_id    = f"CAMP-{_safe_img}-{_safe_host}-{day}"
 
         return {
-            "corr_id":            corr_id,
-            "run_id":             run_id,
-            "base_image":         base_img,
-            "images":             images,
-            "computers":          computers,
-            "users":              users,
-            "first_seen":         first_seen,
-            "last_seen":          last_seen,
-            "event_count":        len(nodes),
-            "chain_depth":        chain_depth,
-            "chain_multiplier":   multiplier,
-            "kill_chain_stages":  stages,
-            "highest_stage":      highest_stage,
-            "confidence":         round(final, 1),
-            "has_persistence":    any(n.has_persistence for n in nodes),
-            "has_injection":      any(n.has_injection for n in nodes),
-            "has_network":        any(n.has_network for n in nodes),
-            "narrative":          narrative,
-            "node_uids":          [n.uid for n in nodes],
-            "status":             "active",
-            "forward_edge_count": forward_count,
-            "direction_bonus":    int(direction_bonus),
+            "corr_id":           corr_id,
+            "run_id":            run_id,
+            "base_image":        base_image,
+            "images":            images,
+            "computers":         computers,
+            "users":             users,
+            "first_seen":        first_seen,
+            "last_seen":         last_seen,
+            "event_count":       len(nodes),
+            "chain_depth":       chain_depth,
+            "chain_multiplier":  multiplier,
+            "kill_chain_stages": stages,
+            "highest_stage":     highest_stage,
+            "confidence":        round(final, 1),
+            "has_persistence":   any(n.has_persistence for n in nodes),
+            "has_injection":     any(n.has_injection for n in nodes),
+            "has_network":       any(n.has_network for n in nodes),
+            "narrative":         narrative,
+            "node_uids":         [n.uid for n in nodes],
+            "status":            "active",
         }
 
     @staticmethod
@@ -457,9 +429,9 @@ class CampaignBuilder:
         chain_depth: int,
         multiplier: float,
     ) -> str:
-        images = sorted({n.image for n in nodes})
-        stages = sorted({n.kill_chain_stage for n in nodes}, key=_kc_index)
-        host   = nodes[0].computer
+        images  = sorted({n.image for n in nodes})
+        stages  = sorted({n.kill_chain_stage for n in nodes}, key=_kc_index)
+        host    = nodes[0].computer
 
         parts = [
             f"Multi-event correlation on {host} involving {len(images)} process(es): "
@@ -488,18 +460,26 @@ class CampaignBuilder:
 # ---------------------------------------------------------------------------
 
 def _decay_stale_campaigns(conn: Any, mode: str, run_id: str) -> None:
+    """
+    Reduce confidence of campaigns not seen in 24 hours (lifecycle decay).
+    Campaigns that persist but don't re-trigger gradually lose confidence —
+    this prevents stale detections from looking as urgent as fresh ones.
+    Campaigns below a minimum confidence floor are marked dormant.
+    """
     try:
         from dashboard.db import get_cursor, sql_now_minus
-        DECAY_PCT      = 0.90
-        MIN_CONFIDENCE = 20
+        DECAY_PCT     = 0.90   # Each decay cycle reduces confidence by 10%
+        MIN_CONFIDENCE = 20    # Below this → mark dormant
         with get_cursor(conn) as cur:
+            # Use FLOOR() not CAST AS UNSIGNED — UNSIGNED wraps negative values
+            # to enormous numbers, corrupting confidence scores on edge cases.
             cur.execute(
                 f"UPDATE correlation_campaigns "
                 f"SET max_confidence = GREATEST("
-                f"  CAST(max_confidence * {DECAY_PCT} AS UNSIGNED), {MIN_CONFIDENCE}"
+                f"  FLOOR(max_confidence * {DECAY_PCT}), {MIN_CONFIDENCE}"
                 f"), "
                 f"status = CASE "
-                f"  WHEN CAST(max_confidence * {DECAY_PCT} AS UNSIGNED) <= {MIN_CONFIDENCE} "
+                f"  WHEN FLOOR(max_confidence * {DECAY_PCT}) <= {MIN_CONFIDENCE} "
                 f"  THEN 'dormant' ELSE status END "
                 f"WHERE run_id = %s "
                 f"AND status = 'active' "
@@ -511,6 +491,7 @@ def _decay_stale_campaigns(conn: Any, mode: str, run_id: str) -> None:
 
 
 def persist_campaigns(campaigns: List[Dict[str, Any]]) -> None:
+    """Write / update campaigns in sentinel_live (or sentinel_cases for uploads)."""
     if not campaigns:
         return
 
@@ -522,19 +503,20 @@ def persist_campaigns(campaigns: List[Dict[str, Any]]) -> None:
         now    = now_utc()
 
         with get_db_connection(mode) as conn:
+            # Lifecycle decay: stale campaigns lose confidence gradually
             _decay_stale_campaigns(conn, mode, run_id)
             with get_cursor(conn) as cur:
                 for camp in campaigns:
-                    cid       = camp["corr_id"]
-                    new_conf  = int(camp["confidence"])
-                    new_stage = camp["highest_stage"]
-
+                    cid = camp["corr_id"]
                     cur.execute(
                         "SELECT burst_count, max_confidence, highest_kill_chain "
                         "FROM correlation_campaigns WHERE corr_id = %s AND run_id = %s",
                         (cid, run_id),
                     )
                     row = cur.fetchone()
+                    new_conf  = int(camp["confidence"])
+                    new_stage = camp["highest_stage"]
+
                     if row:
                         final_stage = _higher_stage(row["highest_kill_chain"], new_stage)
                         cur.execute(
@@ -569,6 +551,7 @@ def persist_campaigns(campaigns: List[Dict[str, Any]]) -> None:
                             identity_hint=f"corr_id={cid}",
                         )
 
+                    # Detail row in correlations table
                     cur.execute(
                         "INSERT INTO `correlations` "
                         "(`corr_id`,`run_id`,`base_image`,`start_time`,`end_time`,"
@@ -605,16 +588,35 @@ def correlate_events(
     time_window_seconds: int = 900,
     persist: bool = True,
 ) -> List[Dict[str, Any]]:
+    """
+    Full correlation pipeline.
+
+    Args:
+        events            : List of event/burst dicts (must have event_uid, image, etc.)
+        run_id            : Analysis run identifier
+        time_window_seconds : Max time gap to consider two events correlated
+        persist           : Whether to write campaigns to DB
+
+    Returns:
+        List of campaign dicts sorted by confidence descending.
+    """
     if not events:
         return []
 
+    # Filter out events with no meaningful identity — they produce orphan nodes
+    # that inflate component counts without adding real correlation signal.
+    valid_events = [e for e in events if e.get("image") or e.get("event_uid")]
+    if not valid_events:
+        return []
+
     graph = CorrelationGraph(time_window_seconds=time_window_seconds)
-    graph.add_nodes_bulk(events)
+    graph.add_nodes_bulk(valid_events)
     graph.build_edges()
 
     builder   = CampaignBuilder()
     campaigns = builder.build_campaigns(graph, run_id)
 
+    # Tag source events with their campaign id
     uid_to_camp: Dict[str, str] = {}
     for camp in campaigns:
         for uid in camp.get("node_uids", []):
@@ -642,6 +644,12 @@ def correlate_bursts(
     time_window_seconds: int = 900,
     persist: bool = True,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Wrapper for burst-level correlation (used by analysis_engine).
+    Maps burst dicts → event dicts, runs correlation, returns
+    (updated_bursts, campaigns).
+    """
+    # Ensure burst dicts have the fields EventNode expects
     mapped = []
     for b in bursts:
         mapped.append({
@@ -659,11 +667,12 @@ def correlate_bursts(
             "start_time":       b.get("start_time"),
             "utc_time":         b.get("start_time"),
             "destination_ip":   b.get("destination_ip"),
-            "_burst_ref":       b,
+            "_burst_ref":       b,   # back-reference so we can mutate original
         })
 
     campaigns = correlate_events(mapped, run_id, time_window_seconds, persist)
 
+    # Propagate correlation metadata back to original bursts
     for m in mapped:
         original = m.get("_burst_ref")
         if original is not None:

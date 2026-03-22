@@ -5,14 +5,11 @@ Upgraded from binary match/no-match to weighted scoring.
 
 Changes:
   - yara_score = number_of_matches × 20, bonus +20 for ≥3 matches, capped at 100.
-    Binary output (matched / not matched) gave no signal strength.
-  - Removed sqlite3 import (was unused — no DB interaction here).
-  - load_yara_rules() returns None gracefully instead of crashing if yara
-    is not installed.
-  - run_yara_on_events() now returns enriched event dicts with yara_score,
-    yara_hits count, and yara_rule_names list — downstream engines use these.
-  - scan_text() helper exposed for scanning arbitrary strings (used by
-    detection_engine when building rich_event context).
+  - Removed unused sqlite3 import.
+  - load_yara_rules() returns None gracefully if yara not installed.
+  - run_yara_on_events() returns enriched dicts with yara_score, yara_hits,
+    and yara_rule_names — downstream engines use these.
+  - scan_text() helper exposed for scanning arbitrary strings.
 """
 from __future__ import annotations
 
@@ -37,10 +34,12 @@ def yara_available() -> bool:
 def load_yara_rules(rules_path) -> Optional[Any]:
     """
     Compile YARA rules from a file path.
-    Returns compiled rules object or None if yara is not installed / path invalid.
+    Returns compiled rules object or None if yara not installed / path invalid.
     """
     if not _YARA_AVAILABLE:
         log.debug("yara-python not installed — YARA scanning disabled")
+        return None
+    if rules_path is None:
         return None
     path = Path(rules_path)
     if not path.exists():
@@ -75,14 +74,9 @@ def compute_yara_score(match_count: int) -> int:
     """
     Convert a raw match count into a 0–100 risk score.
 
-    Scoring:
       1 match  →  20
       2 matches → 40
-      3+ matches → 60 + bonus 20 = 80
-      Capped at 100.
-
-    Binary output gave no signal strength — this makes YARA
-    a proportional contributor to the final score.
+      3+ matches → 60 + bonus 20 = 80, capped at 100.
     """
     if match_count <= 0:
         return 0
@@ -120,12 +114,12 @@ def run_yara_on_events(
     """
     Scan each event dict against compiled YARA rules.
 
-    Returns the same list with three new fields added to each matching event:
+    Returns the same list with three new fields added to each event:
       yara_score      int    0–100 weighted score (not binary)
       yara_hits       int    number of rule matches
       yara_rule_names list   names of matched rules
 
-    Non-matching events still get these fields set to 0 / empty so
+    Non-matching events get these fields set to 0 / empty so
     downstream code can always read them safely.
     """
     if rules is None:

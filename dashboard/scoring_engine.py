@@ -1,26 +1,20 @@
 """
-scoring_engine.py — SentinelTrace v2.2
-=======================================
-Multi-signal fusion scoring engine.
+scoring_engine.py — SentinelTrace v2 Unified Risk Scoring Engine
+=================================================================
+Multi-layer risk model:
+  1. Signal score  — detections × severity weights
+  2. Baseline boost — deviation multiplier (statistical anomaly depth)
+  3. Correlation boost — kill-chain chain depth multiplier
+  4. Context dampening — known parent / known user / internal IP
+  5. Explainability — structured "why this score" output
 
-v2.2 upgrades over v2.0:
-  - compute_final_score(): true weighted fusion of rule_score, baseline
-    deviation, sequence anomaly, YARA score, and kill-chain stage multipliers.
-    Credential Access gets 1.5×, Lateral Movement 1.3×, C2 1.2×.
-  - Rule stacking: aggregate_rule_hits() rewards rule diversity (3+ distinct
-    rules = 1.3× multiplier) and adds contextual boosts for encoded flags,
-    LOLBins, external IPs, and suspicious parent chains.
-  - Noise gate: no detections + deviation < 0.30 = score 0 immediately.
-  - Stage caps respected; deviation cap raised from 35 → 50 for <0.3 tier.
-  - LedgerEntry gains a `category` field for structured dashboard display.
-  - _context_factor gains high-volume process dampening.
-  - Interaction bonus cases changed from elif → if (all can stack).
+Every score decision is recorded in a ledger for audit trail.
 """
 
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -37,14 +31,24 @@ SEVERITY_BASE: Dict[str, float] = {
 }
 
 KILL_CHAIN_ORDER = [
-    "Background", "Delivery", "Execution", "Defense Evasion",
-    "Persistence", "Privilege Escalation", "Credential Access",
-    "Discovery", "Lateral Movement", "Collection",
-    "Command and Control", "Exfiltration", "Actions on Objectives",
+    "Background",
+    "Delivery",
+    "Execution",
+    "Defense Evasion",
+    "Persistence",
+    "Privilege Escalation",
+    "Credential Access",
+    "Discovery",
+    "Lateral Movement",
+    "Collection",
+    "Command and Control",
+    "Exfiltration",
+    "Actions on Objectives",
 ]
 
 _KC_INDEX: Dict[str, int] = {k: i for i, k in enumerate(KILL_CHAIN_ORDER)}
 
+# Confidence ceiling by stage (higher stage = allows higher score)
 STAGE_CAPS: Dict[str, float] = {
     "Actions on Objectives": 100.0,
     "Exfiltration":          100.0,
@@ -61,17 +65,13 @@ STAGE_CAPS: Dict[str, float] = {
     "Background":             30.0,
 }
 
-# Kill-chain stage score multipliers — high-value stages get a risk boost
-STAGE_MULTIPLIERS: Dict[str, float] = {
-    "Credential Access":    1.50,
-    "Lateral Movement":     1.30,
-    "Command and Control":  1.20,
-    "Exfiltration":         1.40,
-    "Actions on Objectives":1.50,
-    "Privilege Escalation": 1.15,
-    "Persistence":          1.10,
-}
+# Chain depth → stage-cap lift (NOT a multiplier — multiplier lives in correlation_engine)
+# Each additional kill-chain stage lifts the score ceiling by 8 pts, max 20.
+# This avoids double-counting while still rewarding deep chains.
+_CHAIN_CAP_LIFT_PER_DEPTH = 8.0
+_CHAIN_CAP_LIFT_MAX       = 20.0
 
+# Context dampers (reduce score when benign context detected)
 KNOWN_BENIGN_PARENTS = frozenset({
     "explorer.exe", "services.exe", "svchost.exe", "wininit.exe",
     "winlogon.exe", "lsass.exe", "taskhostw.exe", "smss.exe",
@@ -140,104 +140,16 @@ class ScoreResult:
         self.chain_multiplier = chain_multiplier
 
     def to_dict(self) -> Dict[str, Any]:
-        cats: Dict[str, List[str]] = {}
-        for e in self.ledger:
-            cats.setdefault(e.category, []).append(e.reason)
         return {
-            "score":            self.score,
-            "stage":            self.stage,
-            "stage_cap":        self.stage_cap,
-            "deviation_used":   round(self.deviation_used, 3),
-            "chain_depth":      self.chain_depth,
-            "chain_multiplier": self.chain_multiplier,
-            "ledger":           [e.to_dict() for e in self.ledger],
-            "why":              [e.reason for e in self.ledger if e.delta != 0],
-            "explanation":      cats,
+            "score":             self.score,
+            "stage":             self.stage,
+            "stage_cap":         self.stage_cap,
+            "deviation_used":    round(self.deviation_used, 3),
+            "chain_depth":       self.chain_depth,
+            "chain_multiplier":  self.chain_multiplier,
+            "ledger":            [e.to_dict() for e in self.ledger],
+            "why": [e.reason for e in self.ledger if e.delta != 0],
         }
-
-
-# ---------------------------------------------------------------------------
-# Rule stacking helper  ← NEW
-# ---------------------------------------------------------------------------
-
-def aggregate_rule_hits(
-    event: Dict[str, Any],
-    matched_rules: List[Dict[str, Any]],
-) -> float:
-    """
-    Aggregate multiple rule hits into a single rule score.
-
-    Scoring:
-      - Base = sum of individual rule confidences (not max, not average)
-      - Rule diversity bonus: ≥3 distinct rule_ids → 1.3× multiplier
-      - Contextual boosts for strong signals present on the event
-      - Result capped at 100
-
-    This replaces single-rule-trigger = single confidence value.
-    """
-    if not matched_rules:
-        return 0.0
-
-    base = sum(float(r.get("confidence_score") or r.get("confidence") or 50) for r in matched_rules)
-
-    # Diversity bonus — multi-technique attack is more alarming
-    diversity = len(set(r.get("rule_id", "") for r in matched_rules))
-    if diversity >= 3:
-        base *= 1.3
-    elif diversity == 2:
-        base *= 1.15
-
-    # Contextual boosts from parser-enriched event signals
-    if event.get("has_encoded_flag") or event.get("cmd_has_encoded_flag"):
-        base += 10
-    if event.get("is_lolbin"):
-        lw = float(event.get("lolbin_weight") or 0.5)
-        base += 5 + (lw * 10)   # 5–15 pts based on LOLBin risk
-    if event.get("is_external_ip"):
-        base += 10
-    if event.get("is_suspicious_chain"):
-        base += 5
-    if event.get("b64_detected") or event.get("cmd_b64_detected"):
-        base += 8
-    if event.get("is_high_entropy") or event.get("cmd_high_entropy"):
-        base += 7
-
-    return float(min(base, 100.0))
-
-
-def compute_final_score(event: Dict[str, Any]) -> int:
-    """
-    True multi-signal fusion scoring.
-
-    Weights:
-      35% rule score        (YAML / YARA rule hits aggregated)
-      25% sequence score    (n-gram chain anomaly from baseline)
-      25% behavior score    (Welford deviation × 100)
-      10% YARA score        (YARA match count × 20, capped at 60)
-       5% feedback adj      (analyst verdict reinforcement signal)
-
-    Then applies kill-chain stage multipliers for high-value stages.
-    """
-    rule_score     = float(event.get("rule_score") or 0)
-    seq_score      = float(event.get("sequence_score") or 0)
-    behavior_score = float(event.get("behavior_score") or event.get("deviation_score") or 0) * 100
-    yara_score     = float(event.get("yara_score") or 0)
-    feedback_adj   = float(event.get("feedback_adj") or 0)
-
-    score = (
-        0.35 * rule_score +
-        0.25 * seq_score +
-        0.25 * behavior_score +
-        0.10 * yara_score +
-        0.05 * feedback_adj
-    )
-
-    # Kill-chain stage risk multiplier
-    stage = event.get("kill_chain_stage") or "Execution"
-    mult  = STAGE_MULTIPLIERS.get(stage, 1.0)
-    score *= mult
-
-    return int(min(score, 100))
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +157,14 @@ def compute_final_score(event: Dict[str, Any]) -> int:
 # ---------------------------------------------------------------------------
 
 class ScoringEngine:
+    """
+    Unified risk scoring.
+
+    Usage:
+        engine = ScoringEngine()
+        result = engine.score_burst(burst_dict, detections, deviation_score, chain_depth)
+    """
+
     def __init__(
         self,
         suppressions: Optional[List[Dict[str, str]]] = None,
@@ -253,6 +173,8 @@ class ScoringEngine:
         self.suppressions  = suppressions or []
         self.host_profiles = host_profiles or {}
 
+    # ── Public API ────────────────────────────────────────────────────────
+
     def score_burst(
         self,
         burst: Dict[str, Any],
@@ -260,8 +182,19 @@ class ScoringEngine:
         deviation_score: float = 0.0,
         chain_depth: int = 1,
     ) -> ScoreResult:
+        """
+        Compute the full risk score for a burst.
+
+        Args:
+            burst           : Burst dict from analysis_engine
+            detections      : Detection hits for events in this burst
+            deviation_score : Float 0–1 from BaselineEngine
+            chain_depth     : Number of distinct kill-chain stages in correlation
+
+        Returns:
+            ScoreResult with score, ledger, and explainability fields
+        """
         ledger: List[LedgerEntry] = []
-        dets = detections or []
 
         image    = (burst.get("image") or "").lower()
         parent   = (burst.get("parent_image") or "").lower()
@@ -270,278 +203,438 @@ class ScoringEngine:
         dst_ip   = burst.get("destination_ip") or ""
         user     = (burst.get("user") or "").upper()
 
-        # ── Noise gate ────────────────────────────────────────────────────
-        if not dets and deviation_score < 0.30:
-            ledger.append(LedgerEntry(
-                "Noise gate", 0.0,
-                "No detections and deviation < 0.30 — background noise",
-                "other",
-            ))
-            return ScoreResult(
-                score=0.0, ledger=ledger, stage=stage,
-                stage_cap=STAGE_CAPS.get(stage, 65.0),
-                deviation_used=deviation_score,
-                chain_depth=chain_depth, chain_multiplier=1.0,
-            )
-
-        # ── 1. Rule signal (stacked) ──────────────────────────────────────
-        signal = self._compute_signal(burst, dets, ledger)
+        # ── 1. Signal score ───────────────────────────────────────────────
+        signal = self._compute_signal(burst, detections, ledger)
 
         # ── 2. Deviation multiplier ───────────────────────────────────────
         dev_mult = self._deviation_multiplier(deviation_score, ledger)
 
-        # ── 3. Behavioral bonuses ─────────────────────────────────────────
+        # ── 3. Behavioral bonuses (persistence, injection, network) ───────
         behavior_bonus = self._behavior_bonus(burst, dst_ip, ledger)
 
-        # ── 4. Chain depth cap lift ───────────────────────────────────────
+        # ── 4. Chain depth stage-cap lift (NOT a multiplier — avoids double-counting) ──
+        # The correlation engine already multiplied confidence by chain depth.
+        # Here we only lift the stage_cap ceiling so a deep chain can reach
+        # its true potential score, without multiplying the raw signal again.
         chain_cap_lift = 0.0
         if chain_depth >= 2:
             chain_cap_lift = min((chain_depth - 1) * 8.0, 20.0)
             ledger.append(LedgerEntry(
-                "Chain depth cap lift", chain_cap_lift,
-                f"Kill-chain depth {chain_depth} → cap +{chain_cap_lift:.0f}",
+                "Chain depth cap lift",
+                chain_cap_lift,
+                f"Kill-chain depth {chain_depth} → stage cap raised by {chain_cap_lift:.0f} pts "
+                f"(no double-count: multiplier lives in correlation engine)",
                 "chain",
             ))
 
         # ── 5. Context dampening ──────────────────────────────────────────
-        context_factor = self._context_factor(image, parent, computer, user, dst_ip, burst, ledger)
+        context_factor = self._context_factor(image, parent, computer, user, dst_ip, ledger)
 
         # ── 6. Environment profile ────────────────────────────────────────
         env_bonus = self._env_bonus(computer, stage, image, ledger)
 
         # ── 7. Suppression check ──────────────────────────────────────────
-        if self._is_suppressed(burst, dets):
-            ledger.append(LedgerEntry("Suppression", -200.0, "Analyst-suppressed", "other"))
+        if self._is_suppressed(burst, detections):
+            ledger.append(LedgerEntry("Suppression", -200.0, "Analyst-suppressed rule/image"))
             return ScoreResult(
                 score=0.0, ledger=ledger, stage=stage,
                 stage_cap=0.0, deviation_used=deviation_score,
                 chain_depth=chain_depth, chain_multiplier=1.0,
             )
 
-        # ── 8. Nonlinear interaction bonuses (all cases independent) ──────
-        interaction_bonus = self._compute_interaction_bonus(deviation_score, chain_depth, burst, ledger)
+        # ── 8. Nonlinear interaction bonus ────────────────────────────────
+        # Linear models (A + B + C) miss cases where two moderate signals
+        # together are far more alarming than either alone.
+        # Real attacks are multivariate — encode that interaction explicitly.
+        interaction_bonus = self._compute_interaction_bonus(
+            deviation_score, chain_depth, burst, ledger
+        )
 
         # ── 9. Temporal spread bonus ──────────────────────────────────────
+        # Events that are correlated across a long time window (slow attack)
+        # get a score boost — slow, distributed attacks are harder to detect
+        # and therefore more dangerous when finally caught.
         temporal_bonus = self._compute_temporal_bonus(burst, ledger)
 
         # ── 10. Data quality factor ───────────────────────────────────────
-        data_quality = self._compute_data_quality(burst, dets, ledger)
+        # Not all signals are equally reliable. Fewer events = more uncertainty.
+        # Reduce score when we have very little evidence, regardless of
+        # what that evidence says.
+        data_quality = self._compute_data_quality(burst, detections, ledger)
 
-        # ── 11. Kill-chain stage risk multiplier ──────────────────────────
-        stage_mult = STAGE_MULTIPLIERS.get(stage, 1.0)
-        if stage_mult > 1.0:
-            ledger.append(LedgerEntry(
-                f"Stage multiplier ×{stage_mult}", 0.0,
-                f"{stage} stage carries {stage_mult}× risk weight",
-                "signal",
-            ))
-
-        # ── 12. Assemble ──────────────────────────────────────────────────
+        # ── 11. Assemble — NO chain multiplier here (it's in correlation) ─
         pre_cap = (
             (signal * dev_mult + behavior_bonus + env_bonus + interaction_bonus + temporal_bonus)
             * context_factor
             * data_quality
-            * stage_mult
         )
         pre_cap = max(pre_cap, 0.0)
 
+        # Stage cap (lifted by chain depth, but not doubled)
         stage_cap = min(STAGE_CAPS.get(stage, 65.0) + chain_cap_lift, 100.0)
-        dev_cap   = self._deviation_cap(deviation_score)
-        final     = min(pre_cap, stage_cap, dev_cap)
+
+        # Deviation cap (low deviation limits score regardless of other factors)
+        dev_cap = self._deviation_cap(deviation_score)
+
+        final = min(pre_cap, stage_cap, dev_cap)
 
         if pre_cap > final:
             ledger.append(LedgerEntry(
-                "Cap applied", final - pre_cap,
-                f"Stage cap ({stage_cap:.0f}) or deviation cap ({dev_cap:.0f})",
-                "other",
+                "Cap applied",
+                final - pre_cap,
+                f"Stage cap ({stage_cap:.0f}) or deviation cap ({dev_cap:.0f}) applied",
             ))
 
         return ScoreResult(
-            score=final, ledger=ledger, stage=stage, stage_cap=stage_cap,
-            deviation_used=deviation_score, chain_depth=chain_depth, chain_multiplier=1.0,
+            score=final,
+            ledger=ledger,
+            stage=stage,
+            stage_cap=stage_cap,
+            deviation_used=deviation_score,
+            chain_depth=chain_depth,
+            chain_multiplier=1.0,   # Multiplier is owned by correlation engine
         )
+
+    def _compute_interaction_bonus(
+        self,
+        deviation_score: float,
+        chain_depth: int,
+        burst: Dict[str, Any],
+        ledger: List[LedgerEntry],
+    ) -> float:
+        """
+        Nonlinear interaction bonus — encodes joint signal combinations that
+        are individually moderate but jointly alarming.
+
+        Real attacks are multivariate.  A pure linear model scores:
+          deviation=0.7 + chain=2 → middling result
+        But an attacker with high deviation AND multi-stage chain AND
+        persistence is a very different threat level than any single factor.
+
+        Three interaction cases:
+          1. High deviation + deep chain → +15 (most potent combination)
+          2. High deviation + behavioral indicators → +10
+          3. Deep chain + behavioral indicators → +8
+        """
+        bonus = 0.0
+
+        has_persistence = bool(burst.get("has_persistence"))
+        has_injection   = bool(burst.get("has_injection"))
+        has_behavioral  = has_persistence or has_injection or bool(burst.get("has_net"))
+
+        # Case 1: statistical anomaly AND structural attack chain
+        if deviation_score >= 0.6 and chain_depth >= 2:
+            bonus += 15.0
+            ledger.append(LedgerEntry(
+                "Interaction: deviation×chain +15", 15.0,
+                f"High deviation ({deviation_score:.2f}) AND chain depth {chain_depth} "
+                f"— jointly much stronger than either signal alone",
+            ))
+
+        # Case 2: statistical anomaly AND behavioral indicators (independent of case 1)
+        if deviation_score >= 0.6 and has_behavioral:
+            bonus += 10.0
+            ledger.append(LedgerEntry(
+                "Interaction: deviation×behavior +10", 10.0,
+                f"High deviation ({deviation_score:.2f}) AND behavioral indicator "
+                f"(persist={has_persistence}, inject={has_injection})",
+                "signal",
+            ))
+
+        # Case 3: deep chain AND behavioral indicators (independent of cases 1+2)
+        if chain_depth >= 2 and has_behavioral:
+            bonus += 8.0
+            ledger.append(LedgerEntry(
+                "Interaction: chain×behavior +8", 8.0,
+                f"Chain depth {chain_depth} AND behavioral indicator "
+                f"(persist={has_persistence}, inject={has_injection})",
+                "signal",
+            ))
+
+        return bonus
+
+    def _compute_temporal_bonus(
+        self,
+        burst: Dict[str, Any],
+        ledger: List[LedgerEntry],
+    ) -> float:
+        """
+        Temporal spread bonus — slow/distributed attacks are harder to detect
+        and more dangerous when caught.
+
+        If correlated events span >30 minutes, the analyst needs to know this
+        isn't a momentary blip — it's a sustained, deliberate campaign.
+        Bonus is proportional to spread duration, capped at +10.
+        """
+        start = burst.get("start_time")
+        end   = burst.get("end_time")
+        if not start or not end:
+            return 0.0
+        if not burst.get("has_correlation"):
+            return 0.0   # Only meaningful when events are correlated across time
+
+        try:
+            t0 = pd.to_datetime(start, errors="coerce", utc=True)
+            t1 = pd.to_datetime(end,   errors="coerce", utc=True)
+            if pd.isna(t0) or pd.isna(t1):
+                return 0.0
+            span_minutes = (t1 - t0).total_seconds() / 60.0
+        except Exception:
+            return 0.0
+
+        if span_minutes < 30:
+            return 0.0
+
+        bonus = min((span_minutes - 30) / 30.0 * 5.0, 10.0)   # +5 per 30 min, max +10
+        ledger.append(LedgerEntry(
+            f"Temporal spread +{bonus:.0f}", bonus,
+            f"Correlated events span {span_minutes:.0f} min — sustained campaign indicator",
+        ))
+        return bonus
+
+    def _compute_data_quality(
+        self,
+        burst: Dict[str, Any],
+        detections: Optional[List[Dict[str, Any]]],
+        ledger: List[LedgerEntry],
+    ) -> float:
+        """
+        Data quality factor — not all signals are equally reliable.
+
+        When we have very few events and very few detection hits, our confidence
+        in the score should be lower, regardless of what those signals say.
+        This prevents single-event spikes from producing alarm-level scores.
+
+        Quality tiers:
+          ≥5 events AND ≥2 detections → 1.00 (full confidence)
+          ≥3 events OR  ≥1 detection  → 0.90 (slight uncertainty)
+          1–2 events, 0 detections    → 0.75 (low evidence — dampen score)
+        """
+        event_count = int(burst.get("count") or burst.get("total_count") or 0)
+        det_count   = len(detections or [])
+
+        if event_count >= 5 and det_count >= 2:
+            return 1.00
+        if event_count >= 3 or det_count >= 1:
+            factor = 0.90
+            ledger.append(LedgerEntry(
+                "Data quality 0.90×", 0.0,
+                f"Moderate evidence ({event_count} events, {det_count} detections) "
+                f"→ slight uncertainty reduction",
+            ))
+            return factor
+        factor = 0.75
+        ledger.append(LedgerEntry(
+            "Data quality 0.75×", 0.0,
+            f"Thin evidence ({event_count} events, {det_count} detections) "
+            f"→ score dampened to reflect uncertainty",
+        ))
+        return factor
+
+    def score_detections(
+        self,
+        detections: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """
+        Score individual detection rows (used for triage queue ranking).
+        Returns detections with confidence_score populated.
+        """
+        scored = []
+        for det in detections:
+            sev   = (det.get("severity") or "low").lower()
+            base  = SEVERITY_BASE.get(sev, 25.0)
+            stage = det.get("kill_chain_stage") or "Execution"
+            kc_bonus = max(0, _KC_INDEX.get(stage, 2) - 2) * 5.0   # 0 at Execution, scales up
+            final = min(base + kc_bonus, 100.0)
+            scored.append({**det, "confidence_score": round(final, 1)})
+        return scored
 
     # ── Internal helpers ──────────────────────────────────────────────────
 
-    def _compute_signal(self, burst, detections, ledger):
+    def _compute_signal(
+        self,
+        burst: Dict[str, Any],
+        detections: Optional[List[Dict[str, Any]]],
+        ledger: List[LedgerEntry],
+    ) -> float:
+        """
+        Base signal from detection severity + volume + rule diversity.
+
+        Why diversity matters: an event that triggers 5 distinct rules
+        (encoded cmd, suspicious parent, rare LOLBin, network connection,
+        registry write) is far more alarming than one rule triggered 5×.
+        The old engine only counted max severity — this loses that signal.
+        """
         dets = detections or []
         if dets:
-            # Use aggregate_rule_hits for proper stacking
-            rule_agg = aggregate_rule_hits(burst, dets)
-            max_sev  = max(
+            max_sev_score = max(
                 SEVERITY_BASE.get((d.get("severity") or "low").lower(), 25.0)
                 for d in dets
             )
-            # Take higher of aggregated rule score or raw severity signal
-            max_sev_score = max(rule_agg, max_sev)
         else:
             sev = (burst.get("severity") or "low").lower()
             max_sev_score = SEVERITY_BASE.get(sev, 25.0)
 
-        count         = int(burst.get("count") or burst.get("total_count") or 1)
-        vol_score     = min(math.log10(count + 1) * 8.0, 20.0)
-        unique_rules  = len(set(d.get("rule_id", "") for d in dets if d.get("rule_id")))
+        # Volume contribution (log-scaled, capped — huge volumes shouldn't dominate)
+        count     = int(burst.get("count") or burst.get("total_count") or 1)
+        vol_score = math.log10(count + 1) * 8.0
+        vol_score = min(vol_score, 20.0)
+
+        # Rule diversity bonus — each distinct rule adds signal up to 20 pts
+        unique_rules   = len(set(d.get("rule_id", "") for d in dets if d.get("rule_id")))
         diversity_bonus = min(unique_rules * 5.0, 20.0)
 
         total = max_sev_score + vol_score + diversity_bonus
         ledger.append(LedgerEntry(
-            "Signal (rules + volume + diversity)", total,
-            f"rule_agg={max_sev_score:.0f} vol={vol_score:.1f} diversity={diversity_bonus:.0f} ({unique_rules} rules)",
-            "signal",
+            "Signal (severity + volume + diversity)",
+            total,
+            f"Max severity={max_sev_score:.0f}, "
+            f"volume={vol_score:.1f} ({count} events), "
+            f"rule diversity={diversity_bonus:.0f} ({unique_rules} distinct rules)",
         ))
         return total
 
-    def _deviation_multiplier(self, deviation_score, ledger):
+    def _deviation_multiplier(
+        self,
+        deviation_score: float,
+        ledger: List[LedgerEntry],
+    ) -> float:
+        """Convert 0–1 deviation score into a 1.0–1.5× score multiplier."""
         if deviation_score < 0.3:
-            mult, reason = 0.8,  f"Low deviation ({deviation_score:.2f}) → 0.8×"
+            mult = 0.8   # Slightly suppress low-deviation events
+            reason = f"Low deviation ({deviation_score:.2f}) → 0.8× dampener"
         elif deviation_score < 0.6:
-            mult, reason = 1.0,  f"Moderate deviation ({deviation_score:.2f}) → neutral"
+            mult = 1.0
+            reason = f"Moderate deviation ({deviation_score:.2f}) → neutral"
         elif deviation_score < 0.8:
-            mult, reason = 1.25, f"High deviation ({deviation_score:.2f}) → 1.25×"
+            mult = 1.25
+            reason = f"High deviation ({deviation_score:.2f}) → 1.25× boost"
         else:
-            mult, reason = 1.5,  f"Very high deviation ({deviation_score:.2f}) → 1.5×"
-        ledger.append(LedgerEntry("Deviation multiplier", 0.0, reason, "baseline"))
+            mult = 1.5
+            reason = f"Very high deviation ({deviation_score:.2f}) → 1.5× boost"
+        ledger.append(LedgerEntry("Deviation multiplier", 0.0, reason))
         return mult
 
     @staticmethod
     def _deviation_cap(deviation_score: float) -> float:
-        if deviation_score < 0.3:  return 50.0
-        if deviation_score < 0.6:  return 65.0
-        if deviation_score < 0.8:  return 85.0
+        """
+        Absolute score ceiling based on deviation tier.
+
+        The old engine returned 35.0 for low deviation — this killed real
+        attacks where an attacker deliberately stayed within baseline norms
+        (living-off-the-land, known-parent abuse).  Raising to 50.0 ensures
+        those attacks can still alert while still being capped below medium.
+        """
+        if deviation_score < 0.3:
+            return 50.0   # Was 35 — too aggressive, blocked stealth attacks
+        if deviation_score < 0.6:
+            return 65.0
+        if deviation_score < 0.8:
+            return 85.0
         return 100.0
 
-    def _behavior_bonus(self, burst, dst_ip, ledger):
+    def _behavior_bonus(
+        self,
+        burst: Dict[str, Any],
+        dst_ip: str,
+        ledger: List[LedgerEntry],
+    ) -> float:
         bonus = 0.0
         if burst.get("has_persistence"):
             bonus += 15.0
-            ledger.append(LedgerEntry("Persistence +15", 15.0, "Persistence mechanism", "behavior"))
+            ledger.append(LedgerEntry("Persistence +15", 15.0, "Persistence mechanism detected"))
         if burst.get("has_injection"):
             bonus += 25.0
-            ledger.append(LedgerEntry("Injection +25", 25.0, "Process injection", "behavior"))
+            ledger.append(LedgerEntry("Injection +25", 25.0, "Process injection detected"))
         if burst.get("has_net") and dst_ip and not _is_internal_ip(dst_ip):
             bonus += 20.0
-            ledger.append(LedgerEntry("External C2 +20", 20.0, f"External IP: {dst_ip}", "behavior"))
+            ledger.append(LedgerEntry("External C2 +20", 20.0, f"External network: {dst_ip}"))
         elif burst.get("has_net"):
             bonus += 5.0
-            ledger.append(LedgerEntry("Internal net +5", 5.0, "Internal network", "behavior"))
-        if burst.get("cmd_high_entropy") or burst.get("has_encoded_flag") or burst.get("cmd_has_encoded_flag"):
+            ledger.append(LedgerEntry("Internal network +5", 5.0, "Internal network activity"))
+        if burst.get("cmd_high_entropy") or burst.get("cmd_has_encoded_flag"):
             bonus += 10.0
-            ledger.append(LedgerEntry("Encoded cmd +10", 10.0, "High-entropy/encoded command", "behavior"))
-        if burst.get("is_lolbin"):
-            lw = float(burst.get("lolbin_weight") or 0.5)
-            lb = round(lw * 8, 1)
-            bonus += lb
-            ledger.append(LedgerEntry(f"LOLBin +{lb}", lb, f"LOLBin weight={lw:.1f}", "behavior"))
+            ledger.append(LedgerEntry("Encoded cmd +10", 10.0, "High-entropy or encoded command line"))
         return bonus
 
-    def _context_factor(self, image, parent, computer, user, dst_ip, burst, ledger):
+    def _context_factor(
+        self,
+        image: str,
+        parent: str,
+        computer: str,
+        user: str,
+        dst_ip: str,
+        ledger: List[LedgerEntry],
+    ) -> float:
         factor = 1.0
+
+        # Dampen if spawned by known benign parent
         parent_name = parent.split("\\")[-1] if "\\" in parent else parent
         if parent_name in KNOWN_BENIGN_PARENTS:
             factor *= 0.85
-            ledger.append(LedgerEntry("Benign parent -15%", 0.0, f"Parent '{parent_name}'", "context"))
+            ledger.append(LedgerEntry(
+                "Benign parent −15%", 0.0,
+                f"Parent '{parent_name}' is a known benign process",
+            ))
+
+        # Dampen if image is a security tool
         image_name = image.split("\\")[-1] if "\\" in image else image
         if image_name in KNOWN_SECURITY_TOOLS:
             factor *= 0.5
-            ledger.append(LedgerEntry("Security tool -50%", 0.0, f"'{image_name}' is monitoring agent", "context"))
+            ledger.append(LedgerEntry(
+                "Security tool −50%", 0.0,
+                f"'{image_name}' is a known security/monitoring agent",
+            ))
+
+        # Dampen for SYSTEM on internal network (common background service)
         if "SYSTEM" in user and (not dst_ip or _is_internal_ip(dst_ip)):
             factor *= 0.75
-            ledger.append(LedgerEntry("SYSTEM+internal -25%", 0.0, "SYSTEM background service", "context"))
-        total_count = int(burst.get("count") or burst.get("total_count") or 0)
-        if total_count > 500 and factor > 0.5:
-            factor *= 0.85
-            ledger.append(LedgerEntry("High-volume -15%", 0.0, f"{total_count} events — noisy process", "context"))
+            ledger.append(LedgerEntry(
+                "SYSTEM + internal −25%", 0.0,
+                "SYSTEM user with no external connectivity — likely background service",
+            ))
+
         return factor
 
-    def _env_bonus(self, computer, stage, image, ledger):
+    def _env_bonus(
+        self,
+        computer: str,
+        stage: str,
+        image: str,
+        ledger: List[LedgerEntry],
+    ) -> float:
         profile = self.host_profiles.get(computer)
         if not profile:
             return 0.0
         bonus = 0.0
         if profile.get("critical_asset"):
             bonus += 10.0
-            ledger.append(LedgerEntry("Critical asset +10", 10.0, f"{computer} is critical", "other"))
+            ledger.append(LedgerEntry(
+                "Critical asset +10", 10.0,
+                f"{computer} is tagged as a critical asset",
+            ))
         if profile.get("profile_type", "").lower() == "server":
             if any(x in image for x in ["powershell", "cmd", "wmic", "psexec"]):
                 bonus += 15.0
-                ledger.append(LedgerEntry("Server shell +15", 15.0, f"Admin tool on server {computer}", "other"))
+                ledger.append(LedgerEntry(
+                    "Server shell +15", 15.0,
+                    f"Admin tool on server {computer}",
+                ))
         return bonus
 
-    def _compute_interaction_bonus(self, deviation_score, chain_depth, burst, ledger):
-        """All three cases are independent and can stack."""
-        bonus = 0.0
-        has_persistence = bool(burst.get("has_persistence"))
-        has_injection   = bool(burst.get("has_injection"))
-        has_behavioral  = has_persistence or has_injection or bool(burst.get("has_net"))
-
-        # Case 1: statistical anomaly + structural chain
-        if deviation_score >= 0.6 and chain_depth >= 2:
-            bonus += 15.0
-            ledger.append(LedgerEntry("deviation×chain +15", 15.0, f"deviation={deviation_score:.2f} chain={chain_depth}", "other"))
-
-        # Case 2: statistical anomaly + behavioral indicator (independent)
-        if deviation_score >= 0.6 and has_behavioral:
-            bonus += 10.0
-            ledger.append(LedgerEntry("deviation×behavior +10", 10.0, f"deviation={deviation_score:.2f} persist={has_persistence} inject={has_injection}", "other"))
-
-        # Case 3: deep chain + behavioral indicator (independent)
-        if chain_depth >= 2 and has_behavioral:
-            bonus += 8.0
-            ledger.append(LedgerEntry("chain×behavior +8", 8.0, f"chain={chain_depth} persist={has_persistence} inject={has_injection}", "other"))
-
-        return bonus
-
-    def _compute_temporal_bonus(self, burst, ledger):
-        if not burst.get("has_correlation"):
-            return 0.0
-        start, end = burst.get("start_time"), burst.get("end_time")
-        if not start or not end:
-            return 0.0
-        try:
-            t0 = pd.to_datetime(start, errors="coerce", utc=True)
-            t1 = pd.to_datetime(end,   errors="coerce", utc=True)
-            if pd.isna(t0) or pd.isna(t1):
-                return 0.0
-            span = (t1 - t0).total_seconds() / 60.0
-        except Exception:
-            return 0.0
-        if span < 30:
-            return 0.0
-        bonus = min((span - 30) / 30.0 * 5.0, 10.0)
-        ledger.append(LedgerEntry(f"Temporal +{bonus:.0f}", bonus, f"Sustained campaign {span:.0f}min", "other"))
-        return bonus
-
-    def _compute_data_quality(self, burst, detections, ledger):
-        event_count = int(burst.get("count") or burst.get("total_count") or 0)
-        det_count   = len(detections or [])
-        if event_count >= 5 and det_count >= 2:
-            return 1.00
-        if event_count >= 3 or det_count >= 1:
-            ledger.append(LedgerEntry("Quality 0.90×", 0.0, f"{event_count} events, {det_count} dets", "other"))
-            return 0.90
-        ledger.append(LedgerEntry("Quality 0.75×", 0.0, f"Thin: {event_count} events, {det_count} dets", "other"))
-        return 0.75
-
-    def score_detections(self, detections: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        scored = []
-        for det in detections:
-            sev      = (det.get("severity") or "low").lower()
-            base     = SEVERITY_BASE.get(sev, 25.0)
-            stage    = det.get("kill_chain_stage") or "Execution"
-            kc_bonus = max(0, _KC_INDEX.get(stage, 2) - 2) * 5.0
-            final    = min(base + kc_bonus, 100.0)
-            scored.append({**det, "confidence_score": round(final, 1)})
-        return scored
-
-    def _is_suppressed(self, burst, detections):
-        if not self.suppressions:
-            return False
+    def _is_suppressed(
+        self,
+        burst: Dict[str, Any],
+        detections: Optional[List[Dict[str, Any]]],
+    ) -> bool:
         import fnmatch
         image = burst.get("image") or ""
+        dets  = detections or []
         for sup in self.suppressions:
             rule_id = sup.get("rule_id")
             pat     = sup.get("image_pattern", "*")
-            for det in (detections or []):
+            # Check any matching detection
+            for det in dets:
                 if str(det.get("rule_id", "")) == str(rule_id):
                     if fnmatch.fnmatch(image, pat):
                         return True
@@ -559,12 +652,22 @@ def get_scoring_engine(
     suppressions: Optional[List[Dict[str, str]]] = None,
     host_profiles: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> ScoringEngine:
+    """Return the module-level ScoringEngine singleton.
+    If suppressions or host_profiles are provided, always update the engine —
+    do not silently ignore them on 2nd+ calls.
+    """
     global _scoring_engine
     if _scoring_engine is None:
         _scoring_engine = ScoringEngine(
             suppressions=suppressions or [],
             host_profiles=host_profiles or {},
         )
+    elif suppressions is not None or host_profiles is not None:
+        # Caller is explicitly providing new context — update in-place
+        if suppressions is not None:
+            _scoring_engine.suppressions = suppressions
+        if host_profiles is not None:
+            _scoring_engine.host_profiles = host_profiles
     return _scoring_engine
 
 
@@ -573,37 +676,52 @@ def reset_scoring_engine() -> None:
     _scoring_engine = None
 
 
+# ---------------------------------------------------------------------------
+# Standalone explainability helper (for dashboard / API)
+# ---------------------------------------------------------------------------
+
 def explain_score(result: ScoreResult) -> Dict[str, Any]:
+    """
+    Convert a ScoreResult into a dashboard-ready explanation dict.
+    """
     color_map = {
-        "Actions on Objectives": "red", "Exfiltration": "red",
-        "Command and Control": "red", "Lateral Movement": "orange",
-        "Credential Access": "orange", "Persistence": "orange",
-        "Privilege Escalation": "orange", "Defense Evasion": "yellow",
-        "Execution": "yellow",
+        "Actions on Objectives": "red",
+        "Exfiltration":          "red",
+        "Command and Control":   "red",
+        "Lateral Movement":      "orange",
+        "Credential Access":     "orange",
+        "Persistence":           "orange",
+        "Privilege Escalation":  "orange",
+        "Defense Evasion":       "yellow",
+        "Execution":             "yellow",
     }
-    factors = [
-        {"label": e.label, "value": round(e.delta, 1),
-         "color": "red" if e.delta >= 20 else "orange" if e.delta >= 10 else "yellow",
-         "category": e.category}
-        for e in result.ledger if e.delta > 0
-    ]
+
+    factors = []
+    for entry in result.ledger:
+        if entry.delta > 0:
+            factors.append({
+                "label": entry.label,
+                "value": round(entry.delta, 1),
+                "color": "red" if entry.delta >= 20 else "orange" if entry.delta >= 10 else "yellow",
+            })
+
     suggestions = []
-    if result.chain_depth < 2:
-        suggestions.append("Multi-stage kill-chain would amplify score (1.5–4.0×)")
+    if not result.chain_depth or result.chain_depth < 2:
+        suggestions.append("Multi-stage kill-chain progression would amplify score (1.5–4.0×)")
     if result.deviation_used < 0.6:
-        suggestions.append("Higher baseline deviation (>0.6) lifts the deviation cap")
+        suggestions.append("Higher behavioral deviation (>0.6) would raise deviation cap")
+
     return {
-        "score":       result.score,
-        "stage":       result.stage,
-        "stage_cap":   result.stage_cap,
-        "stage_color": color_map.get(result.stage, "gray"),
-        "chain_depth": result.chain_depth,
-        "chain_mult":  result.chain_multiplier,
-        "deviation":   round(result.deviation_used, 3),
-        "factors":     factors,
-        "factor_sum":  sum(f["value"] for f in factors),
-        "suggestions": suggestions,
-        "why":         result.to_dict()["why"],
-        "explanation": result.to_dict()["explanation"],
-        "alertable":   result.score >= 40,
+        "score":         result.score,
+        "stage":         result.stage,
+        "stage_cap":     result.stage_cap,
+        "stage_color":   color_map.get(result.stage, "gray"),
+        "chain_depth":   result.chain_depth,
+        "chain_mult":    result.chain_multiplier,
+        "deviation":     round(result.deviation_used, 3),
+        "factors":       factors,
+        "factor_sum":    sum(f["value"] for f in factors),
+        "suggestions":   suggestions,
+        "why":           result.to_dict()["why"],
+        "alertable":     result.score >= 40,
     }

@@ -1,180 +1,233 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>SentinelTrace — Upload</title>
-<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
-<style>
-:root{--void:#060a10;--surface:#0b1220;--card:#0d1525;--card2:#101929;--border:rgba(255,255,255,.07);--border2:rgba(255,255,255,.12);--text:#e8edf5;--muted:#6b7a94;--dim:#3d4a5e;--cyan:#00d4ff;--cyan2:rgba(0,212,255,.1);--red:#ff4757;--green:#00e676;--amber:#ffb800;--mono:'Space Mono',monospace;--sans:'DM Sans',sans-serif}
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:var(--sans);background:var(--void);color:var(--text);min-height:100vh;overflow-x:hidden}
-body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(rgba(0,212,255,.025) 1px,transparent 1px),linear-gradient(90deg,rgba(0,212,255,.025) 1px,transparent 1px);background-size:48px 48px;pointer-events:none}
-
-/* Topbar */
-.topbar{background:rgba(6,10,16,.9);backdrop-filter:blur(20px);border-bottom:1px solid var(--border);padding:0 32px;height:52px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:100}
-.brand{font-family:var(--mono);font-size:13px;font-weight:700;color:var(--cyan);text-decoration:none;display:flex;align-items:center;gap:8px}
-.brand::before{content:'';width:7px;height:7px;background:var(--cyan);border-radius:50%;box-shadow:0 0 6px var(--cyan);animation:pulse 2s infinite}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
-.nav{display:flex;gap:2px}
-.nav a{color:var(--muted);text-decoration:none;font-size:12px;padding:6px 14px;border-radius:8px;transition:all .15s}
-.nav a:hover,.nav a.active{color:var(--text);background:rgba(255,255,255,.06)}
-
-/* Page */
-.page{display:flex;align-items:center;justify-content:center;min-height:calc(100vh - 52px);padding:32px 24px}
-.card{background:var(--card);border:1px solid var(--border);border-radius:20px;overflow:hidden;width:100%;max-width:900px;display:grid;grid-template-columns:280px 1fr;animation:fadeUp .5s ease}
-@keyframes fadeUp{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:translateY(0)}}
-
-/* Sidebar */
-.sidebar{background:linear-gradient(160deg,rgba(0,212,255,.06) 0%,rgba(0,0,0,.2) 100%);border-right:1px solid var(--border);padding:40px 32px;display:flex;flex-direction:column}
-.sb-brand{display:flex;align-items:center;gap:10px;margin-bottom:24px}
-.sb-icon{width:38px;height:38px;background:var(--cyan2);border:1px solid rgba(0,212,255,.3);border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:18px}
-.sb-brand h1{font-family:var(--mono);font-size:14px;font-weight:700;color:var(--cyan)}
-.sb-desc{font-size:12px;color:var(--muted);margin-bottom:28px;line-height:1.7}
-.sb-features{list-style:none;display:flex;flex-direction:column;gap:10px}
-.sb-features li{display:flex;align-items:center;gap:10px;font-size:12px;color:rgba(255,255,255,.7)}
-.sb-features li::before{content:'';width:5px;height:5px;background:var(--cyan);border-radius:50%;flex-shrink:0;opacity:.8}
-
-/* Main panel */
-.main{padding:36px 36px}
-.flash{background:rgba(0,212,255,.08);border:1px solid rgba(0,212,255,.2);color:#60d8ff;padding:11px 14px;border-radius:8px;font-size:13px;margin-bottom:18px;display:flex;align-items:center;gap:8px}
-.flash.error{background:rgba(255,71,87,.08);border-color:rgba(255,71,87,.2);color:#ff8090}
-.flash::before{content:'ℹ';flex-shrink:0}
-.flash.error::before{content:'⚠'}
-
-.mode-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:22px}
-.mode-card{background:rgba(255,255,255,.03);border:1px solid var(--border);border-radius:12px;padding:16px;transition:border-color .2s,background .2s}
-.mode-card:hover{border-color:var(--border2)}
-.mode-card .mico{font-size:22px;margin-bottom:8px}
-.mode-card h3{font-size:13px;font-weight:600;margin-bottom:5px}
-.mode-card p{font-size:11px;color:var(--muted);line-height:1.5}
-
-.action-row{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:20px}
-.btn{display:flex;align-items:center;justify-content:center;gap:7px;padding:10px 18px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;transition:all .15s;border:1px solid var(--border);background:transparent;color:var(--muted);text-decoration:none;font-family:var(--sans)}
-.btn:hover{background:rgba(255,255,255,.05);color:var(--text)}
-.btn-primary{background:var(--cyan);color:#000;border-color:var(--cyan)}
-.btn-primary:hover{opacity:.85}
-.btn-outline{border-color:rgba(0,230,118,.35);color:var(--green)}
-.btn-outline:hover{background:rgba(0,230,118,.07)}
-
-.divider{border:none;border-top:1px solid var(--border);margin:0 0 20px}
-.form-section{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:var(--muted);margin-bottom:14px}
-.form-group{margin-bottom:18px}
-.form-group label{display:block;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.6px;color:var(--muted);margin-bottom:7px}
-.form-group label .opt{font-weight:400;color:var(--dim);text-transform:none;letter-spacing:0}
-
-.drop-zone{border:2px dashed rgba(0,212,255,.25);border-radius:10px;padding:24px;text-align:center;cursor:pointer;transition:all .2s;background:rgba(0,0,0,.2)}
-.drop-zone:hover,.drop-zone.active{border-color:var(--cyan);background:rgba(0,212,255,.04)}
-.drop-zone .dico{font-size:28px;margin-bottom:8px}
-.drop-zone h4{font-size:13px;font-weight:600;margin-bottom:4px}
-.drop-zone p{font-size:11px;color:var(--muted)}
-.file-ok{display:none;align-items:center;gap:8px;background:rgba(0,230,118,.07);border:1px solid rgba(0,230,118,.2);border-radius:7px;padding:8px 12px;margin-top:8px;font-size:12px;color:var(--green)}
-.file-ok.show{display:flex}
-.file-input{background:rgba(0,0,0,.35);border:1px solid var(--border);color:var(--text);padding:9px 12px;border-radius:8px;font-size:12px;width:100%;font-family:var(--sans);transition:border-color .2s}
-.file-input:focus{outline:none;border-color:var(--cyan)}
-.form-hint{font-size:11px;color:var(--dim);margin-top:5px}
-
-.upload-form{display:none}
-.upload-form.show{display:block}
-
-.submit-btn{width:100%;padding:12px;background:var(--cyan);color:#000;border:none;border-radius:8px;font-size:13px;font-weight:700;cursor:pointer;text-transform:uppercase;letter-spacing:.5px;transition:all .15s;display:flex;align-items:center;justify-content:center;gap:8px;margin-top:4px}
-.submit-btn:hover{opacity:.88}
-</style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SentinelTrace | Home</title>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <style>
+        :root{--bg:#0f172a;--card:rgba(30,41,59,0.85);--border:rgba(148,163,184,0.15);--text:#f1f5f9;--muted:#94a3b8;--dim:#64748b;--blue:#60a5fa;--green:#34d399;--red:#f87171;}
+        *{box-sizing:border-box;margin:0;padding:0;}
+        body{font-family:'Inter',system-ui,sans-serif;background:var(--bg);background-image:linear-gradient(to right,rgba(255,255,255,.03) 1px,transparent 1px),linear-gradient(to bottom,rgba(255,255,255,.03) 1px,transparent 1px);background-size:40px 40px;color:var(--text);min-height:100vh;display:flex;flex-direction:column;}
+        .topbar{background:rgba(15,23,42,.95);border-bottom:1px solid var(--border);padding:0 32px;height:56px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:100;backdrop-filter:blur(12px);flex-shrink:0;}
+        .topbar-left{display:flex;align-items:center;gap:28px;}
+        .brand{font-size:15px;font-weight:700;color:var(--blue);text-transform:uppercase;letter-spacing:1.5px;text-decoration:none;display:flex;align-items:center;gap:8px;}
+        .nav-links{display:flex;gap:2px;}
+        .nav-link{color:var(--muted);text-decoration:none;font-size:13px;padding:6px 14px;border-radius:6px;transition:all .15s;font-weight:500;}
+        .nav-link:hover{background:rgba(255,255,255,.06);color:var(--text);}
+        .nav-link.active{color:var(--blue);background:rgba(96,165,250,.1);}
+        .topbar-right{display:flex;align-items:center;gap:12px;}
+        .user-badge{font-size:12px;color:var(--muted);display:flex;align-items:center;gap:6px;padding:4px 10px;background:rgba(255,255,255,.04);border:1px solid var(--border);border-radius:20px;}
+        .user-badge .role{color:var(--dim);font-size:11px;}
+        .logout-btn{padding:6px 14px;background:rgba(248,113,113,.1);border:1px solid rgba(248,113,113,.3);color:var(--red);border-radius:6px;font-size:12px;font-weight:600;text-decoration:none;transition:all .15s;}
+        .logout-btn:hover{background:rgba(248,113,113,.2);}
+        .page-body{flex:1;display:flex;align-items:center;justify-content:center;padding:40px 24px;}
+        .upload-card{display:grid;grid-template-columns:300px 1fr;background:var(--card);border:1px solid var(--border);border-radius:16px;overflow:hidden;width:100%;max-width:900px;box-shadow:0 25px 50px rgba(0,0,0,.4);backdrop-filter:blur(20px);}
+        .sidebar{background:linear-gradient(160deg,#1e3a5f 0%,#0f2744 100%);padding:44px 32px;display:flex;flex-direction:column;justify-content:center;border-right:1px solid rgba(96,165,250,.15);}
+        .sidebar-brand{display:flex;align-items:center;gap:10px;margin-bottom:20px;}
+        .sidebar-brand .sicon{width:40px;height:40px;background:rgba(96,165,250,.15);border:1px solid rgba(96,165,250,.3);border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:18px;}
+        .sidebar-brand h1{font-size:19px;font-weight:700;color:#fff;}
+        .sidebar p{font-size:13px;color:rgba(255,255,255,.5);margin-bottom:28px;line-height:1.6;}
+        .feature-list{list-style:none;display:flex;flex-direction:column;gap:12px;}
+        .feature-list li{display:flex;align-items:center;gap:10px;font-size:13px;color:rgba(255,255,255,.8);}
+        .feature-list li .ficon{width:24px;height:24px;background:rgba(52,211,153,.15);border-radius:50%;display:flex;align-items:center;justify-content:center;color:var(--green);font-size:11px;flex-shrink:0;}
+        .main-panel{padding:40px 36px;display:flex;flex-direction:column;}
+        .flash-msg{background:rgba(96,165,250,.1);border:1px solid rgba(96,165,250,.25);color:var(--blue);padding:10px 14px;border-radius:8px;font-size:13px;margin-bottom:16px;}
+        .flash-msg.error{background:rgba(248,113,113,.1);border-color:rgba(248,113,113,.25);color:var(--red);}
+        .mode-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:20px;}
+        .mode-card{background:rgba(15,23,42,.5);border:1px solid var(--border);border-radius:10px;padding:16px;transition:border-color .2s;}
+        .mode-card:hover{border-color:rgba(96,165,250,.3);}
+        .mode-card .micon{font-size:20px;margin-bottom:8px;}
+        .mode-card h3{font-size:13px;font-weight:700;color:var(--text);margin-bottom:5px;}
+        .mode-card p{font-size:12px;color:var(--muted);line-height:1.5;}
+        .action-row{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:20px;}
+        .btn{padding:10px 18px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;transition:all .15s;display:flex;align-items:center;justify-content:center;gap:7px;text-decoration:none;border:1px solid transparent;}
+        .btn-primary{background:var(--blue);color:#000;border-color:var(--blue);}
+        .btn-primary:hover{opacity:.88;transform:translateY(-1px);}
+        .btn-outline{background:transparent;color:var(--green);border-color:rgba(52,211,153,.4);}
+        .btn-outline:hover{background:rgba(52,211,153,.08);transform:translateY(-1px);}
+        .upload-form{display:none;}
+        .upload-form.visible{display:block;}
+        .form-divider{border:none;border-top:1px solid var(--border);margin:0 0 20px;}
+        .form-section-title{font-size:12px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;margin-bottom:14px;}
+        .form-group{margin-bottom:16px;}
+        .form-label{display:block;font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:7px;}
+        .drop-zone{border:2px dashed rgba(96,165,250,.3);border-radius:10px;padding:24px 16px;text-align:center;cursor:pointer;transition:all .2s;background:rgba(15,23,42,.4);}
+        .drop-zone:hover,.drop-zone.dzactive{border-color:var(--blue);background:rgba(96,165,250,.06);}
+        .drop-zone i{font-size:26px;color:var(--blue);margin-bottom:8px;display:block;}
+        .drop-zone h4{font-size:13px;color:var(--text);margin-bottom:3px;}
+        .drop-zone p{font-size:11px;color:var(--dim);}
+        .file-selected{display:none;align-items:center;gap:8px;background:rgba(52,211,153,.08);border:1px solid rgba(52,211,153,.25);border-radius:7px;padding:8px 12px;margin-top:8px;font-size:12px;color:var(--green);}
+        .file-selected.visible{display:flex;}
+        .rules-input{width:100%;background:rgba(15,23,42,.5);border:1px solid var(--border);color:var(--text);padding:9px 12px;border-radius:8px;font-size:13px;transition:border-color .2s;}
+        .rules-input:focus{outline:none;border-color:var(--blue);}
+        .form-hint{font-size:11px;color:var(--dim);margin-top:5px;}
+        .submit-btn{width:100%;padding:12px;background:var(--blue);color:#000;border:none;border-radius:8px;font-size:14px;font-weight:700;cursor:pointer;text-transform:uppercase;letter-spacing:.5px;transition:all .15s;display:flex;align-items:center;justify-content:center;gap:8px;margin-top:4px;}
+        .submit-btn:hover{opacity:.88;transform:translateY(-1px);}
+    </style>
 </head>
 <body>
+
 <nav class="topbar">
-  <div style="display:flex;align-items:center;gap:24px">
-    <a href="/" class="brand">⬡ SentinelTrace</a>
-    <div class="nav">
-      <a href="/" class="nav-link active">Home</a>
-      <a href="/triage" class="nav-link">Triage</a>
-      <a href="/hunt" class="nav-link">Hunt</a>
-      <a href="/live" class="nav-link">Live</a>
+    <div class="topbar-left">
+        <a href="/" class="brand">⚡ SentinelTrace</a>
+        {% if current_user %}
+        <div class="nav-links">
+            <a href="/" class="nav-link active">Home</a>
+            <a href="/triage" class="nav-link">Triage</a>
+            <a href="/hunt" class="nav-link">Hunt</a>
+            <a href="/live" class="nav-link">Live</a>
+        </div>
+        {% endif %}
     </div>
-  </div>
+    {% if current_user %}
+    <div class="topbar-right">
+        <div class="user-badge">
+            <i class="fas fa-user-shield" style="color:var(--blue);font-size:11px;"></i>
+            {{ current_user.username }}
+            <span class="role">({{ current_user.role }})</span>
+        </div>
+        <a href="/logout" class="logout-btn"><i class="fas fa-sign-out-alt"></i> Logout</a>
+    </div>
+    {% endif %}
 </nav>
 
-<div class="page">
-  <div class="card">
-    <div class="sidebar">
-      <div class="sb-brand"><div class="sb-icon">🛡</div><h1>Sysmon<br>Analyzer</h1></div>
-      <p class="sb-desc">Upload Sysmon event logs to generate a comprehensive security snapshot with kill chain analysis and behavioral correlation.</p>
-      <ul class="sb-features">
-        <li>Timeline reconstruction</li>
-        <li>Process tree visualization</li>
-        <li>MITRE ATT&CK mapping</li>
-        <li>Statistical baseline deviation</li>
-        <li>Multi-stage correlation</li>
-        <li>56-rule detection engine</li>
-      </ul>
-    </div>
-    <div class="main">
-      {% with messages = get_flashed_messages(with_categories=true) %}
-        {% if messages %}{% for cat, msg in messages %}<div class="flash {% if cat=='error' %}error{% endif %}">{{ msg }}</div>{% endfor %}{% endif %}
-      {% endwith %}
+<div class="page-body">
+    <div class="upload-card">
 
-      <div class="mode-grid">
-        <div class="mode-card"><div class="mico">📂</div><h3>Offline Analysis</h3><p>Upload historical Sysmon XML logs for forensic investigation.</p></div>
-        <div class="mode-card"><div class="mico">📡</div><h3>Live Monitoring</h3><p>Real-time telemetry from endpoint via the SIEM console.</p></div>
-      </div>
-
-      <div class="action-row">
-        <button class="btn btn-primary" onclick="showForm()">📁 Select Offline Analysis</button>
-        <a href="/live" class="btn btn-outline">▶ Start Live SIEM</a>
-      </div>
-
-      <form id="uploadForm" action="{{ url_for('setup_upload') }}" method="post" enctype="multipart/form-data" class="upload-form">
-        <hr class="divider">
-        <div class="form-section">Forensic data source</div>
-        <div class="form-group">
-          <label>Sysmon Event Log (XML) <span style="color:var(--red)">*</span></label>
-          <div class="drop-zone" id="dz" onclick="document.getElementById('xmlFile').click()">
-            <div class="dico">☁</div>
-            <h4>Click to upload or drag & drop</h4>
-            <p>Sysmon-generated .xml event log file</p>
-          </div>
-          <input type="file" id="xmlFile" name="sysmon_xml" accept=".xml" required style="display:none" onchange="onXml(this)">
-          <div class="file-ok" id="xmlOk">✓ <span id="xmlName"></span></div>
+        <div class="sidebar">
+            <div class="sidebar-brand">
+                <div class="sicon">🛡️</div>
+                <h1>Sysmon Analyzer</h1>
+            </div>
+            <p>Upload your Sysmon event logs to generate a comprehensive security snapshot with kill chain analysis.</p>
+            <ul class="feature-list">
+                <li><div class="ficon"><i class="fas fa-check"></i></div> Timeline Reconstruction</li>
+                <li><div class="ficon"><i class="fas fa-check"></i></div> Process Tree Visualization</li>
+                <li><div class="ficon"><i class="fas fa-check"></i></div> MITRE ATT&amp;CK Mapping</li>
+                <li><div class="ficon"><i class="fas fa-check"></i></div> Anomaly Detection</li>
+                <li><div class="ficon"><i class="fas fa-check"></i></div> Behavioral Correlation</li>
+            </ul>
         </div>
-        <div class="form-group">
-          <label>Detection Rules <span class="opt">(optional — YARA .yar/.yara)</span></label>
-          <input type="file" name="rules_file" accept=".yar,.yara" class="file-input">
-          <div class="form-hint">Leave blank to use the built-in 56-rule YAML detection set.</div>
+
+        <div class="main-panel">
+
+            {% with messages = get_flashed_messages(with_categories=true) %}
+                {% if messages %}
+                    {% for category, message in messages %}
+                    <div class="flash-msg {% if category == 'error' %}error{% endif %}">
+                        <i class="fas fa-{% if category == 'error' %}exclamation-circle{% else %}info-circle{% endif %}" style="margin-right:6px;"></i>{{ message }}
+                    </div>
+                    {% endfor %}
+                {% endif %}
+            {% endwith %}
+
+            <div class="mode-grid">
+                <div class="mode-card">
+                    <div class="micon">📂</div>
+                    <h3>Offline Analysis</h3>
+                    <p>Upload historical Sysmon XML logs for forensic investigation and timeline reconstruction.</p>
+                </div>
+                <div class="mode-card">
+                    <div class="micon">📡</div>
+                    <h3>Live Monitoring</h3>
+                    <p>Monitor real-time telemetry and live alerts directly from the endpoint via the SIEM console.</p>
+                </div>
+            </div>
+
+            <div class="action-row">
+                <button class="btn btn-primary" onclick="setMode('offline')" id="btn-offline">
+                    <i class="fas fa-file-upload"></i> Select Offline Analysis
+                </button>
+                <a href="/live" class="btn btn-outline">
+                    <i class="fas fa-play-circle"></i> Start Live SIEM
+                </a>
+            </div>
+
+            <form id="offlineForm" action="{{ url_for('setup_upload') }}" method="post" enctype="multipart/form-data" class="upload-form">
+                <hr class="form-divider">
+                <div class="form-section-title">Forensic Data Source</div>
+
+                <div class="form-group">
+                    <label class="form-label">Sysmon Event Log (XML) <span style="color:var(--red)">*</span></label>
+                    <div class="drop-zone" id="dropZone" onclick="document.getElementById('sysmon_xml').click()">
+                        <i class="fas fa-cloud-upload-alt"></i>
+                        <h4>Click to upload or drag &amp; drop</h4>
+                        <p>Sysmon-generated .xml event log file</p>
+                    </div>
+                    <input type="file" id="sysmon_xml" name="sysmon_xml" accept=".xml" required style="display:none" onchange="onXmlSelected(this)">
+                    <div class="file-selected" id="xmlSelected">
+                        <i class="fas fa-file-code"></i>
+                        <span id="xmlFileName"></span>
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label class="form-label">Detection Rules <span style="color:var(--dim)">(Optional)</span></label>
+                    <input type="file" name="rules_file" id="rules_file" class="rules-input" accept=".yar,.yara,.yaml,.yml">
+                    <div class="form-hint"><i class="fas fa-info-circle" style="margin-right:3px;"></i>YARA (.yar/.yara) or YAML (.yaml/.yml). Leave blank to use built-in 56-rule detection set.</div>
+                </div>
+
+                <button type="submit" class="submit-btn">
+                    <i class="fas fa-rocket"></i> Run Offline Analysis
+                </button>
+            </form>
+
         </div>
-        <button type="submit" class="submit-btn">🚀 Run Analysis</button>
-      </form>
     </div>
-  </div>
 </div>
 
 <script>
-function showForm(){
-  document.getElementById('uploadForm').classList.add('show');
-  document.getElementById('uploadForm').scrollIntoView({behavior:'smooth',block:'nearest'});
+function setMode(mode) {
+    if (mode !== 'offline') return;
+    const form = document.getElementById('offlineForm');
+    const btn  = document.getElementById('btn-offline');
+    form.classList.add('visible');
+    btn.style.background  = 'rgba(96,165,250,.15)';
+    btn.style.borderColor = 'rgba(96,165,250,.5)';
+    btn.style.color       = 'var(--blue)';
+    btn.innerHTML         = '<i class="fas fa-check"></i> Offline Analysis Selected';
+    setTimeout(() => form.scrollIntoView({behavior:'smooth',block:'nearest'}), 50);
 }
-function onXml(inp){
-  if(!inp.files||!inp.files[0])return;
-  const name=inp.files[0].name;
-  document.getElementById('xmlName').textContent=name;
-  document.getElementById('xmlOk').classList.add('show');
-  const dz=document.getElementById('dz');
-  dz.style.borderColor='var(--green)';
-  dz.querySelector('h4').textContent='File selected ✓';
-  dz.querySelector('p').textContent=name;
-  showForm();
+
+function onXmlSelected(input) {
+    if (!input.files || !input.files[0]) return;
+    const name = input.files[0].name;
+    document.getElementById('xmlFileName').textContent = name;
+    document.getElementById('xmlSelected').classList.add('visible');
+    const dz = document.getElementById('dropZone');
+    dz.style.borderColor = 'var(--green)';
+    dz.style.background  = 'rgba(52,211,153,.05)';
+    dz.querySelector('h4').textContent = 'File selected ✓';
+    dz.querySelector('p').textContent  = name;
 }
-const dz=document.getElementById('dz');
-if(dz){
-  dz.addEventListener('dragover',e=>{e.preventDefault();dz.classList.add('active')});
-  dz.addEventListener('dragleave',()=>dz.classList.remove('active'));
-  dz.addEventListener('drop',e=>{
-    e.preventDefault();dz.classList.remove('active');
-    if(e.dataTransfer.files.length){
-      const inp=document.getElementById('xmlFile');
-      const dt=new DataTransfer();dt.items.add(e.dataTransfer.files[0]);
-      inp.files=dt.files;onXml(inp);
-    }
-  });
+
+const dz = document.getElementById('dropZone');
+if (dz) {
+    dz.addEventListener('dragover',  e => { e.preventDefault(); dz.classList.add('dzactive'); });
+    dz.addEventListener('dragleave', () => dz.classList.remove('dzactive'));
+    dz.addEventListener('drop', e => {
+        e.preventDefault(); dz.classList.remove('dzactive');
+        if (e.dataTransfer.files.length) {
+            const inp  = document.getElementById('sysmon_xml');
+            const file = e.dataTransfer.files[0];
+            try {
+                // DataTransfer constructor available in Chrome 60+, Firefox 62+, Safari 14.1+
+                const dt = new DataTransfer();
+                dt.items.add(file);
+                inp.files = dt.files;
+                onXmlSelected(inp);
+            } catch(ex) {
+                // Older browser fallback: show filename, user must confirm via file picker
+                const h4 = dz.querySelector('h4');
+                const p  = dz.querySelector('p');
+                if (h4) h4.textContent = file.name + ' — click Browse to confirm';
+                if (p)  p.textContent  = 'Drag-drop file assignment not supported in this browser';
+                dz.style.borderColor = 'var(--amber, #f59e0b)';
+            }
+            setMode('offline');
+        }
+    });
 }
 </script>
 </body>

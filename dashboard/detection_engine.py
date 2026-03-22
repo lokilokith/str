@@ -179,34 +179,12 @@ def match_rules(event: Dict[str, Any], rules: List[Dict]) -> List[Dict[str, Any]
             if parent_name in BENIGN_PARENTS:
                 continue
 
-        # ── Behavioral condition matching (NEW) ──────────────────────────
-        # Rules can declare: cmd_entropy_gt, is_lolbin, has_encoded_flag
-        if (thresh := rule.get("cmd_entropy_gt")) is not None:
-            if float(event.get("cmd_entropy") or 0.0) <= float(thresh):
-                continue
-        if rule.get("is_lolbin") is True:
-            if not event.get("is_lolbin"):
-                continue
-        if rule.get("has_encoded_flag") is True:
-            if not (event.get("has_encoded_flag") or event.get("cmd_has_encoded_flag")):
-                continue
-
-        # Compute per-hit confidence with stacked signal boosts
+        # Compute per-hit confidence boost from entropy / encoding signals
         conf = int(rule.get("confidence", 50))
-        if event.get("cmd_high_entropy") or event.get("is_high_entropy"):
+        if event.get("cmd_high_entropy"):
             conf = min(conf + 15, 100)
-        if event.get("cmd_b64_detected") or event.get("b64_detected"):
+        if event.get("cmd_b64_detected") or event.get("cmd_has_encoded_flag"):
             conf = min(conf + 10, 100)
-        if event.get("has_encoded_flag") or event.get("cmd_has_encoded_flag"):
-            conf = min(conf + 10, 100)
-        # LOLBin weight amplifies confidence proportionally
-        lw = float(event.get("lolbin_weight") or 0.0)
-        if lw > 0:
-            conf = min(int(conf * (1.0 + lw * 0.2)), 100)
-        if event.get("is_external_ip"):
-            conf = min(conf + 8, 100)
-        if event.get("is_suspicious_chain"):
-            conf = min(conf + 5, 100)
 
         hits.append({
             "rule_id":          rule.get("rule_id"),
@@ -373,7 +351,11 @@ def analyze_burst_batch(
 
     baseline  = _get_baseline_engine()
     scorer    = _get_scoring_engine()
-    correlate = _get_correlate_bursts()
+    try:
+        correlate = _get_correlate_bursts()
+    except Exception as _ce:
+        print(f"[DetectionEngine] correlation_engine import failed: {_ce} — skipping correlation")
+        correlate = lambda bursts, run_id, persist=True: (bursts, [])
 
     # ── Step 1: Baseline scoring (mutates bursts in-place) ─────────────
     baseline.process_burst_batch(bursts)
@@ -476,10 +458,7 @@ def analyze_burst_batch(
         host_noise[host] = host_noise.get(host, 0) + int(b.get("count") or 1)
 
     for burst in bursts:
-        dev_score      = float(burst.get("deviation_score") or 0.0)
-        # Wire behavior_score from baseline into the burst so scoring engine can fuse it
-        behavior_score = float(burst.get("behavior_score") or dev_score)
-        burst["behavior_score"] = behavior_score
+        dev_score = float(burst.get("deviation_score") or 0.0)
 
         # ── Real chain depth calculation ───────────────────────────────────
         # v1 heuristic: "if baseline flagged anything → chain_depth = 2" — wrong.
@@ -509,22 +488,8 @@ def analyze_burst_batch(
             deviation_score=dev_score,
             chain_depth=chain_depth,
         )
-        # Compute final fused score using multi-signal compute_final_score
-        from dashboard.scoring_engine import compute_final_score
-        fused_input = dict(burst)
-        fused_input["rule_score"]     = result.score
-        fused_input["sequence_score"] = float(burst.get("baseline_sub_scores", {}).get("sequence", 0.0)) * 100
-        fused_input["behavior_score"] = behavior_score
-        fused_input["yara_score"]     = float(burst.get("yara_score") or 0.0)
-        fused_input["feedback_adj"]   = 0.0
-        fused_score = compute_final_score(fused_input)
-        # Take the higher of the two scoring paths — never lose signal
-        if fused_score > int(round(result.score)):
-            burst["risk_score"] = fused_score
-        else:
-            burst["risk_score"] = int(round(result.score))
 
-        # risk_score already set above by fused scoring path
+        burst["risk_score"]          = int(round(result.score))
         burst["score_ledger"]        = [e.to_dict() for e in result.ledger]
         burst["confidence_reasons"]  = result.to_dict()["why"]
         burst["stage_cap"]           = int(result.stage_cap)
@@ -578,11 +543,9 @@ def analyze_burst_batch(
         # Clean temp field
         burst.pop("_detection_hits", None)
 
-    # ── Step 6: Save updated baselines ─────────────────────────────────
-    try:
-        baseline.save_to_db()
-    except Exception as e:
-        print(f"[DetectionEngine] baseline save failed: {e}")
+    # ── Step 6: Baseline save handled by analysis_engine.persist_behavior_baseline()
+    # Do NOT call baseline.save_to_db() here — analysis_engine manages that
+    # after all scoring is complete, preventing double-writes.
 
     return {
         "bursts":     bursts,

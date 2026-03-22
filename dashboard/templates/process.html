@@ -45,7 +45,7 @@
     {% set child_count = child_summary|length if child_summary else 0 %}
 
     <h1>Process details: {{ image }}</h1>
-    <p><a href="{{ url_for('dashboard') }}">&larr; Back to dashboard</a></p>
+    <p><a href="{{ url_for('dashboard', run_id=session.get('analysis_run_id','')) }}">&larr; Back to dashboard</a></p>
 
     <!-- ===== CONTEXT ASSESSMENT BOX ===== -->
     <div class="context-assessment">

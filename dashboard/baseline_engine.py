@@ -753,7 +753,10 @@ class BaselineEngine:
                             "network_total", "network_subnet_total"]:
                     df[col] = 0
             except Exception as e:
-                print(f"[BaselineEngine] load_from_db failed: {e}")
+                import traceback
+                print(f"[BaselineEngine] load_from_db failed (v2 cols): {e}")
+                print(f"[BaselineEngine] Continuing with empty baseline — next upload will build it.")
+                traceback.print_exc()
                 return
 
         for _, row in df.iterrows():
@@ -835,22 +838,32 @@ class BaselineEngine:
             print(f"[BaselineEngine] save_to_db import failed: {e}")
             return
 
-        # Build upsert with all v2 columns
-        stmt = sql_upsert(
-            "behavior_baseline",
-            ["computer", "process_name", "user_type", "parent_process",
+        # Build upsert — check if decay_updates column exists first
+        try:
+            from dashboard.db import get_db_connection as _gdbc, get_cursor as _gcur, get_table_columns as _gtc
+            with _gdbc("live") as _chk_conn:
+                with _gcur(_chk_conn) as _chk_cur:
+                    _bb_cols = set(_gtc(_chk_cur, "behavior_baseline"))
+            _has_decay = "decay_updates" in _bb_cols
+        except Exception:
+            _has_decay = False
+
+        _insert_cols = ["computer", "process_name", "user_type", "parent_process",
              "hour_bucket", "avg_exec", "var_exec", "avg_cmd_len", "avg_followup",
              "count_samples", "seen_days", "last_updated",
              "seq_bigram_json", "seq_trigram_json", "seq_2_total", "seq_3_total",
              "network_ip_json", "network_subnet_json",
-             "network_total", "network_subnet_total", "decay_updates"],
-            [],
-            ["avg_exec", "var_exec", "avg_cmd_len", "avg_followup",
+             "network_total", "network_subnet_total"]
+        _update_cols = ["avg_exec", "var_exec", "avg_cmd_len", "avg_followup",
              "count_samples", "seen_days", "last_updated",
              "seq_bigram_json", "seq_trigram_json", "seq_2_total", "seq_3_total",
              "network_ip_json", "network_subnet_json",
-             "network_total", "network_subnet_total", "decay_updates"],
-        )
+             "network_total", "network_subnet_total"]
+        if _has_decay:
+            _insert_cols.append("decay_updates")
+            _update_cols.append("decay_updates")
+
+        stmt = sql_upsert("behavior_baseline", _insert_cols, [], _update_cols)
         ts      = now_utc()
         items   = list(self._profiles.items())
         BATCH   = 200
@@ -874,7 +887,7 @@ class BaselineEngine:
                         for (computer, user_type, image), profile in batch:
                             n   = profile.exec_stats.n
                             var = profile.exec_stats.variance
-                            cur.execute(stmt, (
+                            _row_vals = (
                                 computer, image, user_type, "unknown", 0,
                                 profile.exec_stats.mean,
                                 var,
@@ -892,8 +905,10 @@ class BaselineEngine:
                                 _json.dumps(dict(profile.network_subnet_counts)) or None,
                                 profile.network_total,
                                 profile.network_subnet_total,
-                                profile._updates,
-                            ))
+                            )
+                            if _has_decay:
+                                _row_vals = _row_vals + (profile._updates,)
+                            cur.execute(stmt, _row_vals)
                     conn.commit()
         except Exception as e:
             import traceback
@@ -944,14 +959,25 @@ _engine: Optional[BaselineEngine] = None
 
 
 def get_baseline_engine() -> BaselineEngine:
+    """
+    Return the module-level BaselineEngine singleton.
+    The engine loads from DB on first call and caches in memory.
+    Call reset_baseline_engine() between upload runs to force a fresh DB load.
+    """
     global _engine
     if _engine is None:
         _engine = BaselineEngine()
-        _engine.load_from_db()
+        try:
+            _engine.load_from_db()
+        except Exception as e:
+            print(f"[BaselineEngine] load_from_db failed in get_baseline_engine: {e}")
     return _engine
 
 
 def reset_baseline_engine() -> None:
-    """Force reload (useful after DB migrations or tests)."""
+    """Force reload on next get_baseline_engine() call.
+    Call this between upload analysis runs to pick up newly-saved baseline data.
+    """
     global _engine
     _engine = None
+    print("[BaselineEngine] Engine reset — will reload from DB on next call")

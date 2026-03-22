@@ -4,174 +4,306 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>SentinelTrace | Triage Queue</title>
-<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
 <style>
-:root{--void:#060a10;--card:#0d1525;--card2:#101929;--border:rgba(255,255,255,.07);--border2:rgba(255,255,255,.12);--text:#e8edf5;--muted:#6b7a94;--dim:#3d4a5e;--cyan:#00d4ff;--red:#ff4757;--amber:#ffb800;--green:#00e676;--mono:'Space Mono',monospace;--sans:'DM Sans',sans-serif}
+:root{
+  --bg:#0f172a;--card:rgba(30,41,59,.85);--border:rgba(148,163,184,.15);
+  --text:#f1f5f9;--muted:#94a3b8;--dim:#64748b;
+  --blue:#60a5fa;--cyan:#22d3ee;--red:#f87171;--orange:#fbbf24;--green:#34d399;
+  --font:'Inter',system-ui,sans-serif;--mono:'JetBrains Mono',monospace;
+}
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:var(--sans);background:var(--void);color:var(--text);min-height:100vh}
-body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(rgba(0,212,255,.02) 1px,transparent 1px),linear-gradient(90deg,rgba(0,212,255,.02) 1px,transparent 1px);background-size:48px 48px;pointer-events:none}
+body{font-family:var(--font);background:var(--bg);color:var(--text);min-height:100vh}
 
-.topbar{background:rgba(6,10,16,.92);backdrop-filter:blur(20px);border-bottom:1px solid var(--border);padding:0 28px;height:52px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:200}
-.brand{font-family:var(--mono);font-size:13px;font-weight:700;color:var(--cyan);display:flex;align-items:center;gap:8px}
-.brand::before{content:'';width:7px;height:7px;background:var(--cyan);border-radius:50%;animation:pulse 2s infinite}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
-.nav{display:flex;gap:2px}
-.nav a{color:var(--muted);text-decoration:none;font-size:12px;padding:6px 14px;border-radius:8px;transition:all .15s}
-.nav a:hover,.nav a.active{color:var(--text);background:rgba(255,255,255,.06)}
+.topbar{background:rgba(15,23,42,.9);border-bottom:1px solid var(--border);padding:14px 28px;
+  display:flex;justify-content:space-between;align-items:center;position:sticky;top:0;z-index:50}
+.topbar h1{font-size:16px;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:var(--blue)}
+.topbar-right{display:flex;gap:12px;align-items:center}
+.container{max-width:1500px;margin:0 auto;padding:28px}
 
-.page{max-width:1500px;margin:0 auto;padding:28px}
-.page-hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:24px}
-.page-hdr h1{font-size:20px;font-weight:600}
-.refresh-btn{background:rgba(0,212,255,.08);border:1px solid rgba(0,212,255,.2);color:var(--cyan);padding:7px 16px;border-radius:8px;cursor:pointer;font-size:12px;font-weight:600;transition:all .15s}
-.refresh-btn:hover{background:rgba(0,212,255,.15)}
+/* Stat cards */
+.stats-row{display:grid;grid-template-columns:repeat(5,1fr);gap:16px;margin-bottom:28px}
+.stat{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:20px}
+.stat .num{font-size:32px;font-weight:700;font-family:var(--mono)}
+.stat .lbl{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;margin-top:4px}
+.stat.crit .num{color:var(--red)}
+.stat.warn .num{color:var(--orange)}
+.stat.ok   .num{color:var(--green)}
+.stat.info .num{color:var(--blue)}
 
-.stats-row{display:grid;grid-template-columns:repeat(5,1fr);gap:14px;margin-bottom:26px}
-.stat{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:18px;animation:fadeUp .4s ease both}
-@keyframes fadeUp{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}
-.stat:nth-child(2){animation-delay:.05s}.stat:nth-child(3){animation-delay:.1s}.stat:nth-child(4){animation-delay:.15s}.stat:nth-child(5){animation-delay:.2s}
-.stat-num{font-family:var(--mono);font-size:30px;font-weight:700}
-.stat-lbl{font-size:10px;text-transform:uppercase;letter-spacing:.8px;color:var(--muted);margin-top:4px}
-
-.table-wrap{background:var(--card);border:1px solid var(--border);border-radius:14px;overflow:hidden;animation:fadeUp .4s .2s ease both}
-.table-hdr{padding:14px 18px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;gap:12px}
-.table-hdr h2{font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--muted);font-weight:600}
-.filter-row{display:flex;gap:8px;padding:10px 14px;border-bottom:1px solid var(--border);background:rgba(0,0,0,.15);flex-wrap:wrap}
-select{background:rgba(0,0,0,.4);border:1px solid var(--border);color:var(--text);padding:5px 10px;border-radius:6px;font-size:12px;font-family:var(--sans);transition:border-color .2s}
-select:focus{outline:none;border-color:var(--cyan)}
-select option{background:#0b1220}
-
+/* Table wrapper */
+.table-wrap{background:var(--card);border:1px solid var(--border);border-radius:12px;overflow:hidden}
+.table-head{padding:16px 20px;border-bottom:1px solid var(--border);
+  display:flex;justify-content:space-between;align-items:center}
+.table-head h2{font-size:13px;text-transform:uppercase;color:var(--muted);letter-spacing:1px}
 table{width:100%;border-collapse:collapse;font-size:12px}
-th{padding:10px 14px;text-align:left;color:var(--dim);font-size:10px;text-transform:uppercase;letter-spacing:.6px;border-bottom:1px solid var(--border);background:rgba(0,0,0,.2);font-weight:600}
-td{padding:10px 14px;border-bottom:1px solid var(--border);vertical-align:middle}
-tr:last-child td{border-bottom:none}
+th{padding:11px 14px;text-align:left;color:var(--dim);text-transform:uppercase;font-size:10px;
+   border-bottom:1px solid var(--border);letter-spacing:.5px;font-weight:600}
+td{padding:11px 14px;border-bottom:1px solid var(--border);vertical-align:middle}
 tr:hover td{background:rgba(255,255,255,.02)}
 
+/* Badges */
 .badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:700;text-transform:uppercase}
-.b-critical{background:rgba(255,71,87,.15);color:var(--red);border:1px solid rgba(255,71,87,.25)}
-.b-high{background:rgba(255,184,0,.12);color:var(--amber);border:1px solid rgba(255,184,0,.2)}
-.b-medium{background:rgba(0,212,255,.1);color:#60d8ff;border:1px solid rgba(0,212,255,.15)}
-.b-low{background:rgba(107,122,148,.12);color:var(--muted);border:1px solid var(--border)}
-.b-green{background:rgba(0,230,118,.1);color:var(--green);border:1px solid rgba(0,230,118,.15)}
-.b-purple{background:rgba(168,85,247,.12);color:#c084fc;border:1px solid rgba(168,85,247,.2)}
-.b-gray{background:rgba(255,255,255,.05);color:var(--muted)}
+.badge-critical{background:rgba(248,113,113,.15);color:var(--red);border:1px solid rgba(248,113,113,.3)}
+.badge-high    {background:rgba(251,191,36,.15);color:var(--orange);border:1px solid rgba(251,191,36,.3)}
+.badge-medium  {background:rgba(96,165,250,.15);color:var(--blue);border:1px solid rgba(96,165,250,.3)}
+.badge-low     {background:rgba(52,211,153,.15);color:var(--green);border:1px solid rgba(52,211,153,.3)}
+.badge-chain   {background:rgba(96,165,250,.15);color:var(--blue);font-size:10px;padding:2px 6px;border-radius:3px}
+.badge-v2      {background:rgba(34,211,238,.12);color:var(--cyan);font-size:9px;padding:1px 5px;border-radius:3px}
+.badge-v1      {background:rgba(100,116,139,.12);color:var(--dim);font-size:9px;padding:1px 5px;border-radius:3px}
 
-.sla-red{color:var(--red);font-family:var(--mono);font-size:11px}
-.sla-amber{color:var(--amber);font-family:var(--mono);font-size:11px}
-.sla-green{color:var(--green);font-family:var(--mono);font-size:11px}
-.sla-gray{color:var(--muted);font-family:var(--mono);font-size:11px}
+/* SLA badges */
+.sla-badge{font-size:10px;font-weight:600;padding:2px 7px;border-radius:3px}
+.sla-red   {background:rgba(248,113,113,.2);color:var(--red)}
+.sla-orange{background:rgba(251,191,36,.2);color:var(--orange)}
+.sla-green {background:rgba(52,211,153,.2);color:var(--green)}
+.sla-gray  {background:rgba(100,116,139,.2);color:var(--dim)}
 
-.conf-wrap{display:flex;align-items:center;gap:7px}
-.conf-bar{width:52px;height:4px;background:rgba(255,255,255,.08);border-radius:2px;overflow:hidden;flex-shrink:0}
-.conf-fill{height:100%;border-radius:2px}
+/* Confidence bar */
+.conf-bar{width:72px;height:5px;background:rgba(255,255,255,.1);border-radius:3px;display:inline-block;overflow:hidden;vertical-align:middle}
+.conf-fill{height:100%;border-radius:3px;transition:width .3s}
 
-.action-btn{padding:4px 10px;border-radius:5px;border:1px solid var(--border);background:transparent;color:var(--muted);cursor:pointer;font-size:11px;transition:all .15s;text-decoration:none;display:inline-block;font-family:var(--sans)}
-.action-btn:hover{border-color:var(--cyan);color:var(--cyan)}
-.action-btn.esc{border-color:rgba(255,71,87,.3);color:var(--red)}
-.action-btn.esc:hover{background:rgba(255,71,87,.08)}
-.action-btn.ok{border-color:rgba(0,230,118,.3);color:var(--green)}
-.action-btn.ok:hover{background:rgba(0,230,118,.07)}
+/* Deviation mini bar */
+.dev-bar{background:rgba(255,255,255,.08);border-radius:2px;height:5px;width:40px;overflow:hidden;display:inline-block;vertical-align:middle}
+.dev-fill{height:100%;border-radius:2px;display:block}
 
-.empty{text-align:center;padding:48px;color:var(--dim);font-size:13px}
-.empty-icon{font-size:32px;margin-bottom:10px}
+/* Action buttons */
+.action-btn{padding:5px 10px;border-radius:5px;border:1px solid var(--border);background:transparent;
+  color:var(--muted);cursor:pointer;font-size:11px;transition:all .15s;text-decoration:none;display:inline-block}
+.action-btn:hover{border-color:var(--blue);color:var(--blue)}
+.action-btn.escalate{border-color:rgba(248,113,113,.4);color:var(--red)}
+.action-btn.escalate:hover{background:rgba(248,113,113,.1)}
+.action-btn.investigate{border-color:rgba(96,165,250,.4);color:var(--blue)}
+.action-btn.investigate:hover{background:rgba(96,165,250,.1)}
+.action-btn.dismiss{border-color:rgba(52,211,153,.4);color:var(--green)}
+.action-btn.dismiss:hover{background:rgba(52,211,153,.1)}
+
+/* Nav */
+.nav-link{color:var(--muted);text-decoration:none;font-size:13px;padding:6px 12px;border-radius:6px;transition:all .15s}
+.nav-link:hover{background:rgba(255,255,255,.05);color:var(--text)}
+.nav-link.active{color:var(--blue)}
+.refresh-btn{padding:7px 14px;background:rgba(96,165,250,.1);border:1px solid rgba(96,165,250,.3);
+  color:var(--blue);border-radius:6px;cursor:pointer;font-size:12px;font-weight:600}
+.filter-bar{display:flex;gap:10px;align-items:center;padding:12px 16px;
+  border-bottom:1px solid var(--border);background:rgba(15,23,42,.3)}
+.filter-select{background:rgba(15,23,42,.8);border:1px solid var(--border);color:var(--text);
+  padding:5px 10px;border-radius:5px;font-size:12px}
+.empty-state{text-align:center;padding:60px;color:var(--dim);font-size:14px}
 </style>
 </head>
 <body>
+
 <div class="topbar">
-  <div style="display:flex;gap:22px;align-items:center">
-    <div class="brand">⬡ SentinelTrace</div>
-    <nav class="nav">
-      <a href="/">Dashboard</a>
-      <a href="/triage" class="active">Triage</a>
-      <a href="/hunt">Hunt</a>
-      <a href="/live">Live</a>
+  <div style="display:flex;gap:24px;align-items:center">
+    <h1>⚡ SentinelTrace</h1>
+    <nav style="display:flex;gap:4px">
+      <a href="/" class="nav-link">Dashboard</a>
+      <a href="/triage" class="nav-link active">Triage</a>
+      <a href="/hunt" class="nav-link">Hunt</a>
+      <a href="/live" class="nav-link">Live</a>
     </nav>
   </div>
-  <button class="refresh-btn" onclick="location.reload()">↻ Refresh</button>
+  <div class="topbar-right">
+    <span style="font-size:11px;color:var(--dim)">SOC Queue</span>
+    <button class="refresh-btn" onclick="location.reload()">↻ Refresh</button>
+  </div>
 </div>
 
-<div class="page">
-  <div class="page-hdr">
-    <h1>SOC Triage Queue</h1>
-    <span style="font-size:12px;color:var(--muted);font-family:var(--mono)">{{ total }} active · {{ unreviewed }} unreviewed</span>
-  </div>
+<div class="container">
 
+  <!-- Stats Row -->
   <div class="stats-row">
-    <div class="stat"><div class="stat-num" style="color:var(--red)">{{ incidents|selectattr('sla','defined')|selectattr('sla.breached','equalto',True)|list|length }}</div><div class="stat-lbl">SLA Breached</div></div>
-    <div class="stat"><div class="stat-num" style="color:var(--amber)">{{ unreviewed }}</div><div class="stat-lbl">Unreviewed</div></div>
-    <div class="stat"><div class="stat-num">{{ total }}</div><div class="stat-lbl">Total Active</div></div>
-    <div class="stat"><div class="stat-num" style="color:var(--green)">{{ incidents|selectattr('status','equalto','Investigating')|list|length }}</div><div class="stat-lbl">Investigating</div></div>
-    <div class="stat"><div class="stat-num" style="color:var(--cyan)">{{ incidents|selectattr('status','equalto','Escalated')|list|length }}</div><div class="stat-lbl">Escalated</div></div>
+    <div class="stat crit">
+      <div class="num">{{ incidents|selectattr('sla')|selectattr('sla.breached','equalto',True)|list|length }}</div>
+      <div class="lbl">SLA Breached</div>
+    </div>
+    <div class="stat warn">
+      <div class="num">{{ unreviewed }}</div>
+      <div class="lbl">Unreviewed</div>
+    </div>
+    <div class="stat">
+      <div class="num">{{ total }}</div>
+      <div class="lbl">Total Active</div>
+    </div>
+    <div class="stat ok">
+      <div class="num">{{ incidents|selectattr('status','equalto','Investigating')|list|length }}</div>
+      <div class="lbl">Investigating</div>
+    </div>
+    <div class="stat info">
+      <div class="num">{{ incidents|selectattr('status','equalto','Escalated')|list|length }}</div>
+      <div class="lbl">Escalated</div>
+    </div>
   </div>
 
+  <!-- Table -->
   <div class="table-wrap">
-    <div class="table-hdr">
-      <h2>Active incidents — priority queue</h2>
-      <span style="font-size:11px;color:var(--dim)">v2 engine fields where available</span>
+    <div class="table-head">
+      <h2>Active Incidents — Priority Queue</h2>
+      <span style="font-size:11px;color:var(--dim)">v2 engine fields shown where available</span>
     </div>
-    <div class="filter-row">
-      <select onchange="filterTable(this.value,'status')">
+    <div class="filter-bar">
+      <span style="font-size:11px;color:var(--muted)">Filter:</span>
+      <select class="filter-select" onchange="filterTable(this.value,'status')">
         <option value="">All Status</option>
-        <option>New</option><option>Triage</option><option>Investigating</option><option>Escalated</option>
+        <option>New</option><option>Triage</option>
+        <option>Investigating</option><option>Escalated</option>
       </select>
-      <select onchange="filterTable(this.value,'sev')">
+      <select class="filter-select" onchange="filterTable(this.value,'sev')">
         <option value="">All Severity</option>
         <option>High</option><option>Medium</option><option>Low</option>
+      </select>
+      <select class="filter-select" onchange="filterTable(this.value,'engine')">
+        <option value="">All Engines</option>
+        <option value="v2">v2 Engine</option>
+        <option value="v1">v1 Legacy</option>
       </select>
     </div>
 
     {% if incidents %}
     <table id="triageTable">
       <thead>
-        <tr><th>Incident</th><th>Status</th><th>Severity</th><th>Confidence</th><th>SLA</th><th>Analyst</th><th>Created</th><th>Actions</th></tr>
+        <tr>
+          <th>Incident</th>
+          <th>Status</th>
+          <th>Severity</th>
+          <th>Confidence</th>
+          <th>Chain / Deviation</th>
+          <th>SLA</th>
+          <th>Engine</th>
+          <th>Analyst</th>
+          <th>Created</th>
+          <th>Actions</th>
+        </tr>
       </thead>
       <tbody>
-      {% for inc in incidents %}
-      {% set sev = (inc.severity or 'medium') | lower %}
-      <tr data-status="{{ inc.status }}" data-sev="{{ inc.severity }}">
-        <td>
-          <a href="/dashboard/{{ inc.run_id }}" style="color:var(--cyan);font-family:var(--mono);font-weight:700;text-decoration:none">{{ inc.incident_id }}</a>
-          <div style="font-size:10px;color:var(--dim);margin-top:2px;font-family:var(--mono)">{{ inc.run_id[:12] }}</div>
-        </td>
-        <td><span class="badge b-{% if inc.status in ['Escalated'] %}critical{% elif inc.status in ['Investigating','Triage'] %}medium{% else %}gray{% endif %}">{{ inc.status }}</span></td>
-        <td><span class="badge b-{% if sev == 'high' %}critical{% elif sev == 'medium' %}high{% else %}low{% endif %}">{{ inc.severity or 'Med' }}</span></td>
-        <td>
-          <div class="conf-wrap">
-            <span style="font-family:var(--mono);font-size:12px;color:{% if inc.confidence >= 70 %}var(--red){% elif inc.confidence >= 40 %}var(--amber){% else %}var(--green){% endif %}">{{ inc.confidence }}</span>
-            <div class="conf-bar"><div class="conf-fill" style="width:{{ inc.confidence }}%;background:{% if inc.confidence >= 70 %}var(--red){% elif inc.confidence >= 40 %}var(--amber){% else %}var(--cyan){% endif %}"></div></div>
-          </div>
-        </td>
-        <td>
-          {% if inc.sla %}
-          <span class="sla-{% if inc.sla.breached %}red{% elif inc.sla.hours_remaining < 2 %}amber{% else %}green{% endif %}">{{ inc.sla.label }}</span>
-          {% else %}<span class="sla-gray">—</span>{% endif %}
-        </td>
-        <td style="color:var(--muted);font-size:11px">{{ inc.analyst or '—' }}</td>
-        <td style="color:var(--dim);font-size:11px;font-family:var(--mono)">{{ (inc.created_at or '')[:16] }}</td>
-        <td>
-          <div style="display:flex;gap:5px;flex-wrap:wrap">
-            <a href="/dashboard/{{ inc.run_id }}" class="action-btn">Investigate</a>
-            <button class="action-btn esc" onclick="transition('{{ inc.incident_id }}','Escalated')">Escalate</button>
-            <button class="action-btn ok" onclick="transition('{{ inc.incident_id }}','Closed - False Positive')">FP</button>
-          </div>
-        </td>
-      </tr>
-      {% endfor %}
+        {% for inc in incidents %}
+        {% set has_v2 = inc.chain_depth is defined or inc.deviation_score is defined %}
+        {% set dp = ((inc.deviation_score or 0) * 100)|int if inc.deviation_score is defined else -1 %}
+        {% set dev_col = '#f87171' if dp >= 70 else '#fbbf24' if dp >= 40 else '#34d399' if dp >= 0 else '#64748b' %}
+        <tr data-status="{{ inc.status }}" data-sev="{{ inc.severity }}" data-engine="{{ 'v2' if has_v2 else 'v1' }}">
+
+          <!-- Incident ID + run -->
+          <td>
+            <a href="/dashboard/{{ inc.run_id }}" style="color:var(--blue);font-family:var(--mono);font-weight:600">
+              {{ inc.incident_id }}
+            </a>
+            <div style="font-size:10px;color:var(--dim);margin-top:2px;font-family:var(--mono)">run: {{ inc.run_id[:8] }}</div>
+          </td>
+
+          <!-- Status -->
+          <td>
+            <span class="badge badge-{{ (inc.severity or 'medium')|lower }}">{{ inc.status }}</span>
+          </td>
+
+          <!-- Severity -->
+          <td>
+            {% set sev = (inc.severity or 'medium')|lower %}
+            <span class="badge badge-{{ sev }}">{{ inc.severity or 'Medium' }}</span>
+          </td>
+
+          <!-- Confidence bar -->
+          <td>
+            <div style="display:flex;align-items:center;gap:8px">
+              <span style="font-family:var(--mono);font-size:12px;color:{% if inc.confidence >= 70 %}var(--red){% elif inc.confidence >= 40 %}var(--orange){% else %}var(--green){% endif %}">
+                {{ inc.confidence }}
+              </span>
+              <div class="conf-bar">
+                <div class="conf-fill" style="width:{{ inc.confidence }}%;background:
+                  {% if inc.confidence >= 70 %}var(--red){% elif inc.confidence >= 40 %}var(--orange){% else %}var(--green){% endif %}">
+                </div>
+              </div>
+            </div>
+          </td>
+
+          <!-- Chain depth + deviation (v2 fields) -->
+          <td>
+            {% if inc.chain_depth and inc.chain_depth > 1 %}
+              <span class="badge badge-chain" style="margin-right:5px">{{ inc.chain_depth }}×</span>
+            {% endif %}
+            {% if dp >= 0 %}
+            <div style="display:flex;align-items:center;gap:5px;margin-top:3px">
+              <span class="dev-bar"><span class="dev-fill" style="width:{{ dp }}%;background:{{ dev_col }}"></span></span>
+              <span style="font-size:10px;font-family:var(--mono);color:{{ dev_col }}">{{ dp }}%</span>
+            </div>
+            {% elif not inc.chain_depth or inc.chain_depth <= 1 %}
+            <span style="color:var(--dim);font-size:11px">—</span>
+            {% endif %}
+          </td>
+
+          <!-- SLA -->
+          <td>
+            {% if inc.sla %}
+              {% set sla_col = 'sla-red' if inc.sla.breached else ('sla-orange' if inc.sla.hours_remaining < 2 else 'sla-green') %}
+              <span class="sla-badge {{ sla_col }}">{{ inc.sla.label }}</span>
+            {% else %}
+              <span class="sla-badge sla-gray">—</span>
+            {% endif %}
+          </td>
+
+          <!-- Engine source badge -->
+          <td>
+            {% if has_v2 %}
+              <span class="badge badge-v2">v2</span>
+            {% else %}
+              <span class="badge badge-v1">v1</span>
+            {% endif %}
+          </td>
+
+          <!-- Analyst -->
+          <td style="color:var(--muted);font-size:11px">{{ inc.analyst or '—' }}</td>
+
+          <!-- Created -->
+          <td style="color:var(--dim);font-size:11px;font-family:var(--mono)">
+            {{ inc.created_at.strftime('%m/%d %H:%M') if inc.created_at and inc.created_at.strftime is defined else (inc.created_at or '')[:16] }}
+          </td>
+
+          <!-- Actions -->
+          <td>
+            <div style="display:flex;gap:5px;flex-wrap:wrap">
+              <a href="/dashboard/{{ inc.run_id }}" class="action-btn investigate">Investigate</a>
+              <button class="action-btn escalate" onclick="transition('{{ inc.incident_id }}','Escalated')">Escalate</button>
+              <button class="action-btn dismiss" onclick="transition('{{ inc.incident_id }}','Closed - False Positive')">FP</button>
+            </div>
+          </td>
+        </tr>
+        {% endfor %}
       </tbody>
     </table>
+
     {% else %}
-    <div class="empty"><div class="empty-icon">✓</div><div style="font-weight:600;margin-bottom:4px">Queue is clear</div><div>No active incidents requiring triage.</div></div>
+    <div class="empty-state">
+      <div style="font-size:32px;margin-bottom:12px">✓</div>
+      <div style="font-weight:600;color:var(--text);margin-bottom:6px">Queue is clear</div>
+      <div>No active incidents requiring triage.</div>
+    </div>
     {% endif %}
   </div>
+
 </div>
 
 <script>
-function filterTable(v,type){document.querySelectorAll('#triageTable tbody tr').forEach(r=>{const a=type==='status'?r.dataset.status:r.dataset.sev;r.style.display=(!v||a===v)?'':'none'})}
-async function transition(id,status){
-  const r=await fetch(`/api/incident/${id}/transition`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({status,analyst_id:'soc-analyst'})});
-  const d=await r.json();
-  if(d.success)location.reload();else alert('Error: '+(d.error||'Unknown'));
+function filterTable(value, type) {
+  document.querySelectorAll('#triageTable tbody tr').forEach(row => {
+    const attr = type === 'status' ? row.dataset.status
+               : type === 'sev'    ? row.dataset.sev
+               :                     row.dataset.engine;
+    row.style.display = (!value || attr === value) ? '' : 'none';
+  });
 }
-setTimeout(()=>location.reload(),60000);
+
+async function transition(incidentId, newStatus) {
+  const safeId = encodeURIComponent(incidentId);
+  const resp = await fetch(`/api/incident/${safeId}/transition`, {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({status: newStatus, analyst_id: 'soc-analyst'})
+  });
+  const data = await resp.json();
+  if (data.success) { location.reload(); }
+  else { alert('Error: ' + (data.error || 'Unknown error')); }
+}
+
+// Auto-refresh every 60 seconds
+setTimeout(() => location.reload(), 60000);
 </script>
 </body>
 </html>

@@ -3,289 +3,387 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>SentinelTrace — Threat Hunt</title>
-<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+<title>SentinelTrace | Threat Hunt Console</title>
 <style>
-:root{--void:#060a10;--card:#0d1525;--card2:#101929;--border:rgba(255,255,255,.07);--border2:rgba(255,255,255,.12);--text:#e8edf5;--muted:#6b7a94;--dim:#3d4a5e;--cyan:#00d4ff;--red:#ff4757;--amber:#ffb800;--green:#00e676;--orange:#ff6b35;--mono:'Space Mono',monospace;--sans:'DM Sans',sans-serif}
+:root{
+  --bg:#0f172a;--card:rgba(30,41,59,.85);--border:rgba(148,163,184,.15);
+  --text:#f1f5f9;--muted:#94a3b8;--dim:#64748b;
+  --blue:#60a5fa;--cyan:#22d3ee;--red:#f87171;--orange:#fbbf24;--green:#34d399;
+}
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:var(--sans);background:var(--void);color:var(--text);min-height:100vh}
-body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(rgba(0,212,255,.02) 1px,transparent 1px),linear-gradient(90deg,rgba(0,212,255,.02) 1px,transparent 1px);background-size:48px 48px;pointer-events:none}
-
-.topbar{background:rgba(6,10,16,.92);backdrop-filter:blur(20px);border-bottom:1px solid var(--border);padding:0 28px;height:52px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:200}
-.brand{font-family:var(--mono);font-size:13px;font-weight:700;color:var(--cyan);display:flex;align-items:center;gap:8px}
-.brand::before{content:'';width:7px;height:7px;background:var(--cyan);border-radius:50%;animation:pulse 2s infinite}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
-.nav{display:flex;gap:2px}
-.nav a{color:var(--muted);text-decoration:none;font-size:12px;padding:6px 14px;border-radius:8px;transition:all .15s}
-.nav a:hover,.nav a.active{color:var(--text);background:rgba(255,255,255,.06)}
-.run-tag{font-family:var(--mono);font-size:11px;color:var(--muted);padding:4px 10px;border:1px solid var(--border);border-radius:6px}
-
-.page{max-width:1500px;margin:0 auto;padding:28px}
-.card{background:var(--card);border:1px solid var(--border);border-radius:12px;overflow:hidden;margin-bottom:16px;animation:fadeUp .4s ease both}
-@keyframes fadeUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
-.card-hdr{padding:13px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;gap:10px}
-.card-hdr h3{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.8px;color:var(--muted)}
-.card-body{padding:16px}
+body{font-family:'Inter',system-ui,sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
+.topbar{background:rgba(15,23,42,.9);border-bottom:1px solid var(--border);padding:14px 28px;
+  display:flex;justify-content:space-between;align-items:center;position:sticky;top:0;z-index:50}
+.topbar h1{font-size:16px;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:var(--blue)}
+.nav-link{color:var(--muted);text-decoration:none;font-size:13px;padding:6px 12px;border-radius:6px;transition:all .15s}
+.nav-link:hover{background:rgba(255,255,255,.05);color:var(--text)}
+.nav-link.active{color:var(--blue)}
+.container{max-width:1500px;margin:0 auto;padding:28px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:22px;margin-bottom:20px}
 
 /* Query bar */
-.query-bar{display:flex;gap:10px;align-items:stretch;margin-bottom:14px}
-.query-input{flex:1;background:rgba(0,0,0,.45);border:1px solid var(--border);color:var(--text);padding:12px 16px;border-radius:8px;font-family:var(--mono);font-size:13px;transition:border-color .2s,box-shadow .2s}
-.query-input:focus{outline:none;border-color:var(--cyan);box-shadow:0 0 0 3px rgba(0,212,255,.07)}
-.run-btn{padding:12px 22px;background:var(--cyan);color:#000;border:none;border-radius:8px;font-size:13px;font-weight:700;cursor:pointer;font-family:var(--sans);transition:opacity .15s;white-space:nowrap}
-.run-btn:hover{opacity:.86}
-.run-btn:disabled{opacity:.35;cursor:not-allowed}
+.query-bar{display:flex;gap:10px;align-items:stretch}
+.query-input{flex:1;background:rgba(15,23,42,.8);border:1px solid var(--border);color:var(--text);
+  padding:12px 16px;border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:14px;
+  transition:border-color .2s}
+.query-input:focus{outline:none;border-color:var(--blue)}
+.run-btn{padding:12px 24px;background:var(--blue);color:#000;border:none;border-radius:8px;
+  font-size:13px;font-weight:700;cursor:pointer;text-transform:uppercase;letter-spacing:.5px;
+  transition:opacity .15s}
+.run-btn:hover{opacity:.85}
+.run-btn:disabled{opacity:.4;cursor:not-allowed}
 
 /* Quick filters */
-.quick-filters{display:flex;gap:7px;flex-wrap:wrap;margin-bottom:14px}
-.qf{padding:5px 12px;background:rgba(255,255,255,.04);border:1px solid var(--border);color:var(--muted);border-radius:4px;cursor:pointer;font-size:11px;font-family:var(--mono);transition:all .15s}
-.qf:hover{border-color:var(--cyan);color:var(--cyan);background:rgba(0,212,255,.05)}
+.quick-filters{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+.qf-btn{padding:5px 12px;background:rgba(255,255,255,.05);border:1px solid var(--border);
+  color:var(--muted);border-radius:4px;cursor:pointer;font-size:11px;font-family:monospace;
+  transition:all .15s}
+.qf-btn:hover{border-color:var(--blue);color:var(--blue);background:rgba(96,165,250,.08)}
 
-/* Syntax reference */
-.syntax-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:8px;margin-bottom:8px}
-.syn-item{background:rgba(0,0,0,.25);border:1px solid var(--border);border-radius:6px;padding:9px 12px}
-.syn-ex{font-family:var(--mono);font-size:11px;color:var(--cyan);margin-bottom:3px}
-.syn-desc{font-size:11px;color:var(--muted)}
-
-/* Error / loading */
-.error-msg{background:rgba(255,71,87,.08);border:1px solid rgba(255,71,87,.25);color:#ff8090;padding:10px 14px;border-radius:8px;font-size:13px;display:none;margin-bottom:12px}
-.loading{text-align:center;padding:32px;color:var(--muted);display:none}
-.loading::before{content:'⟳';font-size:24px;display:block;margin-bottom:8px;animation:spin .8s linear infinite}
-@keyframes spin{to{transform:rotate(360deg)}}
+/* Syntax help */
+.syntax-row{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:10px;margin-top:16px}
+.syntax-item{background:rgba(15,23,42,.5);border:1px solid var(--border);border-radius:6px;padding:10px 12px}
+.syntax-item .ex{font-family:monospace;font-size:11px;color:var(--cyan);margin-bottom:3px}
+.syntax-item .desc{font-size:11px;color:var(--dim)}
 
 /* Results */
-.results-hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
-.res-count{font-size:13px;color:var(--muted)}
-.res-count span{color:var(--text);font-weight:600}
-.export-btn{padding:6px 14px;border:1px solid var(--border);color:var(--muted);background:transparent;border-radius:6px;font-size:11px;cursor:pointer;transition:all .15s;font-family:var(--sans)}
+.results-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px}
+.results-count{font-size:13px;color:var(--muted)}
+.results-count span{color:var(--text);font-weight:700}
+.export-btn{padding:6px 14px;border:1px solid var(--border);color:var(--muted);background:transparent;
+  border-radius:6px;font-size:11px;cursor:pointer;transition:all .15s}
 .export-btn:hover{border-color:var(--green);color:var(--green)}
 
-/* Panel toggle buttons */
-.panel-btns{display:flex;gap:7px}
-.pbtn{padding:6px 12px;border:1px solid var(--border);color:var(--muted);background:transparent;border-radius:6px;font-size:11px;cursor:pointer;transition:all .15s;font-family:var(--sans)}
-.pbtn:hover{border-color:var(--cyan);color:var(--cyan)}
-
 table{width:100%;border-collapse:collapse;font-size:12px}
-th{padding:10px 14px;text-align:left;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.6px;color:var(--dim);border-bottom:1px solid var(--border);background:rgba(0,0,0,.2)}
-td{padding:9px 14px;border-bottom:1px solid var(--border);vertical-align:top}
-tr:last-child td{border-bottom:none}
+th{padding:11px 14px;text-align:left;color:var(--dim);text-transform:uppercase;font-size:10px;
+   border-bottom:1px solid var(--border);letter-spacing:.5px}
+td{padding:10px 14px;border-bottom:1px solid var(--border);font-family:monospace;vertical-align:top}
 tr:hover td{background:rgba(255,255,255,.02)}
-.mono{font-family:var(--mono);font-size:11px;color:var(--muted)}
-.lolbin-dot{display:inline-block;width:6px;height:6px;background:var(--amber);border-radius:50%;margin-right:5px;vertical-align:middle}
+.badge{display:inline-block;padding:1px 7px;border-radius:3px;font-size:10px;font-weight:700}
+.sev-high  {background:rgba(248,113,113,.15);color:var(--red)}
+.sev-medium{background:rgba(251,191,36,.15);color:var(--orange)}
+.sev-low   {background:rgba(52,211,153,.15);color:var(--green)}
+.sev-critical{background:rgba(248,113,113,.25);color:#ff4444}
+.hl{color:var(--cyan)}  /* highlighted field match */
+.lolbin-flag{display:inline-block;width:6px;height:6px;background:var(--orange);
+  border-radius:50%;margin-right:4px;vertical-align:middle}
 
-.badge{display:inline-block;padding:2px 7px;border-radius:3px;font-size:10px;font-weight:700}
-.b-high{background:rgba(255,71,87,.13);color:var(--red)}
-.b-medium{background:rgba(255,184,0,.1);color:var(--amber)}
-.b-low{background:rgba(0,212,255,.08);color:#60d8ff}
-.b-cyan{background:rgba(0,212,255,.1);color:#60d8ff;border:1px solid rgba(0,212,255,.15)}
+.loading{text-align:center;padding:40px;color:var(--muted);display:none}
+.empty-state{text-align:center;padding:50px;color:var(--dim)}
+.error-msg{background:rgba(248,113,113,.1);border:1px solid rgba(248,113,113,.3);
+  color:var(--red);padding:12px 16px;border-radius:6px;font-size:13px;display:none}
 
-.empty{text-align:center;padding:40px;color:var(--dim);font-size:13px}
+/* Process tree panel */
+.tree-panel{display:none;font-family:monospace;font-size:12px;line-height:1.8}
+.tree-node{padding:2px 0}
+.tree-node .img{color:var(--blue);font-weight:600}
+.tree-node .img.lolbin{color:var(--orange)}
+.tree-node .ts{color:var(--dim);font-size:10px}
+.tree-node .entropy{color:var(--red);font-size:10px}
 </style>
 </head>
 <body>
 
 <div class="topbar">
-  <div style="display:flex;align-items:center;gap:22px">
-    <div class="brand">⬡ SentinelTrace</div>
-    <nav class="nav">
-      <a href="/">Dashboard</a>
-      <a href="/triage">Triage</a>
-      <a href="/hunt" class="active">Hunt</a>
-      <a href="/live">Live</a>
+  <div style="display:flex;gap:24px;align-items:center">
+    <h1>⚡ SentinelTrace</h1>
+    <nav style="display:flex;gap:4px">
+      <a href="/dashboard/current" class="nav-link">Dashboard</a>
+      <a href="/triage" class="nav-link">Triage</a>
+      <a href="/hunt" class="nav-link active">Hunt</a>
+      <a href="/live" class="nav-link">Live</a>
     </nav>
   </div>
-  <div class="run-tag">run: {{ (run_id or 'none')[:16] }}</div>
+  <div style="display:flex;gap:16px;align-items:center">
+    <span style="font-size:11px;color:var(--dim)">
+      Run: <span style="color:var(--muted);font-family:monospace">{{ run_id[:16] if run_id else 'None' }}</span>
+    </span>
+    {% if current_user %}
+    <span style="font-size:11px;color:var(--muted)">{{ current_user.username }} <span style="color:var(--dim)">({{ current_user.role }})</span></span>
+    <a href="/logout" style="padding:6px 12px;background:rgba(248,113,113,.1);border:1px solid rgba(248,113,113,.3);color:var(--red);border-radius:6px;font-size:11px;font-weight:600;text-decoration:none;">Logout</a>
+    {% endif %}
+  </div>
 </div>
 
-<div class="page">
+<div class="container">
 
   <!-- Query Console -->
   <div class="card">
-    <div class="card-hdr">
-      <h3>Hunt Query</h3>
-      <div class="panel-btns">
-        <button class="pbtn" onclick="showTree()">Process Tree</button>
-        <button class="pbtn" onclick="showBeacon()">Beaconing</button>
-        <button class="pbtn" onclick="showIOCs()">IOCs</button>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
+      <h2 style="font-size:13px;text-transform:uppercase;color:var(--muted);letter-spacing:1px">Hunt Query</h2>
+      <div style="display:flex;gap:8px">
+        <button onclick="showTree()" style="padding:6px 12px;border:1px solid var(--border);color:var(--muted);background:transparent;border-radius:6px;font-size:11px;cursor:pointer">Process Tree</button>
+        <button onclick="showBeaconing()" style="padding:6px 12px;border:1px solid var(--border);color:var(--muted);background:transparent;border-radius:6px;font-size:11px;cursor:pointer">Beaconing</button>
+        <button onclick="showIOCs()" style="padding:6px 12px;border:1px solid var(--border);color:var(--muted);background:transparent;border-radius:6px;font-size:11px;cursor:pointer">IOCs</button>
       </div>
     </div>
-    <div class="card-body">
-      <div class="query-bar">
-        <input type="text" id="queryInput" class="query-input"
-          placeholder="image:powershell AND NOT computer:DC01   |   cmd:'-enc '   |   event_id:3 sev:high"
-          value="{{ query }}"
-          onkeydown="if(event.key==='Enter')runQuery()">
-        <button class="run-btn" id="runBtn" onclick="runQuery()">▶ Run</button>
-      </div>
-      <div class="quick-filters">
-        <span style="font-size:11px;color:var(--dim);align-self:center">Quick:</span>
-        <button class="qf" onclick="setQ('image:powershell AND sev:high')">PowerShell High</button>
-        <button class="qf" onclick="setQ('image:cmd AND NOT parent:explorer')">Suspicious CMD</button>
-        <button class="qf" onclick="setQ('event_id:3 image:certutil')">Certutil C2</button>
-        <button class="qf" onclick="setQ('image:mshta')">MSHTA</button>
-        <button class="qf" onclick="setQ('event_id:8')">CreateRemoteThread</button>
-        <button class="qf" onclick="setQ('event_id:10')">LSASS Access</button>
-        <button class="qf" onclick="setQ('image:schtasks AND cmd:create')">Sched Task</button>
-        <button class="qf" onclick="setQ('event_id:25')">Process Tamper</button>
-        <button class="qf" onclick="setQ('sev:critical')">All Critical</button>
-      </div>
-      <div class="syntax-grid">
-        <div class="syn-item"><div class="syn-ex">image:powershell.exe</div><div class="syn-desc">Exact process name</div></div>
-        <div class="syn-item"><div class="syn-ex">cmd:"-enc "</div><div class="syn-desc">CommandLine contains</div></div>
-        <div class="syn-item"><div class="syn-ex">sev:high event_id:3</div><div class="syn-desc">AND (implicit)</div></div>
-        <div class="syn-item"><div class="syn-ex">NOT computer:DC01</div><div class="syn-desc">Exclusion</div></div>
-        <div class="syn-item"><div class="syn-ex">parent:winword.exe</div><div class="syn-desc">Parent image</div></div>
-        <div class="syn-item"><div class="syn-ex">mitre:T1059</div><div class="syn-desc">MITRE technique</div></div>
-      </div>
+    <div class="query-bar">
+      <input type="text" id="queryInput" class="query-input"
+             placeholder="e.g.  image:powershell AND NOT computer:DC01   |   sev:high event_id:3   |   cmd:'-enc '"
+             value="{{ query }}"
+             onkeydown="if(event.key==='Enter') runQuery()">
+      <button class="run-btn" id="runBtn" onclick="runQuery()">▶ Run</button>
+    </div>
+
+    <div class="quick-filters">
+      <span style="font-size:11px;color:var(--dim);align-self:center">Quick:</span>
+      <button class="qf-btn" onclick="setQ('image:powershell AND sev:high')">PowerShell High</button>
+      <button class="qf-btn" onclick="setQ('image:cmd AND NOT parent:explorer')">Suspicious CMD</button>
+      <button class="qf-btn" onclick="setQ('event_id:3 image:certutil')">Certutil C2</button>
+      <button class="qf-btn" onclick="setQ('image:mshta')">MSHTA</button>
+      <button class="qf-btn" onclick="setQ('event_id:8')">CreateRemoteThread</button>
+      <button class="qf-btn" onclick="setQ('event_id:10')">LSASS Access</button>
+      <button class="qf-btn" onclick="setQ('image:schtasks AND cmd:create')">Sched Task</button>
+      <button class="qf-btn" onclick="setQ('event_id:25')">Process Tamper</button>
+      <button class="qf-btn" onclick="setQ('sev:critical')">All Critical</button>
+    </div>
+
+    <div class="syntax-row">
+      <div class="syntax-item"><div class="ex">image:powershell.exe</div><div class="desc">Exact process name</div></div>
+      <div class="syntax-item"><div class="ex">cmd:"-enc "</div><div class="desc">CommandLine contains</div></div>
+      <div class="syntax-item"><div class="ex">sev:high event_id:3</div><div class="desc">AND (implicit)</div></div>
+      <div class="syntax-item"><div class="ex">NOT computer:DC01</div><div class="desc">Exclusion</div></div>
+      <div class="syntax-item"><div class="ex">parent:winword.exe</div><div class="desc">Parent image</div></div>
+      <div class="syntax-item"><div class="ex">mitre:T1059</div><div class="desc">MITRE technique</div></div>
     </div>
   </div>
 
-  <div class="error-msg" id="errMsg"></div>
-  <div class="loading" id="loadDiv">Hunting…</div>
+  <!-- Error -->
+  <div class="error-msg" id="errorMsg"></div>
+
+  <!-- Loading -->
+  <div class="loading" id="loadingDiv">
+    <div style="font-size:28px;margin-bottom:10px">⟳</div>
+    Hunting…
+  </div>
 
   <!-- Results -->
   <div class="card" id="resultsCard" style="display:none">
-    <div class="card-hdr">
-      <div class="results-hdr" style="width:100%;margin:0">
-        <div class="res-count">Found <span id="resCount">0</span> events</div>
+    <div class="results-header">
+      <div class="results-count">Found <span id="resultsCount">0</span> events</div>
+      <div style="display:flex;gap:8px">
         <button class="export-btn" onclick="exportCSV()">Export CSV</button>
       </div>
     </div>
-    <div style="overflow-x:auto;max-height:520px;overflow-y:auto">
+    <div style="overflow-x:auto;max-height:600px;overflow-y:auto">
       <table id="resultsTable">
-        <thead><tr><th>Time</th><th>Image</th><th>Parent</th><th>Command Line</th><th>Computer</th><th>EID</th><th>Severity</th><th>Dst IP</th></tr></thead>
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>Image</th>
+            <th>Parent</th>
+            <th>Command Line</th>
+            <th>Computer</th>
+            <th>EID</th>
+            <th>Severity</th>
+            <th>Dst IP</th>
+          </tr>
+        </thead>
         <tbody id="resultsTbody"></tbody>
       </table>
     </div>
   </div>
 
-  <!-- Process tree panel -->
+  <!-- Process Tree Panel -->
   <div class="card" id="treeCard" style="display:none">
-    <div class="card-hdr"><h3>Process Tree</h3><button class="pbtn" onclick="document.getElementById('treeCard').style.display='none'">✕</button></div>
-    <div class="card-body" style="font-family:var(--mono);font-size:12px;max-height:400px;overflow-y:auto" id="treePanel"></div>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
+      <h2 style="font-size:13px;text-transform:uppercase;color:var(--muted);letter-spacing:1px">Process Tree</h2>
+      <button onclick="document.getElementById('treeCard').style.display='none'" style="background:none;border:none;color:var(--dim);cursor:pointer;font-size:16px">✕</button>
+    </div>
+    <div class="tree-panel" id="treePanel"></div>
   </div>
 
-  <!-- Beaconing panel -->
+  <!-- Beaconing Panel -->
   <div class="card" id="beaconCard" style="display:none">
-    <div class="card-hdr"><h3>Beaconing Signals</h3><button class="pbtn" onclick="document.getElementById('beaconCard').style.display='none'">✕</button></div>
-    <div class="card-body" id="beaconPanel"></div>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
+      <h2 style="font-size:13px;text-transform:uppercase;color:var(--muted);letter-spacing:1px">Beaconing Signals</h2>
+      <button onclick="document.getElementById('beaconCard').style.display='none'" style="background:none;border:none;color:var(--dim);cursor:pointer;font-size:16px">✕</button>
+    </div>
+    <div id="beaconPanel"></div>
   </div>
 
-  <!-- IOC panel -->
+  <!-- IOC Panel -->
   <div class="card" id="iocCard" style="display:none">
-    <div class="card-hdr">
-      <h3>Extracted IOCs</h3>
-      <div style="display:flex;gap:8px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
+      <h2 style="font-size:13px;text-transform:uppercase;color:var(--muted);letter-spacing:1px">Extracted IOCs</h2>
+      <div style="display:flex;gap:8px;align-items:center">
         <a id="iocCsvLink" href="#" style="font-size:11px;color:var(--green);text-decoration:none">Export CSV</a>
-        <button class="pbtn" onclick="document.getElementById('iocCard').style.display='none'">✕</button>
+        <button onclick="document.getElementById('iocCard').style.display='none'" style="background:none;border:none;color:var(--dim);cursor:pointer;font-size:16px">✕</button>
       </div>
     </div>
-    <div class="card-body" id="iocPanel"></div>
+    <div id="iocPanel"></div>
   </div>
 
 </div>
 
 <script>
-const RUN_ID={{ ('"'+run_id+'"') if run_id else 'null' }};
-let lastResults=[];
+const RUN_ID = {{ run_id | tojson }};
+let lastResults = [];
 
-function setQ(q){document.getElementById('queryInput').value=q;runQuery()}
-function esc(s){return s?String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'):''}
-
-async function runQuery(){
-  if(!RUN_ID){showErr('No active run — upload a Sysmon XML first.');return}
-  const q=document.getElementById('queryInput').value.trim();
-  setLoading(true);hideErr();
-  try{
-    const r=await fetch(`/api/hunt?run_id=${encodeURIComponent(RUN_ID)}&q=${encodeURIComponent(q)}`);
-    const d=await r.json();
-    if(d.error){showErr(d.error);return}
-    lastResults=d.results||[];
-    renderResults(lastResults);
-  }catch(e){showErr('Network error: '+e.message)}
-  finally{setLoading(false)}
+function setQ(q) {
+  document.getElementById('queryInput').value = q;
+  runQuery();
 }
 
-function renderResults(results){
-  document.getElementById('resCount').textContent=results.length;
-  document.getElementById('resultsCard').style.display='block';
-  const tbody=document.getElementById('resultsTbody');
-  tbody.innerHTML='';
-  results.forEach(ev=>{
-    const sev=(ev.severity||'low').toLowerCase();
-    const sevClass=sev==='critical'||sev==='high'?'b-high':sev==='medium'?'b-medium':'b-low';
-    const isLolbin=ev.is_lolbin;
-    const highEnt=ev.cmd_high_entropy;
-    const img=(ev.image||'').split(/[/\\]/).pop();
-    const cmd=(ev.command_line||'—').slice(0,130);
-    const tr=document.createElement('tr');
-    tr.innerHTML=`<td class="mono">${esc((ev.event_time||ev.utc_time||'').slice(11,19))}</td><td style="font-weight:500">${isLolbin?'<span class="lolbin-dot"></span>':''}${esc(img)}</td><td class="mono">${esc((ev.parent_image||'—').split(/[/\\]/).pop())}</td><td style="font-family:var(--mono);font-size:10px;color:${highEnt?'var(--amber)':'var(--muted)'};max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(ev.command_line||'')}">${highEnt?'🔒 ':''}${esc(cmd)}</td><td class="mono">${esc(ev.computer||'—')}</td><td style="color:var(--cyan);font-family:var(--mono);font-size:11px">${esc(ev.event_id||'—')}</td><td><span class="badge ${sevClass}">${sev}</span></td><td style="font-family:var(--mono);font-size:11px;color:${ev.destination_ip?'var(--amber)':'var(--dim)'}">${esc(ev.destination_ip||'—')}</td>`;
-    tbody.appendChild(tr);
+function escHtml(s) {
+  if (!s) return '';
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+async function runQuery() {
+  if (!RUN_ID) { showError('No active run — upload a Sysmon XML first.'); return; }
+  const q = document.getElementById('queryInput').value.trim();
+  setLoading(true);
+  hideError();
+  try {
+    const resp = await fetch(`/api/hunt?run_id=${encodeURIComponent(RUN_ID)}&q=${encodeURIComponent(q)}`);
+    const data = await resp.json();
+    if (data.error) { showError(data.error); return; }
+    lastResults = data.results || [];
+    renderResults(lastResults);
+  } catch(e) {
+    showError('Network error: ' + e.message);
+  } finally {
+    setLoading(false);
+  }
+}
+
+function renderResults(results) {
+  document.getElementById('resultsCount').textContent = results.length;
+  document.getElementById('resultsCard').style.display = 'block';
+  const tbody = document.getElementById('resultsTbody');
+  tbody.innerHTML = '';
+  const q = document.getElementById('queryInput').value.toLowerCase();
+
+  results.forEach(ev => {
+    const sev = (ev.severity || 'low').toLowerCase();
+    const isLolbin = ev.is_lolbin;
+    const highEntropy = ev.cmd_high_entropy;
+
+    const row = document.createElement('tr');
+    row.innerHTML = `
+      <td style="color:var(--dim);white-space:nowrap">${escHtml((ev.event_time||ev.utc_time||'').slice(11,19))}</td>
+      <td><span class="${isLolbin?'lolbin-flag':''}">${isLolbin?'<span class="lolbin-flag" title="LOLBin"></span>':''}</span>
+          <span style="color:var(--blue);font-weight:600">${escHtml(ev.image||'—')}</span></td>
+      <td style="color:var(--muted)">${escHtml(ev.parent_image||'—')}</td>
+      <td style="max-width:350px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:${highEntropy?'var(--orange)':'var(--muted)'}" title="${escHtml(ev.command_line||'')}">
+        ${highEntropy?'🔒 ':''}${escHtml((ev.command_line||'—').slice(0,120))}</td>
+      <td style="color:var(--dim)">${escHtml(ev.computer||'—')}</td>
+      <td style="color:var(--cyan)">${escHtml(ev.event_id||'—')}</td>
+      <td><span class="badge sev-${sev}">${sev}</span></td>
+      <td style="color:${ev.destination_ip?'var(--red)':'var(--dim)'}">${escHtml(ev.destination_ip||'—')}</td>
+    `;
+    tbody.appendChild(row);
   });
 }
 
-async function showTree(){
-  if(!RUN_ID)return;
-  try{
-    const r=await fetch(`/api/process-tree/${RUN_ID}`);
-    const d=await r.json();
-    const flat=d.flat||[];
-    const panel=document.getElementById('treePanel');
-    if(!flat.length){panel.innerHTML='<div style="color:var(--dim)">No process tree data.</div>'}
-    else{
-      panel.innerHTML=flat.map(n=>{
-        const indent=(n.depth||0)*20;
-        const prefix=n.depth>0?'↳ ':'';
-        const col=n.is_lolbin?'var(--amber)':'var(--cyan)';
-        return `<div style="margin-left:${indent}px;padding:4px 0;border-bottom:1px solid var(--border)"><span style="color:${col}">${prefix}${esc(n.image)}</span>${n.cmd_high_entropy?' <span style="color:var(--red);font-size:10px">🔒</span>':''} <span style="color:var(--dim);font-size:10px">[pid:${esc(n.pid)}] ${esc((n.event_time||'').slice(11,19))}</span>${n.command_line?`<div style="color:var(--dim);font-size:10px;margin-top:2px;padding-left:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(n.command_line.slice(0,100))}</div>`:''}</div>`;
+async function showTree() {
+  if (!RUN_ID) return;
+  try {
+    const resp = await fetch(`/api/process-tree/${RUN_ID}`);
+    const data = await resp.json();
+    const flat = data.flat || [];
+    const panel = document.getElementById('treePanel');
+    if (!flat.length) { panel.innerHTML = '<div style="color:var(--dim)">No process tree data available.</div>'; }
+    else {
+      panel.innerHTML = flat.map(n => {
+        const indent = '  '.repeat(n.depth || 0);
+        const prefix = n.depth > 0 ? '└─ ' : '';
+        const isLolbin = n.is_lolbin;
+        const hasEntropy = n.cmd_high_entropy;
+        return `<div class="tree-node" style="margin-left:${(n.depth||0)*20}px">
+          <span class="img${isLolbin?' lolbin':''}">${prefix}${escHtml(n.image)}</span>
+          ${hasEntropy?'<span class="entropy"> 🔒 high-entropy cmd</span>':''}
+          <span class="ts"> [pid:${escHtml(n.pid)}] ${escHtml((n.event_time||'').slice(11,19))}</span>
+          ${n.command_line?`<div style="color:var(--dim);font-size:10px;margin-left:20px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:600px">${escHtml((n.command_line||'').slice(0,120))}</div>`:''}
+        </div>`;
       }).join('');
     }
-    document.getElementById('treeCard').style.display='block';
-  }catch(e){showErr('Tree error: '+e.message)}
+    document.getElementById('treeCard').style.display = 'block';
+  } catch(e) { showError('Tree error: ' + e.message); }
 }
 
-async function showBeacon(){
-  if(!RUN_ID)return;
-  try{
-    const r=await fetch(`/api/beaconing/${RUN_ID}`);
-    const d=await r.json();
-    const beacons=d.beacons||[];
-    const panel=document.getElementById('beaconPanel');
-    if(!beacons.length){panel.innerHTML='<div style="color:var(--dim);font-style:italic">No beaconing patterns detected.</div>'}
-    else{
-      panel.innerHTML=`<table><thead><tr><th>Image</th><th>Destination</th><th>Hits</th><th>Interval</th><th>Jitter</th><th>Confidence</th></tr></thead><tbody>${beacons.map(b=>`<tr><td style="color:var(--amber);font-weight:500">${esc(b.image)}</td><td class="mono">${esc(b.destination_ip)}:${esc(b.destination_port)}</td><td class="mono">${b.hit_count}</td><td class="mono">${b.mean_interval_sec}s</td><td class="mono">${b.jitter_pct}%</td><td><span class="badge ${b.confidence>=70?'b-high':'b-medium'}">${b.confidence}%</span></td></tr>`).join('')}</tbody></table>`;
+async function showBeaconing() {
+  if (!RUN_ID) return;
+  try {
+    const resp = await fetch(`/api/beaconing/${RUN_ID}`);
+    const data = await resp.json();
+    const beacons = data.beacons || [];
+    const panel = document.getElementById('beaconPanel');
+    if (!beacons.length) {
+      panel.innerHTML = '<div style="color:var(--dim);text-align:center;padding:20px">No beaconing patterns detected.</div>';
+    } else {
+      panel.innerHTML = `<table><thead><tr>
+        <th>Image</th><th>Destination</th><th>Hits</th><th>Interval</th><th>Jitter</th><th>Confidence</th><th>Description</th>
+      </tr></thead><tbody>${beacons.map(b => `<tr>
+        <td style="color:var(--orange);font-weight:600">${escHtml(b.image)}</td>
+        <td style="color:var(--red)">${escHtml(b.destination_ip)}:${escHtml(b.destination_port)}</td>
+        <td>${b.hit_count}</td>
+        <td>${b.mean_interval_sec}s</td>
+        <td>${b.jitter_pct}%</td>
+        <td><span class="badge sev-${b.confidence>=70?'high':'medium'}">${b.confidence}%</span></td>
+        <td style="color:var(--muted);font-size:11px">${escHtml(b.description)}</td>
+      </tr>`).join('')}</tbody></table>`;
     }
-    document.getElementById('beaconCard').style.display='block';
-  }catch(e){showErr('Beacon error: '+e.message)}
+    document.getElementById('beaconCard').style.display = 'block';
+  } catch(e) { showError('Beaconing error: ' + e.message); }
 }
 
-async function showIOCs(){
-  if(!RUN_ID)return;
-  try{
-    const r=await fetch(`/api/iocs/${RUN_ID}`);
-    const d=await r.json();
-    const iocs=d.iocs||[];
-    document.getElementById('iocCsvLink').href=`/api/iocs/${RUN_ID}/export.csv`;
-    const panel=document.getElementById('iocPanel');
-    const typeColors={ip:'var(--red)',domain:'var(--amber)',url:'var(--cyan)',sha256:'var(--muted)',sha1:'var(--muted)',md5:'var(--muted)'};
-    if(!iocs.length){panel.innerHTML='<div style="color:var(--dim);font-style:italic">No IOCs extracted.</div>'}
-    else{
-      panel.innerHTML=`<table><thead><tr><th>Type</th><th>Value</th><th>Source Field</th><th>Confidence</th></tr></thead><tbody>${iocs.map(ioc=>`<tr><td><span class="badge b-cyan">${esc(ioc.ioc_type)}</span></td><td style="font-family:var(--mono);font-size:11px;color:${typeColors[ioc.ioc_type]||'var(--text)'}">${esc(ioc.ioc_value)}</td><td class="mono">${esc(ioc.source_field)}</td><td class="mono">${ioc.confidence}</td></tr>`).join('')}</tbody></table>`;
+async function showIOCs() {
+  if (!RUN_ID) return;
+  try {
+    const resp = await fetch(`/api/iocs/${RUN_ID}`);
+    const data = await resp.json();
+    const iocs = data.iocs || [];
+    document.getElementById('iocCsvLink').href = `/api/iocs/${RUN_ID}/export.csv`;
+    const panel = document.getElementById('iocPanel');
+    if (!iocs.length) {
+      panel.innerHTML = '<div style="color:var(--dim);text-align:center;padding:20px">No IOCs extracted.</div>';
+    } else {
+      const typeColors = {ip:'var(--red)',domain:'var(--orange)',url:'var(--cyan)',sha256:'var(--blue)',sha1:'var(--blue)',md5:'var(--blue)'};
+      panel.innerHTML = `<table><thead><tr><th>Type</th><th>Value</th><th>Source Field</th><th>Confidence</th></tr></thead>
+        <tbody>${iocs.map(ioc => `<tr>
+          <td><span class="badge" style="background:rgba(96,165,250,.15);color:${typeColors[ioc.ioc_type]||'var(--muted)'}">${escHtml(ioc.ioc_type)}</span></td>
+          <td style="font-family:monospace;color:${typeColors[ioc.ioc_type]||'var(--text)'}">${escHtml(ioc.ioc_value)}</td>
+          <td style="color:var(--dim)">${escHtml(ioc.source_field)}</td>
+          <td><div style="display:flex;align-items:center;gap:6px"><span>${ioc.confidence}</span>
+            <div style="width:50px;height:4px;background:rgba(255,255,255,.1);border-radius:2px">
+              <div style="width:${ioc.confidence}%;height:100%;background:var(--blue);border-radius:2px"></div>
+            </div></div></td>
+        </tr>`).join('')}</tbody></table>`;
     }
-    document.getElementById('iocCard').style.display='block';
-  }catch(e){showErr('IOC error: '+e.message)}
+    document.getElementById('iocCard').style.display = 'block';
+  } catch(e) { showError('IOC error: ' + e.message); }
 }
 
-function exportCSV(){
-  if(!lastResults.length)return;
-  const cols=['event_time','image','parent_image','command_line','computer','event_id','severity','destination_ip'];
-  const csv=[cols.join(','),...lastResults.map(r=>cols.map(c=>`"${(r[c]||'').toString().replace(/"/g,'""')}"`).join(','))].join('\n');
-  const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));a.download=`hunt_${Date.now()}.csv`;a.click();
+function exportCSV() {
+  if (!lastResults.length) return;
+  const cols = ['event_time','image','parent_image','command_line','computer','event_id','severity','destination_ip'];
+  const header = cols.join(',');
+  const rows = lastResults.map(r => cols.map(c => `"${(r[c]||'').toString().replace(/"/g,'""')}"`).join(','));
+  const csv = [header, ...rows].join('\n');
+  const blob = new Blob([csv], {type:'text/csv'});
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
+  a.download = `hunt_results_${Date.now()}.csv`; a.click();
 }
-function setLoading(on){document.getElementById('loadDiv').style.display=on?'block':'none';document.getElementById('runBtn').disabled=on}
-function showErr(m){const e=document.getElementById('errMsg');e.textContent=m;e.style.display='block'}
-function hideErr(){document.getElementById('errMsg').style.display='none'}
 
-window.addEventListener('load',()=>{const q=document.getElementById('queryInput').value.trim();if(q)runQuery()});
+function setLoading(on) {
+  document.getElementById('loadingDiv').style.display = on ? 'block' : 'none';
+  document.getElementById('runBtn').disabled = on;
+}
+function showError(msg) {
+  const el = document.getElementById('errorMsg');
+  el.textContent = msg; el.style.display = 'block';
+}
+function hideError() {
+  document.getElementById('errorMsg').style.display = 'none';
+}
+
+// Run query on load if one is provided
+window.addEventListener('load', () => {
+  const q = document.getElementById('queryInput').value.trim();
+  if (q) runQuery();
+});
 </script>
 </body>
 </html>

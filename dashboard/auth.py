@@ -68,14 +68,21 @@ def get_current_user() -> Optional[dict]:
     last = session.get("last_active")
     if last:
         try:
-            last_dt = datetime.datetime.fromisoformat(last)
-            if (datetime.datetime.utcnow() - last_dt).total_seconds() > SESSION_TIMEOUT_HOURS * 3600:
+            # Strip 'Z' suffix — fromisoformat() fails on it in Python < 3.11
+            clean = last.replace("Z", "+00:00") if last.endswith("Z") else last
+            last_dt = datetime.datetime.fromisoformat(clean)
+            now_dt  = datetime.datetime.now(tz=datetime.timezone.utc)
+            if last_dt.tzinfo is None:
+                last_dt = last_dt.replace(tzinfo=datetime.timezone.utc)
+            if (now_dt - last_dt).total_seconds() > SESSION_TIMEOUT_HOURS * 3600:
                 session.clear()
                 return None
         except Exception:
-            pass
+            # Malformed timestamp — force re-login rather than silently continuing
+            session.clear()
+            return None
     # Refresh last_active
-    session["last_active"] = datetime.datetime.utcnow().isoformat()
+    session["last_active"] = datetime.datetime.now(tz=datetime.timezone.utc).isoformat()
     return user
 
 def login_user(analyst_row: dict) -> None:
@@ -85,7 +92,7 @@ def login_user(analyst_row: dict) -> None:
         "role":       analyst_row.get("role", "analyst"),
         "email":      analyst_row.get("email", ""),
     }
-    session["last_active"] = datetime.datetime.utcnow().isoformat()
+    session["last_active"] = datetime.datetime.now(tz=datetime.timezone.utc).isoformat()
     session.permanent = True
 
 def logout_user() -> None:
@@ -102,10 +109,27 @@ def login_required(f):
         if not user:
             if request.is_json:
                 return jsonify({"error": "Authentication required"}), 401
-            return redirect(url_for("login_page", next=request.url))
+            # Use relative path only to prevent open-redirect attacks
+            return redirect(url_for("login_page", next=request.path))
         g.analyst = user
         return f(*args, **kwargs)
     return wrapped
+
+
+def _safe_next_url(next_url: str) -> str:
+    """
+    Validate a redirect URL is relative (same-origin) to prevent open-redirect attacks.
+    Accepts only paths starting with /  (no scheme, no host).
+    """
+    from urllib.parse import urlparse
+    if not next_url:
+        return "/"
+    parsed = urlparse(next_url)
+    # Reject anything with a scheme or netloc — those are external redirects
+    if parsed.scheme or parsed.netloc:
+        return "/"
+    return next_url or "/"
+
 
 def role_required(min_role: str):
     def decorator(f):
@@ -141,7 +165,9 @@ def _get_analyst_by_username(username: str) -> Optional[dict]:
                 )
                 row = cur.fetchone()
                 return dict(row) if row else None
-    except Exception:
+    except Exception as _e:
+        import logging as _lg
+        _lg.getLogger("auth").error("DB lookup failed for user '%s': %s", username, _e)
         return None
 
 def _create_analyst(username: str, password: str, role: str = "analyst",
@@ -159,11 +185,19 @@ def _create_analyst(username: str, password: str, role: str = "analyst",
         conn.commit()
     return {"analyst_id": analyst_id, "username": username, "role": role}
 
+# Dummy hash used when user not found — prevents timing-based username enumeration
+_DUMMY_HASH = "sha256$dummysalt00000000000000000000000000$" + "0" * 64
+
 def authenticate(username: str, password: str) -> Optional[dict]:
+    """Constant-time authentication — always runs verify_password to prevent
+    timing attacks that reveal whether a username exists."""
     row = _get_analyst_by_username(username)
     if not row:
+        # Still call verify_password to equalise timing
+        verify_password(password, _DUMMY_HASH)
         return None
     if not row.get("is_active", 1):
+        verify_password(password, _DUMMY_HASH)
         return None
     if verify_password(password, row.get("password_hash", "")):
         return row

@@ -76,7 +76,7 @@
 
 <div class="container">
     <p>
-        <a href="{{ url_for('dashboard') }}?{{ request.query_string|safe }}">← Back to dashboard</a>
+        <a href="{{ url_for('dashboard', run_id=session.get('analysis_run_id','')) }}?{{ request.query_string|safe }}">← Back to dashboard</a>
     </p>
 
     <!-- ===== MITRE CONTEXT BOX (CLEAN LOGIC) ===== -->

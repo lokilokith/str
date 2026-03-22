@@ -138,6 +138,8 @@ def score_command_entropy(cmd: Optional[str]) -> Dict[str, Any]:
             "b64_detected": False, "b64_preview": None,
             "has_encoded_flag": False, "has_download_url": False,
         }
+    # Cap length before regex to prevent catastrophically slow scans on huge cmds
+    cmd = cmd[:4096]
     lower = cmd.lower()
     entropy = _shannon_entropy(cmd)
     b64_matches = _B64_RE.findall(cmd)
@@ -177,7 +179,13 @@ def enrich_event(evt: Dict[str, Any]) -> Dict[str, Any]:
     """
     Add computed signal fields to a parsed event dict in-place.
     Called at parse time so all downstream code sees consistent signals.
+    Idempotent: second call on the same dict is a no-op.
     """
+    # Guard against double-enrichment (parse_event + ingest_upload both call this)
+    if evt.get("_enriched"):
+        return evt
+    evt["_enriched"] = True
+
     cmd        = str(evt.get("command_line") or "")
     image      = (evt.get("image") or "").lower()
     image_base = image.split("\\")[-1] if "\\" in image else image
@@ -321,6 +329,15 @@ def parse_event(ev: ET.Element) -> Dict[str, Any]:
         "parser_version":    "2.2.0",
     }
 
+    # Ensure event_id is int or None (never string "None" or "0")
+    if evt["event_id"] is not None:
+        try:
+            evt["event_id"] = int(evt["event_id"])
+            if evt["event_id"] == 0:
+                evt["event_id"] = None
+        except (TypeError, ValueError):
+            evt["event_id"] = None
+
     # Enrich every event at parse time
     enrich_event(evt)
     return evt
@@ -343,7 +360,18 @@ def load_all_sources_from_xml(xml_path) -> List[Dict[str, Any]]:
     if not events:
         raise RuntimeError("No <Event> elements found in XML.")
     log.info("Parsed %d raw XML events from %s", len(events), xml_path.name)
-    return [parse_event(ev) for ev in events]
+    parsed = []
+    errors = 0
+    for ev in events:
+        try:
+            parsed.append(parse_event(ev))
+        except Exception as _pe:
+            errors += 1
+            if errors <= 5:  # log first 5 to avoid spam
+                log.warning("parse_event failed for event: %s", _pe)
+    if errors > 0:
+        log.warning("[event_parser] %d events failed to parse (skipped)", errors)
+    return parsed
 
 
 def parse_xml_to_dataframe(xml_path) -> pd.DataFrame:

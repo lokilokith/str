@@ -92,6 +92,19 @@ ENGINES = {
 }
 
 # ---------------------------------------------------------------------------
+# Engine refresh — call before running analysis after a bulk insert
+# This forces SQLAlchemy to drop stale pooled connections so read_sql_query
+# always sees the rows that were just committed via mysql.connector.
+# ---------------------------------------------------------------------------
+def dispose_engine(mode: str = "cases") -> None:
+    """Dispose SQLAlchemy connection pool to force fresh connections."""
+    try:
+        ENGINES[mode].dispose()
+        log.debug("SQLAlchemy engine pool disposed for mode=%s", mode)
+    except Exception as e:
+        log.warning("dispose_engine failed for mode=%s: %s", mode, e)
+
+# ---------------------------------------------------------------------------
 # Connection context manager
 # ---------------------------------------------------------------------------
 @contextmanager

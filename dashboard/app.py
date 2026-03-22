@@ -56,11 +56,8 @@ from dashboard.db import (
     sanitize_datetime,
     sql_now_minus,
 )
-from dashboard.analysis_engine import (
-    ingest_upload,
-    persist_case,
-    run_full_analysis,
-)
+from dashboard.analysis_engine import ingest_upload, persist_case
+from dashboard.analysis_engine_patch import patched_run_full_analysis as run_full_analysis
 from dashboard.analysis_cache import (
     clear_analysis_snapshot,
     get_analysis_snapshot,
@@ -154,6 +151,18 @@ def _run_analysis_async(run_id: str, xml_path, rules_dest) -> None:
         )
         persist_case(events_df, detections_df, behaviors_df)
         actual_run_id = events_df["run_id"].iloc[0]
+
+        # CRITICAL: dispose SQLAlchemy connection pools AFTER mysql.connector writes.
+        # Without this, read_sql_query returns stale empty results because the pool
+        # holds connections opened before the bulk INSERT completed.
+        try:
+            from dashboard.db import dispose_engine as _dispose
+            _dispose("cases")
+            _dispose("live")
+            log.info("[ASYNC] SQLAlchemy pools disposed — fresh connections will be used")
+        except Exception as _de:
+            log.warning("[ASYNC] dispose_engine failed: %s", _de)
+
         with SNAPSHOT_LOCK:
             context = run_full_analysis(actual_run_id)
             set_analysis_snapshot(actual_run_id, context)
@@ -610,10 +619,11 @@ def api_run_status(run_id: str):
     status = _get_run_status(safe)
     if status.startswith("done:"):
         actual = status.split(":", 1)[1]
+        with app.test_request_context():
+            pass  # ensure app context
         session["analysis_run_id"] = actual
-        # Remove stale upload run_id so it doesn't get confused with actual_run_id
         return jsonify({"status": "done", "run_id": actual,
-                        "redirect": url_for("dashboard", run_id=actual)})
+                        "redirect": f"/dashboard/{actual}"})
     if status.startswith("error:"):
         return jsonify({"status": "error", "error": status.split(":", 1)[1]})
     return jsonify({"status": "processing", "run_id": safe})
@@ -761,7 +771,7 @@ def api_collector_metrics():
 
 @app.route("/api/collector/metrics_DISABLED")
 def api_collector_metrics_orig():
-    if not _COLLECTOR_AVAILABLE:
+    if True:
         return jsonify({
             "error": "Collector not available (non-Windows or not started)",
             "collector_available": False,
@@ -1112,34 +1122,48 @@ def burst_view(burst_id):
     start = burst.get("start_time")
     end   = burst.get("end_time")
 
-    if not image or not start or not end:
-        return f"Invalid burst metadata for ID: {burst_id}", 500
-
+    # Guard: if no time window, query by image+run_id only
+    _burst_mode = "live" if run_id == "live" else "cases"
     try:
-        # FIX: uploaded cases live in sentinel_cases, not sentinel_live
-        _burst_mode = "live" if run_id == "live" else "cases"
         with get_db_connection(_burst_mode) as conn:
             with get_cursor(conn) as cur:
-                cur.execute(
-                    f"SELECT event_time, event_id, image, parent_image, command_line, "
-                    f"{_user_col}, pid, ppid, src_ip, dst_ip, dst_port, file_path, computer "
-                    f"FROM events "
-                    f"WHERE image = %s AND event_time >= %s AND event_time <= %s "
-                    f"AND run_id = %s ORDER BY event_time",
-                    (image, start, end, run_id),
-                )
+                if image and start and end:
+                    # Sanitize timestamps before passing to MySQL
+                    from dashboard.db import sanitize_datetime as _sdt
+                    _start_s = _sdt(start) or start
+                    _end_s   = _sdt(end)   or end
+                    cur.execute(
+                        f"SELECT event_time, event_id, image, parent_image, command_line, "
+                        f"{_user_col}, pid, ppid, src_ip, dst_ip, dst_port, file_path, computer "
+                        f"FROM events "
+                        f"WHERE image = %s AND event_time >= %s AND event_time <= %s "
+                        f"AND run_id = %s ORDER BY event_time LIMIT 500",
+                        (image, _start_s, _end_s, run_id),
+                    )
+                elif image:
+                    # Fallback: get all events for this image in this run
+                    cur.execute(
+                        f"SELECT event_time, event_id, image, parent_image, command_line, "
+                        f"{_user_col}, pid, ppid, src_ip, dst_ip, dst_port, file_path, computer "
+                        f"FROM events WHERE image = %s AND run_id = %s "
+                        f"ORDER BY event_time LIMIT 500",
+                        (image, run_id),
+                    )
+                else:
+                    return "Invalid burst: missing image", 400
+
                 events = [dict(r) for r in cur.fetchall()]
 
                 cur.execute(
                     "SELECT DISTINCT image FROM events "
-                    "WHERE parent_image = %s AND event_time >= %s "
-                    "AND event_time <= %s AND run_id = %s",
-                    (image, start, end, run_id),
+                    "WHERE parent_image = %s AND run_id = %s LIMIT 50",
+                    (image, run_id),
                 )
                 child_images = sorted(
                     r["image"] for r in cur.fetchall() if r.get("image")
                 )
     except Exception as exc:
+        log.error("burst_view error for burst_id=%s: %s", burst_id, exc, exc_info=True)
         flash(f"Error loading burst details: {exc}", "error")
         return redirect(url_for("dashboard", run_id=run_id))
 
@@ -1516,11 +1540,22 @@ def api_alerts_latest():
         mode = "live" if (not run_id or run_id == "live") else "cases"
         engine = get_engine(mode)
         import pandas as pd
-        df = pd.read_sql_query(
-            "SELECT utc_time, image, computer, rule_name, severity, mitre_id "
-            "FROM detections WHERE run_id = %s ORDER BY utc_time DESC LIMIT 20",
-            engine, params=(run_id or "live",)
-        )
+        try:
+            df = pd.read_sql_query(
+                "SELECT COALESCE(utc_time, event_time) AS utc_time, "
+                "image, computer, rule_name, severity, mitre_id "
+                "FROM detections WHERE run_id = %s "
+                "ORDER BY COALESCE(utc_time, event_time) DESC LIMIT 20",
+                engine, params=(run_id or "live",)
+            )
+        except Exception:
+            df = pd.read_sql_query(
+                "SELECT event_time AS utc_time, image, computer, "
+                "rule_name, severity, mitre_id "
+                "FROM detections WHERE run_id = %s "
+                "ORDER BY event_time DESC LIMIT 20",
+                engine, params=(run_id or "live",)
+            )
         if df.empty:
             return jsonify({"alerts": []})
         for col in df.columns:
@@ -1542,7 +1577,8 @@ def api_events_latest():
         engine = get_engine(mode)
         import pandas as pd
         df = pd.read_sql_query(
-            f"SELECT event_time as utc_time, image, command_line, {_user_col} as user, computer "
+            f"SELECT event_time AS utc_time, image, command_line, "
+            f"COALESCE({_user_col}, '') AS user, computer "
             f"FROM events WHERE run_id = %s ORDER BY event_time DESC LIMIT 100",
             engine, params=(run_id or "live",)
         )

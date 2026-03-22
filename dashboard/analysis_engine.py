@@ -41,6 +41,7 @@ from dashboard.db import (
     DB_TYPE,
     DB_STRICT,
     checked_insert,
+    dispose_engine,
     get_db_connection,
     get_cursor,
     get_datetime_columns,
@@ -1362,6 +1363,8 @@ def _calculate_ml_deviations(bursts, baseline_state):
         baseline_entry = baseline_state.get(pk) or baseline_state.get(sk)
         deviation = _compute_deviation_score(features, baseline_entry)
         burst["deviation_score"] = deviation
+        # Tag whether this burst has a historical baseline
+        burst["baseline_mature"] = bool(baseline_entry and int(baseline_entry.get("count_samples",0)) >= 5)
         if features.get("user_type")=="system" and deviation<0.3 and int(features.get("followup_events",0) or 0)==0:
             burst["_pre_suppressed"] = True
             burst["suppression_reason"] = "Expected SYSTEM background activity"
@@ -1372,13 +1375,74 @@ def _calculate_ml_deviations(bursts, baseline_state):
     return feature_cache
 
 
+def _infer_kill_chain_from_content(burst: Dict) -> Optional[str]:
+    """
+    Infer kill-chain stage from command-line content and event IDs when
+    structural flags alone are insufficient.  This catches cases like:
+    - cmd.exe running 'schtasks /create' → Persistence
+    - powershell with '-encodedcommand' → Execution (obfuscated)
+    - Event ID 10 (ProcessAccess) → Privilege Escalation
+    - Network event to external IP → Command and Control
+    - Shadow copy deletion → Actions on Objectives
+    """
+    cmd = (burst.get("commandline") or burst.get("command_line") or "").lower()
+    img = (burst.get("image") or "").lower()
+    eids = set(str(e) for e in (burst.get("event_ids") or []))
+
+    # Actions on Objectives / Impact
+    if any(x in cmd for x in ["shadowcopy delete","delete shadows","vssadmin delete","wbadmin delete"]):
+        return "Actions on Objectives"
+    # Credential Access
+    if any(x in cmd for x in ["sekurlsa","lsadump","mimikatz","invoke-mimikatz","dcsync","kerberoast"]):
+        return "Credential Access"
+    if "10" in eids:  # ProcessAccess → LSASS dump
+        return "Privilege Escalation"
+    # Persistence
+    if any(x in cmd for x in ["schtasks /create","schtasks -create","reg add.*run","currentversion\\run","/create","startup"]):
+        return "Persistence"
+    if any(e in eids for e in ["12","13","14"]):  # Registry set
+        if any(x in cmd for x in ["run","startup","services"]):
+            return "Persistence"
+    if "17" in eids or "18" in eids:  # Named pipe
+        return "Privilege Escalation"
+    # Defense Evasion
+    if any(x in cmd for x in ["disable-av","set-mppreference","amsibypass","disable","firewall","wevtutil cl","clear-log"]):
+        return "Defense Evasion"
+    # Privilege Escalation
+    if any(x in cmd for x in ["whoami /priv","getsystem","fodhelper","eventvwr","cmstp"]):
+        return "Privilege Escalation"
+    if "8" in eids or "25" in eids:  # CreateRemoteThread / ProcessTamper
+        return "Privilege Escalation"
+    # Command and Control
+    if "3" in eids and burst.get("has_net"):
+        dst = burst.get("destination_ip") or ""
+        if is_external_ip(dst):
+            return "Command and Control"
+    if "22" in eids:  # DNS query
+        return "Command and Control"
+    # Execution with obfuscation
+    if any(x in cmd for x in ["-enc ","-encodedcommand","/ec ","frombase64"]):
+        return "Execution"
+    return None
+
+
 def _apply_kill_chain_logic(bursts):
     for burst in bursts:
         for f in ("has_exec","has_net","has_file","has_reg","has_injection"):
             burst.setdefault(f, False)
+        # Layer 1: structural flags (fast, reliable)
         kc = _derive_kill_chain_from_flags(burst)
+        # Layer 2: content/EID inference (catches what flags miss)
+        inferred = _infer_kill_chain_from_content(burst)
+        if inferred:
+            kc = promote_stage(kc, inferred)
+        # Layer 3: prior correlation promotes stage
         if burst.get("correlation_id"):
             kc = promote_stage(burst.get("kill_chain_stage"), kc)
+        # Layer 4: MITRE tactic from detections (most reliable)
+        det_stage = burst.get("kill_chain_stage_from_detection")
+        if det_stage and det_stage not in ("Background","Unclassified","Execution"):
+            kc = promote_stage(kc, det_stage)
         burst["kill_chain_stage"] = kc
 
 
@@ -1512,6 +1576,14 @@ def _update_baselines(feature_cache, baseline_state):
 def run_full_analysis(run_id: str) -> Dict[str, Any]:
     print("run_full_analysis CALLED with run_id =", run_id)
 
+    # Force SQLAlchemy to drop stale pooled connections so read_sql_query sees
+    # the rows freshly committed by persist_case (which uses mysql.connector).
+    try:
+        dispose_engine("cases")
+        dispose_engine("live")
+    except Exception:
+        pass
+
     # Safe defaults
     evidence_state = {}
     kill_chain_summary: List[Dict] = []
@@ -1586,7 +1658,26 @@ def run_full_analysis(run_id: str) -> Dict[str, Any]:
             columns=["rule_id","image","mitre_id","first_seen","last_seen","count","unique_parents"]
         )
 
+    # Wire detection kill-chain stages into bursts before deviation scoring
+    if not detections_df.empty and "kill_chain_stage" in detections_df.columns and "image" in detections_df.columns:
+        _det_kc_map: Dict[str, str] = {}
+        _kc_order_map = {s: i for i, s in enumerate(KILL_CHAIN_ORDER)}
+        for _, _dr in detections_df.iterrows():
+            _img = str(_dr.get("image") or "").lower()
+            _stage = str(_dr.get("kill_chain_stage") or "")
+            if _img and _stage in _kc_order_map:
+                if _img not in _det_kc_map or _kc_order_map.get(_stage,0) > _kc_order_map.get(_det_kc_map[_img],0):
+                    _det_kc_map[_img] = _stage
+    else:
+        _det_kc_map = {}
+
     grouped_rows = _build_bursts(df, beh_df, run_id)
+    # Stamp detection-derived kill chain on bursts
+    for _burst in grouped_rows:
+        _bimg = str(_burst.get("image") or "").lower()
+        if _bimg in _det_kc_map:
+            _burst["kill_chain_stage_from_detection"] = _det_kc_map[_bimg]
+
     feature_cache = _calculate_ml_deviations(grouped_rows, baseline_state)
     for burst, features in feature_cache:
         dev = features.get("deviation_score")
@@ -1673,11 +1764,45 @@ def run_full_analysis(run_id: str) -> Dict[str, Any]:
             brows.sort(key=lambda b:(-b["exec_count"],b["first_seen"]))
             baseline_execution_context = brows[:10]
 
-    # Force correlation persist loop
+    # Force correlation persist loop — persists new bursts into correlations table
     print(f"[DEBUG] forcing persist_auto_correlation loop for {len(grouped_rows)} bursts")
+    corr_persisted = 0
     for burst in grouped_rows:
-        if burst.get("correlation_id"):
+        if burst.get("correlation_id") and not burst.get("_corr_persisted"):
             persist_auto_correlation(burst, run_id)
+            burst["_corr_persisted"] = True
+            corr_persisted += 1
+    print(f"[DEBUG] persisted {corr_persisted} new correlations")
+
+    # Reload correlations AFTER persist so correlation_score reflects reality.
+    # The initial load() at the top of run_full_analysis ran BEFORE persist_auto_correlation,
+    # so the table was empty. We must reload now.
+    try:
+        dispose_engine("cases")
+        _corr_df_reload     = load_correlations(run_id)
+        _campaigns_df_reload = load_correlation_campaigns(run_id)
+        if not _corr_df_reload.empty:
+            correlations = _corr_df_reload.to_dict(orient="records")
+            print(f"[DEBUG] reloaded {len(correlations)} correlations after persist")
+        if not _campaigns_df_reload.empty:
+            correlation_campaigns = [
+                {"corr_id":r.get("corr_id"),"base_image":r.get("base_image"),
+                 "highest_kill_chain":r.get("highest_kill_chain") or "Execution",
+                 "max_confidence":int(r.get("max_confidence",0) or 0),
+                 "status":r.get("status") or "active"}
+                for _,r in _campaigns_df_reload.iterrows()
+            ]
+    except Exception as _ce:
+        print(f"[WARN] correlation reload failed: {_ce}")
+
+    # Recompute correlation_score from reloaded data
+    _sev_w2 = {"low":1,"medium":2,"high":3}
+    correlation_score = sum(_sev_w2.get((c.get("severity") or "low").lower(),1) for c in correlations) if correlations else 0
+    # Give credit for in-memory burst correlations even if DB reload failed
+    if correlation_score == 0:
+        _n_corr_bursts = sum(1 for b in grouped_rows if b.get("has_correlation"))
+        if _n_corr_bursts >= 2:
+            correlation_score = _n_corr_bursts * 2
 
     # Final cleanup
     known_benign = {"services.exe","wininit.exe","winlogon.exe","lsass.exe","csrss.exe","svchost.exe","spoolsv.exe","explorer.exe"}
@@ -1743,6 +1868,62 @@ def run_full_analysis(run_id: str) -> Dict[str, Any]:
         })
     burst_aggregates.sort(key=lambda x: x["peak_score"], reverse=True)
 
+    # ── Build attack narrative / story ──────────────────────────────────────
+    # Group top bursts by host+user into a coherent attack story chain.
+    # This is what elevates a "rule engine" into a real SIEM.
+    attack_story: List[str] = []
+    story_entities: Dict[str, List] = defaultdict(list)
+    for _b in sorted(grouped_rows, key=lambda x: x.get("risk_score",0), reverse=True)[:30]:
+        _host = _b.get("computer") or "unknown"
+        _user = _b.get("user") or "unknown"
+        story_entities[f"{_host}|{_user}"].append(_b)
+
+    for _entity, _entity_bursts in story_entities.items():
+        _host, _user = _entity.split("|", 1)
+        # Sort by kill-chain stage index for chronological story
+        _entity_bursts.sort(key=lambda x: KILL_CHAIN_ORDER.index(x.get("kill_chain_stage","Background"))
+                             if x.get("kill_chain_stage") in KILL_CHAIN_ORDER else 0)
+        for _b in _entity_bursts:
+            _stage = _b.get("kill_chain_stage") or "Background"
+            _img   = _b.get("image") or "unknown"
+            _score = int(_b.get("risk_score",0) or 0)
+            _cnt   = int(_b.get("count",0) or 0)
+            if _score < 20 and _stage == "Background":
+                continue
+            _cmd_hint = ""
+            _descs = _b.get("descriptions") or []
+            if _descs:
+                _sample = str(_descs[0])[:60] if _descs else ""
+                if _sample:
+                    _cmd_hint = f" [{_sample}]"
+            if _stage == "Actions on Objectives":
+                attack_story.append(f"⚠ IMPACT: {_img} on {_host} ({_cnt} events, score {_score}){_cmd_hint}")
+            elif _stage == "Command and Control":
+                _dst = _b.get("destination_ip") or "unknown IP"
+                attack_story.append(f"🌐 C2 BEACON: {_img} → {_dst} on {_host} ({_cnt} events, score {_score})")
+            elif _stage == "Credential Access":
+                attack_story.append(f"🔑 CRED ACCESS: {_img} on {_host} ({_cnt} events, score {_score})")
+            elif _stage == "Privilege Escalation":
+                attack_story.append(f"⬆ PRIV ESC: {_img} on {_host} ({_cnt} events, score {_score})")
+            elif _stage == "Persistence":
+                attack_story.append(f"📌 PERSISTENCE: {_img} on {_host} ({_cnt} events, score {_score}){_cmd_hint}")
+            elif _stage in ("Execution","Defense Evasion") and _score >= 30:
+                attack_story.append(f"▶ {_stage.upper()}: {_img} on {_host} ({_cnt} events, score {_score}){_cmd_hint}")
+    attack_story = attack_story[:20]  # cap for display
+
+    # Kill-chain summary — build BEFORE attack_conf_score computation so it can be used
+    kc_counts: Dict = {}
+    for b in grouped_rows:
+        stage = b.get("kill_chain_stage") or "Background"
+        if stage != "Background":
+            kc_counts[stage] = kc_counts.get(stage, 0) + 1
+    kill_chain_summary = [{"stage": s, "count": c} for s, c in kc_counts.items()]
+    # Also derive from detections if bursts gave nothing
+    if not kill_chain_summary and not detections_df.empty and "kill_chain_stage" in detections_df.columns:
+        kc_det = detections_df["kill_chain_stage"].value_counts().reset_index()
+        kc_det.columns = ["stage", "count"]
+        kill_chain_summary = kc_det.to_dict(orient="records")
+
     # Attack confidence
     attack_conf_score = 0; attack_conf_basis = []
     max_det_conf = 0
@@ -1794,20 +1975,6 @@ def run_full_analysis(run_id: str) -> Dict[str, Any]:
     if attack_conf_cap: attack_conf_score = min(attack_conf_score, attack_conf_cap)
     confidence_trend = [int(b.get("risk_score",0) or 0) for b in grouped_rows]
 
-    # Kill-chain summary — count bursts per stage
-    kc_counts: Dict = {}
-    for b in grouped_rows:
-        stage = b.get("kill_chain_stage") or "Background"
-        if stage != "Background":
-            kc_counts[stage] = kc_counts.get(stage, 0) + 1
-    kill_chain_summary = [{"stage": s, "count": c} for s, c in kc_counts.items()]
-
-    # Also derive kill_chain_summary from detections if bursts gave nothing
-    if not kill_chain_summary and not detections_df.empty and "kill_chain_stage" in detections_df.columns:
-        kc_det = detections_df["kill_chain_stage"].value_counts().reset_index()
-        kc_det.columns = ["stage", "count"]
-        kill_chain_summary = kc_det.to_dict(orient="records")
-
     # MITRE summary
     if not detections_df.empty and "mitre_id" in detections_df.columns:
         tmp = detections_df.fillna({"mitre_tactic":"Unknown","mitre_id":"Unmapped"}).groupby(["mitre_tactic","mitre_id"]).size().reset_index(name="count")
@@ -1821,8 +1988,7 @@ def run_full_analysis(run_id: str) -> Dict[str, Any]:
         correlations_detail = [{"corr_id":r.get("corr_id"),"start_time":r.get("start_time"),"end_time":r.get("end_time"),"base_image":r.get("base_image"),"kill_chain_stage":r.get("kill_chain_stage"),"event_ids":r.get("event_ids"),"description":r.get("description"),"severity":r.get("severity"),"confidence":r.get("confidence"),"computer":r.get("computer")} for _,r in corr_detail_df.iterrows()]
 
     correlation_hunts = [{"id":c.get("corr_id"),"description":c.get("description","Correlation detected"),"severity":c.get("severity","medium")} for c in correlations] if correlations else []
-    sev_w2 = {"low":1,"medium":2,"high":3}
-    correlation_score = sum(sev_w2.get((c.get("severity") or "low").lower(),1) for c in correlations) if correlations else 0
+    # Note: correlation_score is computed after the persist+reload block below
 
     interesting = interesting_df.loc[:,~interesting_df.columns.duplicated()].to_dict(orient="records") if not interesting_df.empty else []
     recent_df   = recent_df.loc[:,~recent_df.columns.duplicated()]
@@ -1861,8 +2027,29 @@ def run_full_analysis(run_id: str) -> Dict[str, Any]:
         eph = eph.groupby("hour_bucket").size().reset_index(name="count").sort_values("hour_bucket")
         events_per_hour = [{"hour":r["hour_bucket"].strftime("%H:%M"),"count":int(r["count"])} for _,r in eph.iterrows()]
 
-    # Incident
-    is_alertable = (attack_conf_score>=40 and (correlation_score>0 or highest_kill_chain not in (None,"Background")))
+    # Incident — compute kill-chain depth (distinct stages observed in this run)
+    _kc_stages_seen = set()
+    for _b in grouped_rows:
+        _s = _b.get("kill_chain_stage")
+        if _s and _s not in ("Background", "Unclassified"):
+            _kc_stages_seen.add(_s)
+    kill_chain_depth = len(_kc_stages_seen)
+
+    # CRITICAL requires score>=70 AND (correlation OR multi-stage kill chain)
+    # HIGH requires score>=50 AND at least one real kill-chain stage
+    # MEDIUM requires score>=40 AND at least one real kill-chain stage
+    # Single-stage detections alone never reach CRITICAL — that would be false inflation.
+    _has_multi_stage = (kill_chain_depth >= 2) or (correlation_score > 0)
+    if attack_conf_score >= 70 and _has_multi_stage:
+        _alert_level = "critical"
+    elif attack_conf_score >= 50 and kill_chain_depth >= 1:
+        _alert_level = "high"
+    elif attack_conf_score >= 40 and kill_chain_depth >= 1:
+        _alert_level = "medium"
+    else:
+        _alert_level = "low"
+
+    is_alertable = (_alert_level in ("critical", "high", "medium"))
     if is_alertable and incident is None:
         incident = {"incident_id":f"INC-{run_id[:8]}","status":"New","severity":attack_conf_level,"score":attack_conf_score}
     if incident:
@@ -1936,4 +2123,6 @@ def run_full_analysis(run_id: str) -> Dict[str, Any]:
         "next_expected_stage":        highest_kill_chain,
         "missing_evidence":           [],
         "effective_urgency":          attack_conf_level,
+        "attack_story":               attack_story,
+        "kill_chain_depth":           kill_chain_depth,
     }
