@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>SentinelTrace — Live SIEM</title>
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>
+:root{--void:#060a10;--card:#0d1525;--card2:#101929;--border:rgba(255,255,255,.07);--border2:rgba(255,255,255,.12);--text:#e8edf5;--muted:#6b7a94;--dim:#3d4a5e;--cyan:#00d4ff;--red:#ff4757;--amber:#ffb800;--green:#00e676;--mono:'Space Mono',monospace;--sans:'DM Sans',sans-serif}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:var(--sans);background:var(--void);color:var(--text);min-height:100vh;overflow-x:hidden}
+body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradient(0deg,transparent,transparent 3px,rgba(0,0,0,.04) 3px,rgba(0,0,0,.04) 4px);pointer-events:none;z-index:0}
+
+.topbar{position:sticky;top:0;z-index:200;background:rgba(6,10,16,.95);backdrop-filter:blur(20px);border-bottom:1px solid var(--border);padding:0 28px;height:52px;display:flex;align-items:center;justify-content:space-between}
+.brand{font-family:var(--mono);font-size:13px;font-weight:700;color:var(--cyan);display:flex;align-items:center;gap:8px}
+.status-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.dot-running{background:var(--green);box-shadow:0 0 8px var(--green);animation:blink 1.5s infinite}
+.dot-stopped{background:var(--red)}
+.dot-degraded{background:var(--amber);animation:blink 1s infinite}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
+.status-badge{padding:4px 12px;border-radius:20px;font-size:11px;font-weight:700;font-family:var(--mono);border:1px solid var(--border)}
+.s-running{border-color:rgba(0,230,118,.3);color:var(--green);background:rgba(0,230,118,.07)}
+.s-stopped{border-color:rgba(255,71,87,.3);color:var(--red);background:rgba(255,71,87,.07)}
+.s-degraded{border-color:rgba(255,184,0,.3);color:var(--amber);background:rgba(255,184,0,.07)}
+.nav{display:flex;gap:2px}
+.nav a{color:var(--muted);text-decoration:none;font-size:12px;padding:6px 14px;border-radius:8px;transition:all .15s}
+.nav a:hover,.nav a.active{color:var(--text);background:rgba(255,255,255,.06)}
+
+.page{max-width:1600px;margin:0 auto;padding:24px 28px;position:relative;z-index:1}
+.dash-grid{display:grid;grid-template-columns:2fr 1fr;gap:16px;margin-bottom:16px}
+.dash-grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;margin-bottom:16px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:12px;overflow:hidden;animation:fadeUp .4s ease both}
+@keyframes fadeUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+.card-hdr{padding:13px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;gap:8px}
+.card-hdr h3{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.8px;color:var(--muted)}
+.card-body{padding:16px}
+
+.eps-num{font-family:var(--mono);font-size:36px;font-weight:700;color:var(--cyan);line-height:1}
+.eps-sub{font-size:11px;color:var(--muted);margin-top:4px}
+.latency-num{font-family:var(--mono);font-size:13px;color:var(--text)}
+
+.beacon-item,.burst-item{display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid var(--border);font-size:12px}
+.beacon-item:last-child,.burst-item:last-child{border-bottom:none}
+.beacon-dst{font-family:var(--mono);font-size:11px;color:var(--muted)}
+.beacon-hits{font-family:var(--mono);font-size:12px;font-weight:700;color:var(--red)}
+.burst-img{font-weight:500}
+.burst-cnt{font-family:var(--mono);font-size:12px;color:var(--amber)}
+
+.filter-btns{display:flex;gap:6px;flex-wrap:wrap}
+.fbtn{padding:4px 10px;border:1px solid var(--border);border-radius:4px;background:transparent;color:var(--muted);cursor:pointer;font-size:11px;font-family:var(--sans);transition:all .15s}
+.fbtn.active,.fbtn:hover{border-color:var(--cyan);color:var(--cyan);background:rgba(0,212,255,.05)}
+
+/* Stream table */
+.stream-wrap{max-height:440px;overflow-y:auto}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{padding:9px 14px;text-align:left;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.6px;color:var(--dim);border-bottom:1px solid var(--border);background:rgba(0,0,0,.2);position:sticky;top:0;z-index:5}
+td{padding:8px 14px;border-bottom:1px solid rgba(255,255,255,.04);vertical-align:middle}
+.mono{font-family:var(--mono);font-size:11px;color:var(--muted)}
+.sev-high{background:rgba(255,71,87,.12);color:var(--red);padding:2px 6px;border-radius:3px;font-size:10px;font-weight:700}
+.sev-medium{background:rgba(255,184,0,.1);color:var(--amber);padding:2px 6px;border-radius:3px;font-size:10px;font-weight:700}
+.sev-low{background:rgba(0,212,255,.08);color:#60d8ff;padding:2px 6px;border-radius:3px;font-size:10px;font-weight:700}
+tr.noise{opacity:.35}
+.new-row{animation:rowFlash .6s ease}
+@keyframes rowFlash{from{background:rgba(0,212,255,.1)}to{background:transparent}}
+
+.chart-wrap{height:180px;position:relative}
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div style="display:flex;align-items:center;gap:24px">
+    <div class="brand">⬡ SentinelTrace</div>
+    <nav class="nav">
+      <a href="/">Dashboard</a>
+      <a href="/triage">Triage</a>
+      <a href="/hunt">Hunt</a>
+      <a href="/live" class="active">Live</a>
+    </nav>
+  </div>
+  <div style="display:flex;align-items:center;gap:12px">
+    <span class="status-badge s-stopped" id="statusBadge">INITIALIZING</span>
+    <span style="font-size:11px;color:var(--muted);font-family:var(--mono)">Latency: <span id="latency">—</span>ms</span>
+  </div>
+</div>
+
+<div class="page">
+
+  <div class="dash-grid">
+    <!-- EPS Chart -->
+    <div class="card">
+      <div class="card-hdr">
+        <h3>Telemetry throughput (EPS)</h3>
+        <span class="status-dot dot-stopped" id="statusDot"></span>
+      </div>
+      <div class="card-body">
+        <div class="chart-wrap"><canvas id="epsChart"></canvas></div>
+      </div>
+    </div>
+
+    <!-- Metrics panel -->
+    <div class="card">
+      <div class="card-hdr"><h3>Ingestion profile</h3></div>
+      <div class="card-body">
+        <div class="eps-num" id="currentEps">0.00</div>
+        <div class="eps-sub">Events per second (60s window)</div>
+        <div style="margin-top:20px">
+          <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.8px;color:var(--dim);margin-bottom:8px">Active beaconing signals</div>
+          <div id="beaconList"><div style="font-size:12px;color:var(--dim);font-style:italic">No signals detected</div></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="dash-grid3">
+    <!-- Process bursts -->
+    <div class="card" style="animation-delay:.05s">
+      <div class="card-hdr"><h3>Process bursts (top 5 / 1m)</h3></div>
+      <div class="card-body">
+        <div id="burstList"><div style="font-size:12px;color:var(--dim);font-style:italic">No recent bursts</div></div>
+      </div>
+    </div>
+
+    <!-- Noise filters -->
+    <div class="card" style="animation-delay:.1s">
+      <div class="card-hdr"><h3>SOC noise filters</h3></div>
+      <div class="card-body">
+        <div class="filter-btns" id="filterBtns">
+          <button class="fbtn active" onclick="toggleNoise('svchost.exe',this)">svchost.exe</button>
+          <button class="fbtn active" onclick="toggleNoise('lsass.exe',this)">lsass.exe</button>
+          <button class="fbtn active" onclick="toggleNoise('services.exe',this)">services.exe</button>
+          <button class="fbtn" onclick="toggleNoise('chrome.exe',this)">chrome.exe</button>
+          <button class="fbtn" onclick="toggleNoise('splunk.exe',this)">splunk.exe</button>
+        </div>
+        <div style="margin-top:16px;font-size:11px;color:var(--dim)">Filtered processes are shown at 35% opacity in the stream.</div>
+      </div>
+    </div>
+
+    <!-- Stats -->
+    <div class="card" style="animation-delay:.15s">
+      <div class="card-hdr"><h3>Pipeline stats</h3></div>
+      <div class="card-body">
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+          <div><div style="font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.6px;margin-bottom:3px">Ingested</div><div style="font-family:var(--mono);font-size:20px;color:var(--green)" id="statIngested">0</div></div>
+          <div><div style="font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.6px;margin-bottom:3px">Analysed</div><div style="font-family:var(--mono);font-size:20px;color:var(--cyan)" id="statAnalysed">0</div></div>
+          <div><div style="font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.6px;margin-bottom:3px">Errors</div><div style="font-family:var(--mono);font-size:20px;color:var(--red)" id="statErrors">0</div></div>
+          <div><div style="font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.6px;margin-bottom:3px">Uptime</div><div style="font-family:var(--mono);font-size:14px;color:var(--text)" id="statUptime">—</div></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Event Stream -->
+  <div class="card" style="animation-delay:.2s">
+    <div class="card-hdr">
+      <h3>Live signal stream</h3>
+      <span style="font-size:11px;color:var(--dim);font-family:var(--mono)" id="streamCount">0 events buffered</span>
+    </div>
+    <div class="stream-wrap">
+      <table id="streamTable">
+        <thead><tr><th style="width:13%">Timestamp</th><th style="width:14%">Computer</th><th style="width:7%">EID</th><th style="width:22%">Process</th><th style="width:34%">Command Line</th><th style="width:10%">Severity</th></tr></thead>
+        <tbody id="streamBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+</div>
+
+<script>
+let lastRowId=0;
+let rowCount=0;
+const hiddenProcs=new Set(['svchost.exe','lsass.exe','services.exe']);
+
+const ctx=document.getElementById('epsChart').getContext('2d');
+const epsData=Array(60).fill(0);
+const epsChart=new Chart(ctx,{
+  type:'line',
+  data:{labels:Array(60).fill(''),datasets:[{label:'EPS',data:epsData,borderColor:'#00d4ff',backgroundColor:'rgba(0,212,255,.07)',borderWidth:1.5,pointRadius:0,fill:true,tension:.4}]},
+  options:{responsive:true,maintainAspectRatio:false,animation:{duration:0},scales:{x:{display:false},y:{grid:{color:'rgba(255,255,255,.04)'},ticks:{color:'#3d4a5e',font:{size:10}},min:0}},plugins:{legend:{display:false}}}
+});
+
+function esc(s){return s?String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'):''}
+
+function toggleNoise(proc,btn){
+  if(hiddenProcs.has(proc)){hiddenProcs.delete(proc);btn.classList.remove('active')}
+  else{hiddenProcs.add(proc);btn.classList.add('active')}
+  document.querySelectorAll('#streamBody tr').forEach(r=>{
+    const img=(r.dataset.image||'').toLowerCase();
+    r.classList.toggle('noise',hiddenProcs.has(img));
+  });
+}
+
+async function fetchStatus(){
+  try{
+    const r=await fetch('/api/live/status');
+    const d=await r.json();
+    const badge=document.getElementById('statusBadge');
+    const dot=document.getElementById('statusDot');
+    const lat=document.getElementById('latency');
+    badge.className='status-badge s-'+d.status.toLowerCase();
+    badge.textContent=d.status;
+    dot.className='status-dot dot-'+d.status.toLowerCase();
+    lat.textContent=d.latency>0?d.latency:'0';
+  }catch(e){}
+}
+
+async function fetchMetrics(){
+  try{
+    const r=await fetch('/api/live/metrics');
+    const d=await r.json();
+    document.getElementById('currentEps').textContent=(d.eps_sma||0).toFixed(2);
+    epsData.push(d.eps_sma||0);epsData.shift();
+    epsChart.data.datasets[0].data=[...epsData];
+    epsChart.update('none');
+
+    const bl=document.getElementById('beaconList');
+    if(d.beaconing&&d.beaconing.length){
+      bl.innerHTML=d.beaconing.map(b=>`<div class="beacon-item"><div><div class="beacon-dst">${esc(b.destination_ip)}:${esc(b.destination_port)}</div></div><div class="beacon-hits">${b.hits} hits</div></div>`).join('');
+    }else{bl.innerHTML='<div style="font-size:12px;color:var(--dim);font-style:italic">No signals</div>'}
+
+    const brl=document.getElementById('burstList');
+    if(d.process_bursts&&d.process_bursts.length){
+      brl.innerHTML=d.process_bursts.map(b=>`<div class="burst-item"><div class="burst-img">${esc((b.image||'').split('\\').pop())}</div><div class="burst-cnt">${b.count}/min</div></div>`).join('');
+    }else{brl.innerHTML='<div style="font-size:12px;color:var(--dim);font-style:italic">No recent bursts</div>'}
+  }catch(e){}
+}
+
+async function fetchCollMetrics(){
+  try{
+    const r=await fetch('/api/collector/metrics');
+    if(!r.ok)return;
+    const d=await r.json();
+    document.getElementById('statIngested').textContent=d.events_ingested||0;
+    document.getElementById('statAnalysed').textContent=d.events_analysed||0;
+    document.getElementById('statErrors').textContent=(d.ingest_errors||0)+(d.analysis_errors||0);
+    const up=d.uptime_seconds||0;
+    const h=Math.floor(up/3600),m=Math.floor((up%3600)/60),s=Math.floor(up%60);
+    document.getElementById('statUptime').textContent=`${h}h ${m}m ${s}s`;
+  }catch(e){}
+}
+
+async function fetchEvents(){
+  try{
+    const r=await fetch(`/api/live/events?since_id=${lastRowId}`);
+    const d=await r.json();
+    if(!d.events||!d.events.length)return;
+    lastRowId=d.last_row_id;
+    const body=document.getElementById('streamBody');
+    // DOM backpressure — keep max 200 rows
+    while(body.children.length>=200&&body.lastChild)body.removeChild(body.lastChild);
+    d.events.slice().reverse().forEach(ev=>{
+      const imgFull=ev.image||'';
+      const img=imgFull.split('/').pop().split('\\').pop();
+      const sev=(ev.severity||'low').toLowerCase();
+      const sevClass=sev==='high'?'sev-high':sev==='medium'?'sev-medium':'sev-low';
+      const isNoise=hiddenProcs.has(img.toLowerCase());
+      const ts=(ev.event_time||ev.inserted_at||'').slice(11,19);
+      const cmd=(ev.command_line||'—').slice(0,120);
+      const tr=document.createElement('tr');
+      tr.className='new-row'+(isNoise?' noise':'');
+      tr.dataset.image=img.toLowerCase();
+      tr.innerHTML=`<td class="mono">${esc(ts)}</td><td class="mono">${esc(ev.computer||'—')}</td><td class="mono" style="color:var(--cyan)">${esc(ev.event_id||'—')}</td><td style="font-weight:500">${esc(img)}</td><td class="mono" style="color:var(--muted);font-size:10px;max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(ev.command_line||'')}"><span>${esc(cmd)}</span></td><td><span class="${sevClass}">${sev}</span></td>`;
+      body.insertBefore(tr,body.firstChild);
+      rowCount++;
+    });
+    document.getElementById('streamCount').textContent=`${rowCount} events buffered`;
+  }catch(e){}
+}
+
+fetchStatus();fetchMetrics();fetchCollMetrics();fetchEvents();
+setInterval(fetchEvents,1000);
+setInterval(fetchMetrics,5000);
+setInterval(fetchStatus,5000);
+setInterval(fetchCollMetrics,10000);
+</script>
+</body>
+</html>

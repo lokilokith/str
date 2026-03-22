@@ -1,0 +1,688 @@
+"""
+detection_engine.py — SentinelTrace v2 Unified Detection Engine
+================================================================
+Wires together:
+  1. YAML rule matching (from rules.yaml)
+  2. Statistical baseline deviation (BaselineEngine)
+  3. Graph-based correlation (CorrelationEngine)
+  4. Unified risk scoring with explainability (ScoringEngine)
+
+Replaces the old heuristic-only detection_engine.py.
+Drop-in compatible with existing analysis_engine.py call sites.
+"""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import pandas as pd
+import yaml
+
+
+# ---------------------------------------------------------------------------
+# Lazy imports (avoid circular at module load time)
+# ---------------------------------------------------------------------------
+
+def _get_baseline_engine():
+    from dashboard.baseline_engine import get_baseline_engine
+    return get_baseline_engine()
+
+
+def _get_scoring_engine():
+    from dashboard.scoring_engine import get_scoring_engine
+    return get_scoring_engine()
+
+
+def _get_correlate_bursts():
+    from dashboard.correlation_engine import correlate_bursts
+    return correlate_bursts
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+BENIGN_PARENTS = frozenset({
+    "services.exe", "wininit.exe", "winlogon.exe", "lsass.exe",
+    "csrss.exe", "svchost.exe", "spoolsv.exe", "explorer.exe",
+    "taskhost.exe", "taskhostw.exe", "smss.exe",
+})
+
+KILL_CHAIN_ORDER = [
+    "Background", "Delivery", "Execution", "Defense Evasion",
+    "Persistence", "Privilege Escalation", "Credential Access",
+    "Discovery", "Lateral Movement", "Collection",
+    "Command and Control", "Exfiltration", "Actions on Objectives",
+]
+
+
+# ---------------------------------------------------------------------------
+# YAML Rule Loading
+# ---------------------------------------------------------------------------
+
+_RULES_CACHE: Optional[List[Dict]] = None
+
+
+def load_yaml_rules(rules_path: Optional[Path] = None) -> List[Dict]:
+    """Load detection rules from rules.yaml with auto-discovery."""
+    global _RULES_CACHE
+    if _RULES_CACHE is not None and rules_path is None:
+        return _RULES_CACHE
+
+    search_paths = []
+    if rules_path:
+        search_paths.append(Path(rules_path))
+
+    base = Path(__file__).resolve().parent
+    search_paths += [
+        base.parent / "rules.yaml",
+        base / "rules.yaml",
+        Path("rules.yaml"),
+    ]
+
+    for p in search_paths:
+        if p.exists():
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    data = yaml.safe_load(f)
+                rules = data.get("rules", []) if data else []
+                _RULES_CACHE = rules
+                print(f"[DetectionEngine] Loaded {len(rules)} rules from {p}")
+                return rules
+            except Exception as e:
+                print(f"[DetectionEngine] Failed to load {p}: {e}")
+
+    print("[DetectionEngine] No rules.yaml found — using heuristic fallback")
+    _RULES_CACHE = []
+    return []
+
+
+def invalidate_rules_cache() -> None:
+    global _RULES_CACHE
+    _RULES_CACHE = None
+
+
+# ---------------------------------------------------------------------------
+# Single-event YAML rule matching
+# ---------------------------------------------------------------------------
+
+def _safe_lower(v: Any) -> str:
+    s = str(v) if v is not None else ""
+    return s.lower() if s not in ("None", "nan", "") else ""
+
+
+def match_rules(event: Dict[str, Any], rules: List[Dict]) -> List[Dict[str, Any]]:
+    """
+    Test a single event dict against all loaded YAML rules.
+    Returns a list of hit dicts (one per matched rule).
+
+    Supports rule fields:
+      event_id, image_contains, image_any, parent_any,
+      cmd_any, path_prefix_any, severity_required, filter_benign_parent
+    """
+    hits = []
+    try:
+        eid = int(event.get("event_id") or 0)
+    except (TypeError, ValueError):
+        eid = 0
+
+    image   = _safe_lower(event.get("image"))
+    cmd     = _safe_lower(event.get("command_line") or event.get("commandline"))
+    parent  = _safe_lower(event.get("parent_image"))
+    fpath   = _safe_lower(
+        event.get("file_path") or event.get("target_filename")
+        or event.get("reg_key") or ""
+    )
+    sev     = _safe_lower(event.get("severity"))
+
+    for rule in rules:
+        # EventID filter
+        rule_eids = rule.get("event_id", [])
+        if rule_eids and eid not in rule_eids:
+            continue
+
+        # image_contains
+        ic = rule.get("image_contains")
+        if ic and ic.lower() not in image:
+            continue
+
+        # image_any (basename match)
+        ia = rule.get("image_any", [])
+        if ia and not any(x.lower() in image for x in ia):
+            continue
+
+        # parent_any
+        pa = rule.get("parent_any", [])
+        if pa and not any(x.lower() in parent for x in pa):
+            continue
+
+        # cmd_any
+        ca = rule.get("cmd_any", [])
+        if ca and not any(s.lower() in cmd for s in ca):
+            continue
+
+        # path_prefix_any
+        pp = rule.get("path_prefix_any", [])
+        if pp and not any(fpath.startswith(x.lower()) for x in pp):
+            continue
+
+        # severity_required
+        sr = rule.get("severity_required")
+        if sr and sev != sr.lower():
+            continue
+
+        # filter_benign_parent
+        if rule.get("filter_benign_parent"):
+            parent_name = parent.split("\\")[-1] if "\\" in parent else parent
+            if parent_name in BENIGN_PARENTS:
+                continue
+
+        # ── Behavioral condition matching (NEW) ──────────────────────────
+        # Rules can declare: cmd_entropy_gt, is_lolbin, has_encoded_flag
+        if (thresh := rule.get("cmd_entropy_gt")) is not None:
+            if float(event.get("cmd_entropy") or 0.0) <= float(thresh):
+                continue
+        if rule.get("is_lolbin") is True:
+            if not event.get("is_lolbin"):
+                continue
+        if rule.get("has_encoded_flag") is True:
+            if not (event.get("has_encoded_flag") or event.get("cmd_has_encoded_flag")):
+                continue
+
+        # Compute per-hit confidence with stacked signal boosts
+        conf = int(rule.get("confidence", 50))
+        if event.get("cmd_high_entropy") or event.get("is_high_entropy"):
+            conf = min(conf + 15, 100)
+        if event.get("cmd_b64_detected") or event.get("b64_detected"):
+            conf = min(conf + 10, 100)
+        if event.get("has_encoded_flag") or event.get("cmd_has_encoded_flag"):
+            conf = min(conf + 10, 100)
+        # LOLBin weight amplifies confidence proportionally
+        lw = float(event.get("lolbin_weight") or 0.0)
+        if lw > 0:
+            conf = min(int(conf * (1.0 + lw * 0.2)), 100)
+        if event.get("is_external_ip"):
+            conf = min(conf + 8, 100)
+        if event.get("is_suspicious_chain"):
+            conf = min(conf + 5, 100)
+
+        hits.append({
+            "rule_id":          rule.get("rule_id"),
+            "rule_name":        rule.get("name"),
+            "mitre_id":         rule.get("mitre_id"),
+            "mitre_tactic":     rule.get("mitre_tactic"),
+            "kill_chain_stage": rule.get("kill_chain_stage") or rule.get("mitre_tactic", "Execution"),
+            "severity":         rule.get("severity", "medium"),
+            "confidence_score": conf,
+            "description":      rule.get("description", ""),
+            # Propagate event context
+            "utc_time":         event.get("utc_time") or event.get("event_time"),
+            "event_time":       event.get("event_time") or event.get("utc_time"),
+            "image":            event.get("image"),
+            "event_id":         eid,
+            "computer":         event.get("computer"),
+            "process_id":       event.get("pid") or event.get("process_id"),
+            "parent_process_id":event.get("ppid") or event.get("parent_process_id"),
+            "parent_image":     event.get("parent_image"),
+            "source_ip":        event.get("src_ip") or event.get("source_ip"),
+            "source_port":      event.get("source_port"),
+            "destination_ip":   event.get("dst_ip") or event.get("destination_ip"),
+            "destination_port": event.get("dst_port") or event.get("destination_port"),
+            "target_filename":  event.get("file_path") or event.get("target_filename"),
+            "command_line":     event.get("command_line"),
+        })
+
+    return hits
+
+
+# ---------------------------------------------------------------------------
+# DataFrame-level detection (used by analysis_engine.ingest_upload)
+# ---------------------------------------------------------------------------
+
+DETECTION_OUTPUT_COLS = [
+    "rule_id", "rule_name", "mitre_id", "mitre_tactic", "kill_chain_stage",
+    "utc_time", "event_time", "image", "event_id", "description", "severity",
+    "computer", "process_id", "parent_process_id", "parent_image",
+    "source_ip", "source_port", "destination_ip", "destination_port",
+    "target_filename", "command_line", "confidence_score",
+]
+
+
+def find_detections(
+    df: pd.DataFrame,
+    rules: Optional[List[Dict]] = None,
+) -> pd.DataFrame:
+    """
+    Run YAML rule matching across a DataFrame of events.
+    Falls back to heuristic EID mapping if no rules supplied.
+    """
+    if df.empty:
+        return pd.DataFrame(columns=DETECTION_OUTPUT_COLS)
+
+    if rules is None:
+        rules = load_yaml_rules()
+
+    if not rules:
+        return _heuristic_detections(df)
+
+    hits = []
+    for _, row in df.iterrows():
+        ev = row.to_dict()
+        for hit in match_rules(ev, rules):
+            hits.append(hit)
+
+    if not hits:
+        return pd.DataFrame(columns=DETECTION_OUTPUT_COLS)
+
+    result = pd.DataFrame(hits)
+    for col in DETECTION_OUTPUT_COLS:
+        if col not in result.columns:
+            result[col] = None
+    return result[DETECTION_OUTPUT_COLS]
+
+
+def _heuristic_detections(df: pd.DataFrame) -> pd.DataFrame:
+    """Minimal EID-based detection when no rules.yaml is available."""
+    EID_MAP = {
+        1:  ("T1059",     "Execution",           "Execution",           "Process Create"),
+        3:  ("T1071",     "Command and Control",  "Command and Control",  "Network Connection"),
+        8:  ("T1055",     "Privilege Escalation", "Privilege Escalation", "CreateRemoteThread"),
+        10: ("T1003",     "Credential Access",    "Credential Access",   "LSASS Access"),
+        11: ("T1105",     "Command and Control",  "Command and Control",  "FileCreate"),
+        12: ("T1112",     "Defense Evasion",      "Persistence",         "Registry Create"),
+        13: ("T1112",     "Defense Evasion",      "Persistence",         "Registry Set"),
+        22: ("T1071.004", "Command and Control",  "Command and Control",  "DNSEvent"),
+        25: ("T1055.012", "Defense Evasion",      "Privilege Escalation", "ProcessTampering"),
+    }
+    hits = []
+    for _, row in df.iterrows():
+        try:
+            eid = int(float(row.get("event_id") or 0))
+        except Exception:
+            continue
+        if eid not in EID_MAP:
+            continue
+        mitre_id, tactic, stage, desc = EID_MAP[eid]
+        hits.append({
+            "rule_id":          f"HEUR-{eid}",
+            "rule_name":        f"Heuristic EID {eid}: {desc}",
+            "mitre_id":         mitre_id,
+            "mitre_tactic":     tactic,
+            "kill_chain_stage": stage,
+            "utc_time":         row.get("utc_time") or row.get("event_time"),
+            "event_time":       row.get("event_time") or row.get("utc_time"),
+            "image":            row.get("image"),
+            "event_id":         eid,
+            "description":      desc,
+            "severity":         row.get("severity") or "medium",
+            "computer":         row.get("computer"),
+            "process_id":       row.get("pid") or row.get("process_id"),
+            "parent_process_id":row.get("ppid") or row.get("parent_process_id"),
+            "parent_image":     row.get("parent_image"),
+            "source_ip":        row.get("src_ip") or row.get("source_ip"),
+            "source_port":      row.get("source_port"),
+            "destination_ip":   row.get("dst_ip") or row.get("destination_ip"),
+            "destination_port": row.get("dst_port") or row.get("destination_port"),
+            "target_filename":  row.get("file_path") or row.get("target_filename"),
+            "command_line":     row.get("command_line"),
+            "confidence_score": 40,
+        })
+
+    if not hits:
+        return pd.DataFrame(columns=DETECTION_OUTPUT_COLS)
+    result = pd.DataFrame(hits)
+    for col in DETECTION_OUTPUT_COLS:
+        if col not in result.columns:
+            result[col] = None
+    return result[DETECTION_OUTPUT_COLS]
+
+
+# ---------------------------------------------------------------------------
+# Burst-level full analysis pipeline
+# (used by analysis_engine.run_full_analysis)
+# ---------------------------------------------------------------------------
+
+def analyze_burst_batch(
+    bursts: List[Dict[str, Any]],
+    run_id: str,
+    rules: Optional[List[Dict]] = None,
+) -> Dict[str, Any]:
+    """
+    Full analysis pipeline for a batch of burst dicts:
+
+    1. YAML rule detection per burst event summary
+    2. Baseline deviation scoring
+    3. Graph correlation
+    4. Unified risk scoring
+    5. Kill-chain and severity assignment
+
+    Returns:
+        {
+          "bursts":     List[Dict] — mutated bursts with all scores
+          "campaigns":  List[Dict] — correlation campaigns
+          "detections": List[Dict] — flat detection hits
+        }
+    """
+    if not bursts:
+        return {"bursts": [], "campaigns": [], "detections": []}
+
+    if rules is None:
+        rules = load_yaml_rules()
+
+    baseline  = _get_baseline_engine()
+    scorer    = _get_scoring_engine()
+    correlate = _get_correlate_bursts()
+
+    # ── Step 1: Baseline scoring (mutates bursts in-place) ─────────────
+    baseline.process_burst_batch(bursts)
+
+    # ── Step 2: YAML rule matching per burst ───────────────────────────
+    all_detection_hits: List[Dict[str, Any]] = []
+    for burst in bursts:
+        # ── Build rich event context — preserve all available fields ────
+        # The old "synthetic_event" summarized bursts into a thin dict,
+        # losing raw fields like grandparent_image, integrity_level,
+        # target_object, and per-event cmd context.
+        # We now pass the full burst dict enriched with derived fields.
+        rich_event = {
+            # Core identity
+            "event_id":         (burst.get("event_ids") or [1])[0],
+            "image":            burst.get("image"),
+            "parent_image":     burst.get("parent_image"),
+            "grandparent_image": burst.get("grandparent_image"),    # trigram support
+            "computer":         burst.get("computer"),
+            "user":             burst.get("user"),
+            # Command context — prefer full commandline over concatenated descriptions
+            "command_line": (
+                burst.get("command_line")
+                or burst.get("commandline")
+                or " ".join(str(d) for d in (burst.get("descriptions") or []) if d)
+            ),
+            # File / registry paths
+            "file_path":       burst.get("target_filename"),
+            "target_object":   burst.get("target_object"),
+            "target_filename": burst.get("target_filename"),
+            # Severity + time
+            "severity":   burst.get("severity") or "low",
+            "utc_time":   burst.get("start_time"),
+            "event_time": burst.get("start_time"),
+            # Entropy signals (from parser enrichment)
+            "cmd_high_entropy":      burst.get("cmd_high_entropy", False),
+            "cmd_has_encoded_flag":  burst.get("cmd_has_encoded_flag", False),
+            "cmd_b64_detected":      burst.get("cmd_b64_detected", False),
+            "has_encoded_flag":      burst.get("cmd_has_encoded_flag", False),
+            "cmd_entropy":           burst.get("cmd_entropy", 0.0),
+            # Network
+            "src_ip":           burst.get("source_ip"),
+            "dst_ip":           burst.get("destination_ip"),
+            "dst_port":         burst.get("destination_port"),
+            "destination_ip":   burst.get("destination_ip"),
+            "destination_port": burst.get("destination_port"),
+            # Process IDs
+            "pid":  burst.get("process_id"),
+            "ppid": burst.get("parent_process_id"),
+            # Behavioral flags from prior pipeline stages
+            "has_persistence": burst.get("has_persistence", False),
+            "has_injection":   burst.get("has_injection",   False),
+            "has_net":         burst.get("has_net",         False),
+            # Baseline sequence depth: how many hops deep is this in a
+            # known-anomalous chain?  Used for real chain_depth calculation.
+            "_seq_anomaly":    burst.get("baseline_sub_scores", {}).get("sequence", 0.0),
+        }
+
+        hits = match_rules(rich_event, rules)
+        burst["_detection_hits"] = hits
+        all_detection_hits.extend(hits)
+
+        # Persistence / injection flags from detection hits
+        for h in hits:
+            stage = h.get("kill_chain_stage") or ""
+            mitre = h.get("mitre_id") or ""
+            if "Persistence" in stage:
+                burst["has_persistence"] = True
+            if mitre in ("T1055", "T1055.001", "T1055.012", "T1134", "T1134.001"):
+                burst["has_injection"] = True
+            # Credential access is also escalation-worthy
+            if "Credential" in stage:
+                burst["has_credential_access"] = True
+
+    # ── Step 3: Kill-chain assignment ──────────────────────────────────
+    for burst in bursts:
+        hits   = burst.get("_detection_hits", [])
+        stages = [h.get("kill_chain_stage") for h in hits if h.get("kill_chain_stage")]
+        if stages:
+            highest = max(stages, key=lambda s: KILL_CHAIN_ORDER.index(s)
+                          if s in KILL_CHAIN_ORDER else 0)
+            # Promote if correlation already set a higher stage
+            existing = burst.get("kill_chain_stage") or "Background"
+            if (KILL_CHAIN_ORDER.index(highest) if highest in KILL_CHAIN_ORDER else 0) > \
+               (KILL_CHAIN_ORDER.index(existing) if existing in KILL_CHAIN_ORDER else 0):
+                burst["kill_chain_stage"] = highest
+        elif not burst.get("kill_chain_stage"):
+            burst["kill_chain_stage"] = "Execution"
+
+    # ── Step 4: Graph correlation ───────────────────────────────────────
+    bursts, campaigns = correlate(bursts, run_id, persist=True)
+
+    # ── Step 5: Unified risk scoring ────────────────────────────────────
+    # Compute adaptive per-host noise threshold before scoring.
+    # Hosts with many low-severity events have a higher inherent noise floor,
+    # so a moderate score there is less meaningful than on a quiet host.
+    host_noise: Dict[str, int] = {}
+    for b in bursts:
+        host = (b.get("computer") or "unknown").lower()
+        host_noise[host] = host_noise.get(host, 0) + int(b.get("count") or 1)
+
+    for burst in bursts:
+        dev_score      = float(burst.get("deviation_score") or 0.0)
+        # Wire behavior_score from baseline into the burst so scoring engine can fuse it
+        behavior_score = float(burst.get("behavior_score") or dev_score)
+        burst["behavior_score"] = behavior_score
+
+        # ── Real chain depth calculation ───────────────────────────────────
+        # v1 heuristic: "if baseline flagged anything → chain_depth = 2" — wrong.
+        # Real chain depth = distinct kill-chain stages from detection hits
+        # PLUS a +1 bonus when the baseline sequence model found a rare
+        # multi-hop transition (sequence anomaly > 0.7 means the n-gram model
+        # hasn't seen this parent→child chain in normal behavior).
+        kc_set = set()
+        for hit in burst.get("_detection_hits", []):
+            s = hit.get("kill_chain_stage")
+            if s and s in KILL_CHAIN_ORDER:
+                kc_set.add(s)
+
+        seq_anomaly = float(burst.get("baseline_sub_scores", {}).get("sequence", 0.0))
+        chain_depth = max(len(kc_set), 1)
+        if seq_anomaly > 0.7 and chain_depth < 3:
+            # Rare sequence transition — promote chain depth by 1 to reflect
+            # the multi-hop behavioral signal from the n-gram model
+            chain_depth += 1
+
+        if burst.get("has_correlation"):
+            chain_depth = max(chain_depth, 2)   # Correlated events always ≥ 2
+
+        result = scorer.score_burst(
+            burst,
+            detections=burst.get("_detection_hits"),
+            deviation_score=dev_score,
+            chain_depth=chain_depth,
+        )
+        # Compute final fused score using multi-signal compute_final_score
+        from dashboard.scoring_engine import compute_final_score
+        fused_input = dict(burst)
+        fused_input["rule_score"]     = result.score
+        fused_input["sequence_score"] = float(burst.get("baseline_sub_scores", {}).get("sequence", 0.0)) * 100
+        fused_input["behavior_score"] = behavior_score
+        fused_input["yara_score"]     = float(burst.get("yara_score") or 0.0)
+        fused_input["feedback_adj"]   = 0.0
+        fused_score = compute_final_score(fused_input)
+        # Take the higher of the two scoring paths — never lose signal
+        if fused_score > int(round(result.score)):
+            burst["risk_score"] = fused_score
+        else:
+            burst["risk_score"] = int(round(result.score))
+
+        # risk_score already set above by fused scoring path
+        burst["score_ledger"]        = [e.to_dict() for e in result.ledger]
+        burst["confidence_reasons"]  = result.to_dict()["why"]
+        burst["stage_cap"]           = int(result.stage_cap)
+        burst["chain_multiplier"]    = result.chain_multiplier
+
+        # ── Adaptive threshold: noisy hosts require higher score to alert ──
+        host       = (burst.get("computer") or "unknown").lower()
+        host_total = host_noise.get(host, 1)
+        # If host generates >10 000 events in this batch, raise alert bar by 5 pts
+        adaptive_floor = 40
+        if host_total > 10_000:
+            adaptive_floor = 45
+        elif host_total > 50_000:
+            adaptive_floor = 50
+
+        # ── Slow-attack penalty carry-through ─────────────────────────────
+        # If baseline flagged a stealthy pattern, ensure score doesn't drop
+        # below 40 even if raw signal is weak — the behavioral signal is real.
+        if burst.get("baseline_anomalies") and len(burst["baseline_anomalies"]) >= 2:
+            burst["risk_score"] = max(burst["risk_score"], 35)
+
+        # Severity classification
+        stage = burst.get("kill_chain_stage", "Execution")
+        score = burst["risk_score"]
+        if stage in ("Actions on Objectives", "Command and Control",
+                     "Persistence", "Privilege Escalation", "Credential Access"):
+            burst["severity"] = "high"
+        elif score >= 60:
+            burst["severity"] = "high"
+        elif score >= 40:
+            burst["severity"] = "medium"
+        else:
+            burst["severity"] = "low"
+
+        # Classification (uses adaptive floor)
+        burst["classification"] = (
+            "attack_candidate" if (
+                score >= adaptive_floor
+                or burst.get("has_persistence")
+                or burst.get("has_injection")
+                or burst.get("has_correlation")
+            ) else "background_activity"
+        )
+
+        # ── Feedback loop: high-risk events MUST NOT poison the baseline ──
+        # Mark bursts that scored above 80 so BaselineEngine.should_learn()
+        # will reject them — prevents attackers from training the model.
+        if score > 80:
+            burst["_never_learn"] = True
+
+        # Clean temp field
+        burst.pop("_detection_hits", None)
+
+    # ── Step 6: Save updated baselines ─────────────────────────────────
+    try:
+        baseline.save_to_db()
+    except Exception as e:
+        print(f"[DetectionEngine] baseline save failed: {e}")
+
+    return {
+        "bursts":     bursts,
+        "campaigns":  campaigns,
+        "detections": all_detection_hits,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Legacy DetectionRule / DetectionEngine classes
+# (kept for backward compatibility with existing soc_verdict / app imports)
+# ---------------------------------------------------------------------------
+
+class DetectionRule:
+    """Legacy rule wrapper — kept for backward compatibility."""
+
+    def __init__(
+        self,
+        name: str,
+        event_ids: List[str],
+        severity: str,
+        confidence: int,
+        mitre_id: str,
+        mitre_tactic: str,
+        explanation: str,
+        check_func,
+        rule_id: Optional[str] = None,
+        version: int = 1,
+        enabled: bool = True,
+    ):
+        self.name         = name
+        self.event_ids    = event_ids
+        self.severity     = severity
+        self.confidence   = confidence
+        self.mitre_id     = mitre_id
+        self.mitre_tactic = mitre_tactic
+        self.explanation  = explanation
+        self.check_func   = check_func
+        self.rule_id      = rule_id or name.lower().replace(" ", "_")
+        self.version      = version
+        self.enabled      = enabled
+
+    def evaluate(self, event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        eid = str(event.get("event_id", "")).strip()
+        if eid not in self.event_ids:
+            return None
+        try:
+            if not self.check_func(event):
+                return None
+        except Exception:
+            return None
+
+        return {
+            "rule_name":        self.name,
+            "rule_id":          self.rule_id,
+            "severity":         self.severity,
+            "confidence_score": self.confidence,
+            "mitre_id":         self.mitre_id,
+            "mitre_tactic":     self.mitre_tactic,
+            "description":      self.explanation,
+            "kill_chain_stage": self._tactic_to_stage(self.mitre_tactic),
+            "rule_version":     self.version,
+            "event_id":         event.get("event_id"),
+            "utc_time":         event.get("utc_time"),
+            "image":            event.get("image"),
+            "computer":         event.get("computer"),
+            "process_id":       event.get("pid"),
+            "parent_process_id":event.get("ppid"),
+            "source_ip":        event.get("src_ip"),
+            "destination_ip":   event.get("dst_ip"),
+            "target_filename":  event.get("file_path") or event.get("target_filename"),
+        }
+
+    @staticmethod
+    def _tactic_to_stage(tactic: str) -> str:
+        mapping = {
+            "Initial Access":       "Delivery",
+            "Execution":            "Execution",
+            "Persistence":          "Persistence",
+            "Privilege Escalation": "Privilege Escalation",
+            "Defense Evasion":      "Defense Evasion",
+            "Credential Access":    "Credential Access",
+            "Discovery":            "Discovery",
+            "Lateral Movement":     "Lateral Movement",
+            "Collection":           "Collection",
+            "Command and Control":  "Command and Control",
+            "Exfiltration":         "Exfiltration",
+            "Impact":               "Actions on Objectives",
+        }
+        return mapping.get(tactic, "Execution")
+
+
+class DetectionEngine:
+    """
+    Legacy class — wraps YAML rule matching for backward compatibility.
+    New code should call match_rules() / find_detections() / analyze_burst_batch() directly.
+    """
+
+    def __init__(self):
+        self.rules_yaml = load_yaml_rules()
+
+    def run_detections(self, event: Dict[str, Any]) -> List[Dict[str, Any]]:
+        return match_rules(event, self.rules_yaml)

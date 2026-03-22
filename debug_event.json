@@ -1,0 +1,27 @@
+[
+  {
+    "event_uid": "b1ecb5461533592ee41f902ddb20b8938b1a925310071502f4beb6a7a84c794d",
+    "run_id": "live",
+    "event_time": "2026-03-11T06:45:39.9005990Z",
+    "event_id": "5",
+    "image": "C:\\Program Files\\Splunk\\bin\\splunk-optimize.exe",
+    "parent_image": null,
+    "command_line": null,
+    "user": "NT AUTHORITY\\SYSTEM",
+    "pid": "32904",
+    "ppid": null,
+    "src_ip": null,
+    "dst_ip": null,
+    "dst_port": null,
+    "file_path": null,
+    "severity": null,
+    "computer": "LokithStark",
+    "description": null,
+    "tags": null,
+    "destination_ip": null,
+    "source_port": null,
+    "target_filename": null,
+    "process_id": "32904",
+    "parent_process_id": null
+  }
+]

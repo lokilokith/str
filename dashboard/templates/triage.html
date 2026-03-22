@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>SentinelTrace | Triage Queue</title>
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{--void:#060a10;--card:#0d1525;--card2:#101929;--border:rgba(255,255,255,.07);--border2:rgba(255,255,255,.12);--text:#e8edf5;--muted:#6b7a94;--dim:#3d4a5e;--cyan:#00d4ff;--red:#ff4757;--amber:#ffb800;--green:#00e676;--mono:'Space Mono',monospace;--sans:'DM Sans',sans-serif}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:var(--sans);background:var(--void);color:var(--text);min-height:100vh}
+body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(rgba(0,212,255,.02) 1px,transparent 1px),linear-gradient(90deg,rgba(0,212,255,.02) 1px,transparent 1px);background-size:48px 48px;pointer-events:none}
+
+.topbar{background:rgba(6,10,16,.92);backdrop-filter:blur(20px);border-bottom:1px solid var(--border);padding:0 28px;height:52px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:200}
+.brand{font-family:var(--mono);font-size:13px;font-weight:700;color:var(--cyan);display:flex;align-items:center;gap:8px}
+.brand::before{content:'';width:7px;height:7px;background:var(--cyan);border-radius:50%;animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.nav{display:flex;gap:2px}
+.nav a{color:var(--muted);text-decoration:none;font-size:12px;padding:6px 14px;border-radius:8px;transition:all .15s}
+.nav a:hover,.nav a.active{color:var(--text);background:rgba(255,255,255,.06)}
+
+.page{max-width:1500px;margin:0 auto;padding:28px}
+.page-hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:24px}
+.page-hdr h1{font-size:20px;font-weight:600}
+.refresh-btn{background:rgba(0,212,255,.08);border:1px solid rgba(0,212,255,.2);color:var(--cyan);padding:7px 16px;border-radius:8px;cursor:pointer;font-size:12px;font-weight:600;transition:all .15s}
+.refresh-btn:hover{background:rgba(0,212,255,.15)}
+
+.stats-row{display:grid;grid-template-columns:repeat(5,1fr);gap:14px;margin-bottom:26px}
+.stat{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:18px;animation:fadeUp .4s ease both}
+@keyframes fadeUp{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}
+.stat:nth-child(2){animation-delay:.05s}.stat:nth-child(3){animation-delay:.1s}.stat:nth-child(4){animation-delay:.15s}.stat:nth-child(5){animation-delay:.2s}
+.stat-num{font-family:var(--mono);font-size:30px;font-weight:700}
+.stat-lbl{font-size:10px;text-transform:uppercase;letter-spacing:.8px;color:var(--muted);margin-top:4px}
+
+.table-wrap{background:var(--card);border:1px solid var(--border);border-radius:14px;overflow:hidden;animation:fadeUp .4s .2s ease both}
+.table-hdr{padding:14px 18px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;gap:12px}
+.table-hdr h2{font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--muted);font-weight:600}
+.filter-row{display:flex;gap:8px;padding:10px 14px;border-bottom:1px solid var(--border);background:rgba(0,0,0,.15);flex-wrap:wrap}
+select{background:rgba(0,0,0,.4);border:1px solid var(--border);color:var(--text);padding:5px 10px;border-radius:6px;font-size:12px;font-family:var(--sans);transition:border-color .2s}
+select:focus{outline:none;border-color:var(--cyan)}
+select option{background:#0b1220}
+
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{padding:10px 14px;text-align:left;color:var(--dim);font-size:10px;text-transform:uppercase;letter-spacing:.6px;border-bottom:1px solid var(--border);background:rgba(0,0,0,.2);font-weight:600}
+td{padding:10px 14px;border-bottom:1px solid var(--border);vertical-align:middle}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:rgba(255,255,255,.02)}
+
+.badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:700;text-transform:uppercase}
+.b-critical{background:rgba(255,71,87,.15);color:var(--red);border:1px solid rgba(255,71,87,.25)}
+.b-high{background:rgba(255,184,0,.12);color:var(--amber);border:1px solid rgba(255,184,0,.2)}
+.b-medium{background:rgba(0,212,255,.1);color:#60d8ff;border:1px solid rgba(0,212,255,.15)}
+.b-low{background:rgba(107,122,148,.12);color:var(--muted);border:1px solid var(--border)}
+.b-green{background:rgba(0,230,118,.1);color:var(--green);border:1px solid rgba(0,230,118,.15)}
+.b-purple{background:rgba(168,85,247,.12);color:#c084fc;border:1px solid rgba(168,85,247,.2)}
+.b-gray{background:rgba(255,255,255,.05);color:var(--muted)}
+
+.sla-red{color:var(--red);font-family:var(--mono);font-size:11px}
+.sla-amber{color:var(--amber);font-family:var(--mono);font-size:11px}
+.sla-green{color:var(--green);font-family:var(--mono);font-size:11px}
+.sla-gray{color:var(--muted);font-family:var(--mono);font-size:11px}
+
+.conf-wrap{display:flex;align-items:center;gap:7px}
+.conf-bar{width:52px;height:4px;background:rgba(255,255,255,.08);border-radius:2px;overflow:hidden;flex-shrink:0}
+.conf-fill{height:100%;border-radius:2px}
+
+.action-btn{padding:4px 10px;border-radius:5px;border:1px solid var(--border);background:transparent;color:var(--muted);cursor:pointer;font-size:11px;transition:all .15s;text-decoration:none;display:inline-block;font-family:var(--sans)}
+.action-btn:hover{border-color:var(--cyan);color:var(--cyan)}
+.action-btn.esc{border-color:rgba(255,71,87,.3);color:var(--red)}
+.action-btn.esc:hover{background:rgba(255,71,87,.08)}
+.action-btn.ok{border-color:rgba(0,230,118,.3);color:var(--green)}
+.action-btn.ok:hover{background:rgba(0,230,118,.07)}
+
+.empty{text-align:center;padding:48px;color:var(--dim);font-size:13px}
+.empty-icon{font-size:32px;margin-bottom:10px}
+</style>
+</head>
+<body>
+<div class="topbar">
+  <div style="display:flex;gap:22px;align-items:center">
+    <div class="brand">⬡ SentinelTrace</div>
+    <nav class="nav">
+      <a href="/">Dashboard</a>
+      <a href="/triage" class="active">Triage</a>
+      <a href="/hunt">Hunt</a>
+      <a href="/live">Live</a>
+    </nav>
+  </div>
+  <button class="refresh-btn" onclick="location.reload()">↻ Refresh</button>
+</div>
+
+<div class="page">
+  <div class="page-hdr">
+    <h1>SOC Triage Queue</h1>
+    <span style="font-size:12px;color:var(--muted);font-family:var(--mono)">{{ total }} active · {{ unreviewed }} unreviewed</span>
+  </div>
+
+  <div class="stats-row">
+    <div class="stat"><div class="stat-num" style="color:var(--red)">{{ incidents|selectattr('sla','defined')|selectattr('sla.breached','equalto',True)|list|length }}</div><div class="stat-lbl">SLA Breached</div></div>
+    <div class="stat"><div class="stat-num" style="color:var(--amber)">{{ unreviewed }}</div><div class="stat-lbl">Unreviewed</div></div>
+    <div class="stat"><div class="stat-num">{{ total }}</div><div class="stat-lbl">Total Active</div></div>
+    <div class="stat"><div class="stat-num" style="color:var(--green)">{{ incidents|selectattr('status','equalto','Investigating')|list|length }}</div><div class="stat-lbl">Investigating</div></div>
+    <div class="stat"><div class="stat-num" style="color:var(--cyan)">{{ incidents|selectattr('status','equalto','Escalated')|list|length }}</div><div class="stat-lbl">Escalated</div></div>
+  </div>
+
+  <div class="table-wrap">
+    <div class="table-hdr">
+      <h2>Active incidents — priority queue</h2>
+      <span style="font-size:11px;color:var(--dim)">v2 engine fields where available</span>
+    </div>
+    <div class="filter-row">
+      <select onchange="filterTable(this.value,'status')">
+        <option value="">All Status</option>
+        <option>New</option><option>Triage</option><option>Investigating</option><option>Escalated</option>
+      </select>
+      <select onchange="filterTable(this.value,'sev')">
+        <option value="">All Severity</option>
+        <option>High</option><option>Medium</option><option>Low</option>
+      </select>
+    </div>
+
+    {% if incidents %}
+    <table id="triageTable">
+      <thead>
+        <tr><th>Incident</th><th>Status</th><th>Severity</th><th>Confidence</th><th>SLA</th><th>Analyst</th><th>Created</th><th>Actions</th></tr>
+      </thead>
+      <tbody>
+      {% for inc in incidents %}
+      {% set sev = (inc.severity or 'medium') | lower %}
+      <tr data-status="{{ inc.status }}" data-sev="{{ inc.severity }}">
+        <td>
+          <a href="/dashboard/{{ inc.run_id }}" style="color:var(--cyan);font-family:var(--mono);font-weight:700;text-decoration:none">{{ inc.incident_id }}</a>
+          <div style="font-size:10px;color:var(--dim);margin-top:2px;font-family:var(--mono)">{{ inc.run_id[:12] }}</div>
+        </td>
+        <td><span class="badge b-{% if inc.status in ['Escalated'] %}critical{% elif inc.status in ['Investigating','Triage'] %}medium{% else %}gray{% endif %}">{{ inc.status }}</span></td>
+        <td><span class="badge b-{% if sev == 'high' %}critical{% elif sev == 'medium' %}high{% else %}low{% endif %}">{{ inc.severity or 'Med' }}</span></td>
+        <td>
+          <div class="conf-wrap">
+            <span style="font-family:var(--mono);font-size:12px;color:{% if inc.confidence >= 70 %}var(--red){% elif inc.confidence >= 40 %}var(--amber){% else %}var(--green){% endif %}">{{ inc.confidence }}</span>
+            <div class="conf-bar"><div class="conf-fill" style="width:{{ inc.confidence }}%;background:{% if inc.confidence >= 70 %}var(--red){% elif inc.confidence >= 40 %}var(--amber){% else %}var(--cyan){% endif %}"></div></div>
+          </div>
+        </td>
+        <td>
+          {% if inc.sla %}
+          <span class="sla-{% if inc.sla.breached %}red{% elif inc.sla.hours_remaining < 2 %}amber{% else %}green{% endif %}">{{ inc.sla.label }}</span>
+          {% else %}<span class="sla-gray">—</span>{% endif %}
+        </td>
+        <td style="color:var(--muted);font-size:11px">{{ inc.analyst or '—' }}</td>
+        <td style="color:var(--dim);font-size:11px;font-family:var(--mono)">{{ (inc.created_at or '')[:16] }}</td>
+        <td>
+          <div style="display:flex;gap:5px;flex-wrap:wrap">
+            <a href="/dashboard/{{ inc.run_id }}" class="action-btn">Investigate</a>
+            <button class="action-btn esc" onclick="transition('{{ inc.incident_id }}','Escalated')">Escalate</button>
+            <button class="action-btn ok" onclick="transition('{{ inc.incident_id }}','Closed - False Positive')">FP</button>
+          </div>
+        </td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <div class="empty"><div class="empty-icon">✓</div><div style="font-weight:600;margin-bottom:4px">Queue is clear</div><div>No active incidents requiring triage.</div></div>
+    {% endif %}
+  </div>
+</div>
+
+<script>
+function filterTable(v,type){document.querySelectorAll('#triageTable tbody tr').forEach(r=>{const a=type==='status'?r.dataset.status:r.dataset.sev;r.style.display=(!v||a===v)?'':'none'})}
+async function transition(id,status){
+  const r=await fetch(`/api/incident/${id}/transition`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({status,analyst_id:'soc-analyst'})});
+  const d=await r.json();
+  if(d.success)location.reload();else alert('Error: '+(d.error||'Unknown'));
+}
+setTimeout(()=>location.reload(),60000);
+</script>
+</body>
+</html>

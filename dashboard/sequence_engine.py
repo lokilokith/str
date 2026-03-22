@@ -1,0 +1,564 @@
+"""
+sequence_engine.py — SentinelTrace v3 Sequence Detection Engine
+===============================================================
+PROBLEM 1 FIX: Event-centric → Attack-centric detection
+
+Instead of detecting each event in isolation, this engine tracks
+ATTACK CHAINS: ordered sequences of process launches that match
+known attacker playbooks.
+
+Examples it catches:
+  winword.exe → powershell.exe → cmd.exe → network  (phishing macro)
+  mshta.exe → powershell.exe → regsvr32.exe         (fileless malware)
+  cmd.exe → schtasks.exe + reg.exe                  (persistence)
+  lsass access → mimikatz keywords                  (credential dump)
+
+Architecture:
+  - SequencePattern: defines a multi-hop attack chain
+  - SequenceTracker: stateful per-host tracker (sliding window)
+  - SequenceEngine: batch-processes a DataFrame of events
+"""
+
+from __future__ import annotations
+
+import hashlib
+import uuid
+from collections import defaultdict, deque
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
+
+import pandas as pd
+
+
+# ---------------------------------------------------------------------------
+# Kill chain ordering
+# ---------------------------------------------------------------------------
+
+KILL_CHAIN_ORDER = [
+    "Background", "Delivery", "Execution", "Defense Evasion",
+    "Persistence", "Privilege Escalation", "Credential Access",
+    "Discovery", "Lateral Movement", "Collection",
+    "Command and Control", "Exfiltration", "Actions on Objectives",
+]
+
+
+# ---------------------------------------------------------------------------
+# Sequence Pattern Definition
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SequenceStep:
+    """One hop in an attack chain."""
+    image_contains: Optional[str] = None        # partial image name match
+    image_any: Optional[List[str]] = None        # OR list of exact names
+    cmd_contains: Optional[str] = None           # command line substring
+    event_id: Optional[int] = None               # Sysmon event ID filter
+    max_gap_seconds: int = 3600                  # max time to next step
+
+
+@dataclass
+class SequencePattern:
+    """A named multi-hop attack chain pattern."""
+    pattern_id: str
+    name: str
+    description: str
+    steps: List[SequenceStep]
+    mitre_id: str
+    mitre_tactic: str
+    kill_chain_stage: str
+    base_confidence: int = 80                    # confidence when fully matched
+    min_steps_to_fire: int = 0                   # 0 = must complete all steps
+
+
+# ---------------------------------------------------------------------------
+# Built-in Attack Patterns
+# ---------------------------------------------------------------------------
+
+BUILTIN_PATTERNS: List[SequencePattern] = [
+
+    # ── Phishing macro execution chain ──────────────────────────────────────
+    SequencePattern(
+        pattern_id="SEQ-001",
+        name="Office macro → PowerShell execution",
+        description="Office application spawns PowerShell — classic phishing macro payload",
+        mitre_id="T1566.001",
+        mitre_tactic="Initial Access",
+        kill_chain_stage="Execution",
+        base_confidence=90,
+        steps=[
+            SequenceStep(image_any=["winword.exe", "excel.exe", "outlook.exe", "powerpnt.exe"],
+                         event_id=1, max_gap_seconds=300),
+            SequenceStep(image_contains="powershell", event_id=1, max_gap_seconds=300),
+        ],
+    ),
+
+    # ── Office → PowerShell → network (full phishing chain) ─────────────────
+    SequencePattern(
+        pattern_id="SEQ-002",
+        name="Office macro → PowerShell → C2 download",
+        description="Office spawns PowerShell which makes outbound network connection — staged payload delivery",
+        mitre_id="T1566.001",
+        mitre_tactic="Initial Access",
+        kill_chain_stage="Command and Control",
+        base_confidence=95,
+        steps=[
+            SequenceStep(image_any=["winword.exe", "excel.exe", "outlook.exe"], event_id=1),
+            SequenceStep(image_contains="powershell", event_id=1, max_gap_seconds=600),
+            SequenceStep(image_contains="powershell", event_id=3, max_gap_seconds=120),
+        ],
+    ),
+
+    # ── Encoded PowerShell → file drop ──────────────────────────────────────
+    SequencePattern(
+        pattern_id="SEQ-003",
+        name="Encoded PowerShell → file drop",
+        description="PowerShell with encoded command followed by file creation — dropper activity",
+        mitre_id="T1059.001",
+        mitre_tactic="Execution",
+        kill_chain_stage="Execution",
+        base_confidence=85,
+        steps=[
+            SequenceStep(image_contains="powershell", cmd_contains="-enc", event_id=1),
+            SequenceStep(image_contains="powershell", event_id=11, max_gap_seconds=300),
+        ],
+    ),
+
+    # ── PowerShell → cmd → network (lateral movement) ───────────────────────
+    SequencePattern(
+        pattern_id="SEQ-004",
+        name="PowerShell → cmd.exe → network connection",
+        description="PowerShell spawns cmd.exe which makes network connection — lateral movement pattern",
+        mitre_id="T1021",
+        mitre_tactic="Lateral Movement",
+        kill_chain_stage="Lateral Movement",
+        base_confidence=80,
+        steps=[
+            SequenceStep(image_contains="powershell", event_id=1),
+            SequenceStep(image_any=["cmd.exe"], event_id=1, max_gap_seconds=120),
+            SequenceStep(image_any=["cmd.exe"], event_id=3, max_gap_seconds=60),
+        ],
+    ),
+
+    # ── Credential dumping chain ─────────────────────────────────────────────
+    SequencePattern(
+        pattern_id="SEQ-005",
+        name="LSASS access → credential tool execution",
+        description="Process opens LSASS followed by credential dumping tool — active credential theft",
+        mitre_id="T1003.001",
+        mitre_tactic="Credential Access",
+        kill_chain_stage="Credential Access",
+        base_confidence=95,
+        steps=[
+            SequenceStep(event_id=10, max_gap_seconds=300),   # ProcessAccess (LSASS)
+            SequenceStep(cmd_contains="sekurlsa", event_id=1, max_gap_seconds=300),
+        ],
+    ),
+
+    # ── Registry persistence after execution ────────────────────────────────
+    SequencePattern(
+        pattern_id="SEQ-006",
+        name="Execution → registry Run key persistence",
+        description="Process execution followed by Run key modification — establishing persistence",
+        mitre_id="T1547.001",
+        mitre_tactic="Persistence",
+        kill_chain_stage="Persistence",
+        base_confidence=85,
+        steps=[
+            SequenceStep(image_any=["powershell.exe", "cmd.exe", "wscript.exe", "cscript.exe"],
+                         event_id=1),
+            SequenceStep(event_id=13, max_gap_seconds=600),   # Registry value set
+        ],
+    ),
+
+    # ── Scheduled task persistence ───────────────────────────────────────────
+    SequencePattern(
+        pattern_id="SEQ-007",
+        name="Shell → scheduled task creation",
+        description="Shell spawns schtasks.exe with /create — scheduled task persistence",
+        mitre_id="T1053.005",
+        mitre_tactic="Persistence",
+        kill_chain_stage="Persistence",
+        base_confidence=82,
+        steps=[
+            SequenceStep(image_any=["powershell.exe", "cmd.exe"], event_id=1),
+            SequenceStep(image_contains="schtasks", cmd_contains="/create", event_id=1,
+                         max_gap_seconds=120),
+        ],
+    ),
+
+    # ── Shadow copy deletion (ransomware indicator) ───────────────────────────
+    SequencePattern(
+        pattern_id="SEQ-008",
+        name="Shell → shadow copy deletion",
+        description="Shell executes vssadmin/wmic to delete shadow copies — pre-ransomware indicator",
+        mitre_id="T1490",
+        mitre_tactic="Impact",
+        kill_chain_stage="Actions on Objectives",
+        base_confidence=95,
+        steps=[
+            SequenceStep(image_any=["cmd.exe", "powershell.exe"], event_id=1),
+            SequenceStep(cmd_contains="shadowcopy", event_id=1, max_gap_seconds=300),
+        ],
+    ),
+
+    # ── Firewall disable → C2 ────────────────────────────────────────────────
+    SequencePattern(
+        pattern_id="SEQ-009",
+        name="Firewall disabled → outbound connection",
+        description="netsh disables firewall followed by outbound network — clearing path for C2",
+        mitre_id="T1562.004",
+        mitre_tactic="Defense Evasion",
+        kill_chain_stage="Command and Control",
+        base_confidence=90,
+        steps=[
+            SequenceStep(image_contains="netsh", cmd_contains="firewall", event_id=1),
+            SequenceStep(event_id=3, max_gap_seconds=300),
+        ],
+    ),
+
+    # ── MSHTA → network → file drop (HTA dropper) ────────────────────────────
+    SequencePattern(
+        pattern_id="SEQ-010",
+        name="MSHTA → network → file drop",
+        description="MSHTA makes network connection then drops file — HTA-based dropper chain",
+        mitre_id="T1218.005",
+        mitre_tactic="Defense Evasion",
+        kill_chain_stage="Execution",
+        base_confidence=92,
+        steps=[
+            SequenceStep(image_contains="mshta", event_id=1),
+            SequenceStep(image_contains="mshta", event_id=3, max_gap_seconds=120),
+            SequenceStep(event_id=11, max_gap_seconds=120),
+        ],
+    ),
+
+    # ── Discovery → lateral movement ─────────────────────────────────────────
+    SequencePattern(
+        pattern_id="SEQ-011",
+        name="Network enumeration → remote execution",
+        description="net.exe enumeration followed by PsExec/WMI — pre-lateral movement reconnaissance",
+        mitre_id="T1018",
+        mitre_tactic="Discovery",
+        kill_chain_stage="Lateral Movement",
+        base_confidence=80,
+        steps=[
+            SequenceStep(image_any=["net.exe", "net1.exe", "nltest.exe"], event_id=1),
+            SequenceStep(image_any=["psexec.exe", "psexec64.exe", "wmic.exe"],
+                         event_id=1, max_gap_seconds=1800),
+        ],
+    ),
+
+    # ── Certutil download → execution ────────────────────────────────────────
+    SequencePattern(
+        pattern_id="SEQ-012",
+        name="Certutil download → new process execution",
+        description="Certutil downloads file, then new process spawns — LOLBin staging and execution",
+        mitre_id="T1105",
+        mitre_tactic="Command and Control",
+        kill_chain_stage="Execution",
+        base_confidence=88,
+        steps=[
+            SequenceStep(image_contains="certutil", cmd_contains="-urlcache", event_id=1),
+            SequenceStep(event_id=1, max_gap_seconds=300),
+        ],
+    ),
+]
+
+
+# ---------------------------------------------------------------------------
+# Step matching helper
+# ---------------------------------------------------------------------------
+
+def _step_matches(event: Dict[str, Any], step: SequenceStep) -> bool:
+    """Return True if a single event dict satisfies a sequence step."""
+    # Event ID filter
+    if step.event_id is not None:
+        try:
+            if int(event.get("event_id") or 0) != step.event_id:
+                return False
+        except (TypeError, ValueError):
+            return False
+
+    img = str(event.get("image") or "").lower()
+    cmd = str(event.get("command_line") or event.get("commandline") or "").lower()
+
+    if step.image_contains and step.image_contains.lower() not in img:
+        return False
+
+    if step.image_any:
+        if not any(x.lower() in img for x in step.image_any):
+            return False
+
+    if step.cmd_contains and step.cmd_contains.lower() not in cmd:
+        return False
+
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Per-host sequence tracker
+# ---------------------------------------------------------------------------
+
+class _ChainState:
+    """One in-progress chain match attempt."""
+    __slots__ = ("step_idx", "last_time", "matched_evs")
+
+    def __init__(self, step_idx: int, last_time: datetime, matched_evs: list):
+        self.step_idx   = step_idx
+        self.last_time  = last_time
+        self.matched_evs = matched_evs
+
+
+class _HostTracker:
+    """
+    Multi-chain state tracker per (host, pattern).
+
+    FIXED: previously only one active chain per pattern per host.
+    Now supports MULTIPLE concurrent in-progress chains per pattern.
+    This prevents state overwrite when:
+      - attacker runs: ps → cmd → ps → cmd
+      - parallel attack paths run simultaneously on the same host
+      - chain restarts before previous chain completes
+
+    State: {pattern_id → List[_ChainState]}
+    Each pattern can have up to MAX_CHAINS_PER_PATTERN concurrent chains.
+    """
+
+    MAX_CHAINS_PER_PATTERN = 8   # max concurrent in-progress chains per pattern
+
+    def __init__(self, window_seconds: int = 3600):
+        # {pattern_id → List[_ChainState]}
+        self._state: Dict[str, List[_ChainState]] = defaultdict(list)
+        self._window = window_seconds
+
+    def _prune_timed_out(
+        self, chains: List[_ChainState], pat: SequencePattern, now: datetime
+    ) -> List[_ChainState]:
+        """Remove chains whose last-matched step has exceeded its time window."""
+        live = []
+        for chain in chains:
+            if chain.step_idx < len(pat.steps):
+                step       = pat.steps[chain.step_idx]
+                max_gap    = step.max_gap_seconds
+                elapsed    = (now - chain.last_time).total_seconds()
+                if elapsed <= max_gap:
+                    live.append(chain)
+                # else: timed out — drop silently
+        return live
+
+    def process_event(
+        self,
+        event: Dict[str, Any],
+        patterns: List[SequencePattern],
+        now: datetime,
+    ) -> List[Dict[str, Any]]:
+        """
+        Feed one event.  Returns list of completed sequence detections.
+
+        Algorithm per pattern:
+          1. Prune timed-out chains
+          2. Advance any chain whose NEXT step matches this event
+          3. If any chain completed → emit detection, remove it
+          4. If step 0 of this pattern matches → start a NEW chain
+             (allows parallel chains for the same pattern)
+        """
+        completed: List[Dict[str, Any]] = []
+
+        for pat in patterns:
+            pid = pat.pattern_id
+
+            # Step 1: prune timed-out chains
+            self._state[pid] = self._prune_timed_out(self._state[pid], pat, now)
+
+            still_active: List[_ChainState] = []
+            newly_completed: List[_ChainState] = []
+
+            # Step 2 + 3: try to advance each existing chain
+            for chain in self._state[pid]:
+                current_step = pat.steps[chain.step_idx]
+                if _step_matches(event, current_step):
+                    new_idx  = chain.step_idx + 1
+                    new_evs  = chain.matched_evs + [event]
+                    if new_idx >= len(pat.steps):
+                        # Chain complete!
+                        newly_completed.append(_ChainState(new_idx, now, new_evs))
+                    else:
+                        still_active.append(_ChainState(new_idx, now, new_evs))
+                else:
+                    still_active.append(chain)  # no progress, keep alive
+
+            # Emit completed detections
+            for done in newly_completed:
+                completed.append(_build_sequence_detection(pat, done.matched_evs))
+
+            # Step 4: check if step 0 matches → start fresh chain
+            # This runs regardless of whether we advanced existing chains,
+            # allowing parallel tracking of the same pattern from a new anchor.
+            if _step_matches(event, pat.steps[0]):
+                if len(pat.steps) == 1:
+                    # Single-step pattern — fires immediately
+                    completed.append(
+                        _build_sequence_detection(pat, [event])
+                    )
+                else:
+                    new_chain = _ChainState(1, now, [event])
+                    still_active.append(new_chain)
+
+            # Cap concurrent chains to avoid unbounded memory growth
+            if len(still_active) > self.MAX_CHAINS_PER_PATTERN:
+                # Keep most-advanced chains (highest step_idx)
+                still_active.sort(key=lambda c: c.step_idx, reverse=True)
+                still_active = still_active[:self.MAX_CHAINS_PER_PATTERN]
+
+            self._state[pid] = still_active
+
+        return completed
+
+
+def _build_sequence_detection(
+    pat: SequencePattern,
+    matched_events: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Build a detection dict from a completed sequence match."""
+    first_ev = matched_events[0]
+    last_ev  = matched_events[-1]
+    chain_str = " → ".join(
+        str(e.get("image") or "").split("\\")[-1] or str(e.get("event_id"))
+        for e in matched_events
+    )
+    return {
+        "detection_id":     f"SEQ-DET-{uuid.uuid4().hex[:10]}",
+        "pattern_id":       pat.pattern_id,
+        "rule_id":          pat.pattern_id,
+        "rule_name":        pat.name,
+        "description":      f"{pat.description} | Chain: {chain_str}",
+        "mitre_id":         pat.mitre_id,
+        "mitre_tactic":     pat.mitre_tactic,
+        "kill_chain_stage": pat.kill_chain_stage,
+        "confidence_score": pat.base_confidence,
+        "severity":         _confidence_to_severity(pat.base_confidence),
+        "chain_depth":      len(matched_events),
+        "chain_str":        chain_str,
+        "image":            str(first_ev.get("image") or ""),
+        "computer":         str(first_ev.get("computer") or ""),
+        "utc_time":         first_ev.get("event_time") or first_ev.get("utc_time"),
+        "event_time":       first_ev.get("event_time") or first_ev.get("utc_time"),
+        "end_time":         last_ev.get("event_time") or last_ev.get("utc_time"),
+        "matched_event_ids": [str(e.get("event_id")) for e in matched_events],
+        "run_id":           str(first_ev.get("run_id") or ""),
+        "is_sequence":      True,
+    }
+
+
+def _confidence_to_severity(conf: int) -> str:
+    if conf >= 90: return "critical"
+    if conf >= 75: return "high"
+    if conf >= 55: return "medium"
+    return "low"
+
+
+# ---------------------------------------------------------------------------
+# Public SequenceEngine
+# ---------------------------------------------------------------------------
+
+class SequenceEngine:
+    """
+    Stateful sequence detection engine.
+
+    Usage:
+        engine = SequenceEngine()
+        detections = engine.process_dataframe(events_df)
+
+    Returns a list of sequence detection dicts, one per completed chain match.
+    Each detection has the same schema as a YAML-rule detection so it can be
+    inserted directly into the detections table and displayed in the dashboard.
+    """
+
+    def __init__(
+        self,
+        patterns: Optional[List[SequencePattern]] = None,
+        window_seconds: int = 3600,
+    ):
+        self.patterns = patterns if patterns is not None else BUILTIN_PATTERNS
+        self.window   = window_seconds
+        # Per-host trackers:  host → _HostTracker
+        self._trackers: Dict[str, _HostTracker] = defaultdict(
+            lambda: _HostTracker(window_seconds)
+        )
+
+    def process_dataframe(self, df: pd.DataFrame) -> List[Dict[str, Any]]:
+        """
+        Process a sorted DataFrame of events and return all sequence detections.
+        Events MUST be sorted by event_time ascending for correct ordering.
+        """
+        if df.empty:
+            return []
+
+        detections: List[Dict[str, Any]] = []
+
+        # Ensure sorted
+        time_col = "event_time" if "event_time" in df.columns else "utc_time"
+        if time_col in df.columns:
+            df = df.sort_values(time_col, na_position="last")
+
+        for _, row in df.iterrows():
+            event = row.to_dict()
+            # Coerce NaN → None for safety
+            event = {k: (None if (isinstance(v, float) and v != v) else v)
+                     for k, v in event.items()}
+
+            computer = str(event.get("computer") or "unknown_host")
+
+            # Parse timestamp
+            ts_raw = event.get("event_time") or event.get("utc_time")
+            try:
+                if isinstance(ts_raw, datetime):
+                    now = ts_raw.replace(tzinfo=timezone.utc) if ts_raw.tzinfo is None else ts_raw
+                elif ts_raw is not None:
+                    now = pd.to_datetime(ts_raw, errors="coerce", utc=True).to_pydatetime()
+                else:
+                    now = datetime.now(tz=timezone.utc)
+            except Exception:
+                now = datetime.now(tz=timezone.utc)
+
+            tracker   = self._trackers[computer]
+            completed = tracker.process_event(event, self.patterns, now)
+            detections.extend(completed)
+
+        return detections
+
+    def process_event(
+        self,
+        event: Dict[str, Any],
+        now: Optional[datetime] = None,
+    ) -> List[Dict[str, Any]]:
+        """Process a single live event dict (for streaming use)."""
+        computer = str(event.get("computer") or "unknown_host")
+        if now is None:
+            now = datetime.now(tz=timezone.utc)
+        tracker = self._trackers[computer]
+        return tracker.process_event(event, self.patterns, now)
+
+    def reset(self) -> None:
+        """Clear all in-progress tracking state."""
+        self._trackers.clear()
+
+
+# ---------------------------------------------------------------------------
+# Module-level singleton (used by detection_engine.analyze_burst_batch)
+# ---------------------------------------------------------------------------
+
+_sequence_engine: Optional[SequenceEngine] = None
+
+
+def get_sequence_engine() -> SequenceEngine:
+    global _sequence_engine
+    if _sequence_engine is None:
+        _sequence_engine = SequenceEngine()
+    return _sequence_engine
+
+
+def reset_sequence_engine() -> None:
+    global _sequence_engine
+    _sequence_engine = None

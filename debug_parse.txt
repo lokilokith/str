@@ -1,0 +1,5 @@
+Opening Sysmon...
+Traceback (most recent call last):
+  File "L:\DOWNLOADS\sentineltrace-main\sentineltrace-main\debug_parse.py", line 10, in <module>
+    query_handle = win32evtlog.EvtQuery(CHANNEL_NAME, flags, "*")
+pywintypes.error: (5, 'EvtQuery', 'Access is denied.')
