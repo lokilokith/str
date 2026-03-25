@@ -312,11 +312,11 @@ select option{background:#0b1220}
 
   {# ── Situation Strip ── #}
   <div class="situation fade-up d1">
-    <div class="sit-card c-{% if attack_conf_score >= 70 %}red{% elif attack_conf_score >= 40 %}amber{% else %}cyan{% endif %}">
+    <div class="sit-card c-{% if attack_conf_score >= 75 %}red{% elif attack_conf_score >= 45 %}amber{% else %}cyan{% endif %}">
       <div class="sit-label">Threat Posture</div>
       <div class="sit-value">{{ attack_conf_level | default('None') }}</div>
       <div class="sit-sub">{{ attack_conf_score | default(0) }}/100 confidence</div>
-      <span class="sit-badge b-{% if attack_conf_score >= 70 %}red{% elif attack_conf_score >= 40 %}amber{% else %}cyan{% endif %}">
+      <span class="sit-badge b-{% if attack_conf_score >= 75 %}red{% elif attack_conf_score >= 45 %}amber{% else %}cyan{% endif %}">
         {{ highest_kill_chain | default('No kill chain') }}
       </span>
     </div>
@@ -412,7 +412,7 @@ select option{background:#0b1220}
           <td><span class="score-pill score-{% if sd.kill_chain_stage in ['Actions on Objectives','Command and Control'] %}critical{% elif sd.kill_chain_stage in ['Persistence','Privilege Escalation','Credential Access'] %}high{% else %}med{% endif %}">{{ sd.kill_chain_stage }}</span></td>
           <td>
             <div class="conf-wrap">
-              <div class="conf-bar"><div class="conf-fill fill-{% if sc >= 80 %}red{% elif sc >= 60 %}amber{% else %}cyan{% endif %}" style="width:{{ sc }}%"></div></div>
+              <div class="conf-bar"><div class="conf-fill fill-{% if sc >= 75 %}red{% elif sc >= 45 %}amber{% else %}cyan{% endif %}" style="width:{{ sc }}%"></div></div>
               <div class="conf-num">{{ sc }}</div>
             </div>
           </td>
@@ -513,7 +513,7 @@ select option{background:#0b1220}
           <td><span class="score-pill score-{% if c.highest_kill_chain in ['Actions on Objectives','Command and Control'] %}critical{% elif c.highest_kill_chain in ['Persistence','Privilege Escalation'] %}high{% else %}med{% endif %}">{{ c.highest_kill_chain }}</span></td>
           <td>
             <div class="conf-wrap">
-              <div class="conf-bar"><div class="conf-fill fill-{% if c.max_confidence >= 70 %}red{% elif c.max_confidence >= 40 %}amber{% else %}cyan{% endif %}" style="width:{{ c.max_confidence }}%"></div></div>
+              <div class="conf-bar"><div class="conf-fill fill-{% if c.max_confidence >= 75 %}red{% elif c.max_confidence >= 45 %}amber{% else %}cyan{% endif %}" style="width:{{ c.max_confidence }}%"></div></div>
               <div class="conf-num">{{ c.max_confidence }}</div>
             </div>
           </td>
@@ -536,7 +536,7 @@ select option{background:#0b1220}
         <tbody>
         {% for b in burst_aggregates %}
         {% set sc = b.peak_score | default(0) %}
-        {% set sc_cls = 'critical' if sc >= 70 else 'high' if sc >= 40 else 'med' if sc >= 20 else 'low' %}
+        {% set sc_cls = 'critical' if sc >= 75 else 'high' if sc >= 45 else 'med' if sc > 0 else 'low' %}
         {% set dev = ((b.deviation_score | default(0)) * 100) | int %}
         <tr class="burst-row" onclick="toggleBurst('ba{{ loop.index }}')">
           <td style="font-weight:500">
@@ -545,16 +545,23 @@ select option{background:#0b1220}
             {% if b.has_correlation %}<span class="sit-badge b-purple" style="margin-left:4px;font-size:9px">Campaign</span>{% endif %}
             {% if b.has_sequence_detection | default(false) %}<span class="sit-badge" style="background:rgba(168,85,247,.15);color:#c084fc;margin-left:4px;font-size:9px">Chain</span>{% endif %}
           </td>
-          <td><span class="score-pill score-{{ 'critical' if b.kill_chain_stage in ['Actions on Objectives','Command and Control'] else 'high' if b.kill_chain_stage in ['Persistence','Privilege Escalation'] else 'med' }}">{{ b.kill_chain_stage or 'Exec' }}</span></td>
+          <td>
+            <span class="score-pill score-{{ 'critical' if sc >= 75 else 'high' if sc >= 45 else 'med' if sc > 0 else 'low' }}">
+              {{ b.kill_chain_stage or 'Exec' }}
+            </span>
+            {% if b.stage_hint %}
+            <span class="sit-badge b-purple" style="font-size:9px;margin-left:4px">Hint: {{ b.stage_hint }}</span>
+            {% endif %}
+          </td>
           <td class="mono">{{ b.total_count }}</td>
           <td>
             <span class="score-pill score-{{ sc_cls }}">{{ sc }}/{{ b.stage_cap | default(100) }}</span>
           </td>
           <td>
-            {% if dev > 0 %}
+            {% if b.baseline_count and b.baseline_count > 0 %}
             <div class="conf-wrap">
               <div class="conf-bar"><div class="conf-fill fill-{% if dev >= 70 %}red{% elif dev >= 40 %}amber{% else %}cyan{% endif %}" style="width:{{ dev }}%"></div></div>
-              <span class="conf-num" style="color:{% if dev >= 70 %}var(--red){% elif dev >= 40 %}var(--amber){% else %}var(--cyan){% endif %}">{{ dev }}%</span>
+              <span class="conf-num" style="color:var(--muted)">{{ b.baseline_count }}</span>
             </div>
             {% else %}
             <span style="color:var(--dim);font-size:10px">No baseline</span>

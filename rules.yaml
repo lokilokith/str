@@ -671,3 +671,96 @@ rules:
     kill_chain_stage: Actions on Objectives
     confidence: 55
     description: Clipboard content accessed — attacker collecting copied credentials
+  # --- ADDITIONAL SOC-GRADE HARDENING ---
+  - rule_id: DET-057
+    name: PowerShell complex obfuscation (-bxor)
+    event_id: [1]
+    image_contains: powershell
+    cmd_any: ["-bxor", "convertto-securestring", "set-alias", "new-object io.memory"]
+    severity: high
+    mitre_id: T1027
+    mitre_tactic: Defense Evasion
+    kill_chain_stage: Defense Evasion
+    confidence: 85
+    description: PowerShell using complex obfuscation or XOR operations — advanced evasion
+    
+  - rule_id: DET-058
+    name: Local user or group creation
+    event_id: [1]
+    image_any: [net.exe, net1.exe]
+    cmd_any: ["user /add", "user /delete", "localgroup add", "group /add"]
+    severity: high
+    mitre_id: T1136.001
+    mitre_tactic: Persistence
+    kill_chain_stage: Persistence
+    confidence: 75
+    description: New local user or group created — persistence or privilege escalation
+    
+  - rule_id: DET-059
+    name: SharpHound or BloodHound execution
+    event_id: [1]
+    cmd_any: ["sharphound", "invoke-bloodhound", "collectionmethod", "-collection"]
+    severity: critical
+    mitre_id: T1482
+    mitre_tactic: Discovery
+    kill_chain_stage: Execution
+    confidence: 95
+    description: Active Directory enumeration tool detected — pre-lateral movement reconnaissance
+    
+  - rule_id: DET-060
+    name: Unusual child of lsass.exe
+    event_id: [1]
+    parent_any: [lsass.exe]
+    severity: critical
+    mitre_id: T1003.001
+    mitre_tactic: Credential Access
+    kill_chain_stage: Privilege Escalation
+    confidence: 95
+    description: lsass.exe spawned a child process — highly suspicious indicator of credential dumping
+  - rule_id: DET-061
+    name: PowerShell frombase64string execution
+    event_id: [1]
+    image_contains: powershell
+    cmd_any: ["frombase64string", "[convert]::", "memoryat"]
+    severity: high
+    mitre_id: T1140
+    mitre_tactic: Defense Evasion
+    kill_chain_stage: Execution
+    confidence: 80
+    description: PowerShell using Base64 decoding in memory — payload obfuscation
+    
+  - rule_id: DET-062
+    name: Domain admin group enumeration
+    event_id: [1]
+    image_any: [net.exe, net1.exe]
+    cmd_any: ["group \"domain admins\" /domain", "group \"enterprise admins\" /domain"]
+    severity: high
+    mitre_id: T1069.002
+    mitre_tactic: Discovery
+    kill_chain_stage: Execution
+    confidence: 85
+    description: Enumeration of high-privilege domain groups — pre-lateral movement reconnaissance
+    
+  - rule_id: DET-063
+    name: Security service disruption (taskkill)
+    event_id: [1]
+    image_any: [taskkill.exe]
+    cmd_any: ["/f /im msmpeng.exe", "/f /im senceir.exe", "/f /im cb.exe", "/f /im sentinelone.exe"]
+    severity: critical
+    mitre_id: T1562.001
+    mitre_tactic: Defense Evasion
+    kill_chain_stage: Defense Evasion
+    confidence: 95
+    description: Attempt to kill security or monitoring processes via taskkill
+    
+  - rule_id: DET-064
+    name: Netsh portproxy creation
+    event_id: [1]
+    image_contains: netsh
+    cmd_any: ["interface portproxy add v4tov4", "listenport="]
+    severity: high
+    mitre_id: T1090
+    mitre_tactic: Command and Control
+    kill_chain_stage: Command and Control
+    confidence: 80
+    description: Netsh used to create a port proxy — potential C2 redirection or lateral movement pivot

@@ -11,30 +11,23 @@ from __future__ import annotations
 import math, re
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
-import pandas as pd
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. BEACONING DETECTION
 # ─────────────────────────────────────────────────────────────────────────────
 
 def detect_beaconing(
-    df: pd.DataFrame,
+    df: 'pd.DataFrame',
     min_hits: int = 6,
     max_jitter_pct: float = 0.20,
     min_interval_sec: float = 5.0,
 ) -> List[Dict[str, Any]]:
     """
     Detect beaconing — regular outbound connections to the same destination.
-
-    A beacon is characterised by:
-      - Same (image, destination_ip, destination_port) tuple
-      - >= min_hits connections
-      - Inter-arrival time coefficient of variation <= max_jitter_pct
-        (low jitter = machine-generated regularity)
-
+    ...
     Returns list of beacon candidates sorted by confidence descending.
     """
+    import pandas as pd
     results = []
 
     ip_col   = next((c for c in ("destination_ip","dst_ip") if c in df.columns), None)
@@ -112,15 +105,13 @@ def detect_beaconing(
 # 2. PROCESS TREE RECONSTRUCTION
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_process_tree(df: pd.DataFrame) -> List[Dict[str, Any]]:
+def build_process_tree(df: 'pd.DataFrame') -> List[Dict[str, Any]]:
     """
     Build a forest of process trees from event data.
-
-    Each node: {pid, ppid, image, command_line, event_time, computer,
-                user, children: [...], depth, event_id, severity}
-
+    ...
     Returns list of root nodes (processes with no parent in the dataset).
     """
+    import pandas as pd
     if df.empty:
         return []
 
@@ -279,11 +270,12 @@ def parse_hunt_query(query: str) -> List[Dict[str, Any]]:
     return conditions
 
 
-def apply_hunt_query(df: pd.DataFrame, conditions: List[Dict]) -> pd.DataFrame:
+def apply_hunt_query(df: 'pd.DataFrame', conditions: List[Dict]) -> 'pd.DataFrame':
     """
     Apply parsed hunt conditions to a DataFrame.
     AND conditions narrow the result; OR conditions widen it.
     """
+    import pandas as pd
     if not conditions or df.empty:
         return df
 

@@ -19,7 +19,7 @@ Scope:
 """
 
 import threading
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 # -------------------------------------------------------------------
 # Internal store
@@ -28,51 +28,66 @@ from typing import Dict, List, Optional
 _ANALYSIS_STORE: Dict[str, dict] = {}   # { run_id: analysis_context }
 _STORE_ORDER:    List[str]        = []   # insertion-order list for FIFO eviction
 _STORE_LOCK      = threading.Lock()      # protects both store and order list
-_STORE_MAX_SIZE  = 20                    # max snapshots in memory before eviction
+_STORE_MAX_SIZE  = 100                   # max snapshots in memory before eviction (Phase 9)
 
+import logging
+import time
+log = logging.getLogger("analysis_cache")
 
 # -------------------------------------------------------------------
+# Hybrid Versioning (The 10/10 Integrity Phase)
+# -------------------------------------------------------------------
+
+_SNAPSHOT_VERSIONS: Dict[str, Tuple[float, float]] = {}  # { run_id: (monotonic, unix) }
+
+# ---------------------------------------------------
 # Snapshot API
-# -------------------------------------------------------------------
+# ---------------------------------------------------
 
 def set_analysis_snapshot(run_id: str, snapshot: dict) -> None:
     """
-    Store analysis snapshot for a specific run_id.
-
-    Behavior:
-    - Overwrites snapshot if the same run_id is reused.
-    - Evicts the oldest snapshot (FIFO) when over capacity.
+    Store analysis snapshot for a specific run_id with hybrid versioning and validation.
     """
     if not run_id or snapshot is None:
         return
 
+    # 🔥 Integrity validation (Stop the "Ghost UI" bug)
+    if not snapshot.get("timeline") and not snapshot.get("burst_aggregates"):
+        log.warning(f"[Cache] Rejected empty snapshot for run_id={run_id[:16]} (No timeline/bursts)")
+        return
+
     with _STORE_LOCK:
-        # If it's a new run_id and we're at capacity, evict the oldest
         if run_id not in _ANALYSIS_STORE and len(_ANALYSIS_STORE) >= _STORE_MAX_SIZE:
             if _STORE_ORDER:
                 oldest = _STORE_ORDER.pop(0)
                 _ANALYSIS_STORE.pop(oldest, None)
+                _SNAPSHOT_VERSIONS.pop(oldest, None)
+                log.info(f"[Cache] Evicted oldest snapshot (run_id={oldest[:16]}) to free space")
 
+        # 🔥 Hybrid Versioning: (monotonic for sequence, time for wall-clock sanity)
+        _SNAPSHOT_VERSIONS[run_id] = (time.monotonic(), time.time())
         _ANALYSIS_STORE[run_id] = snapshot
-
-        # Maintain insertion order (re-inserting moves to end)
+        
         if run_id in _STORE_ORDER:
             _STORE_ORDER.remove(run_id)
         _STORE_ORDER.append(run_id)
+        log.debug(f"[Cache] Snapshot set: run_id={run_id[:16]}, size={len(str(snapshot))}")
 
 
 def get_analysis_snapshot(run_id: str) -> Optional[dict]:
     """
-    Retrieve analysis snapshot for a run_id.
-
-    Returns:
-    - dict if snapshot exists
-    - None if not found or run_id is invalid
+    Retrieve analysis snapshot for a run_id with integrity check.
     """
     if not run_id:
         return None
     with _STORE_LOCK:
-        return _ANALYSIS_STORE.get(run_id)
+        snapshot = _ANALYSIS_STORE.get(run_id)
+        if snapshot:
+            # 🔥 Defensive integrity check: ensure snapshot wasn't partially cleared
+            if not snapshot.get("timeline") and not snapshot.get("burst_aggregates"):
+                return None
+            return snapshot
+        return None
 
 
 def clear_analysis_snapshot(run_id: Optional[str] = None, *, clear_all: bool = False) -> None:

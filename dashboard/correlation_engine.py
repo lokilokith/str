@@ -17,9 +17,6 @@ import uuid
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-import pandas as pd
-
-
 # ---------------------------------------------------------------------------
 # Kill Chain Ordering
 # ---------------------------------------------------------------------------
@@ -75,6 +72,47 @@ def _temporal_weight(delta_seconds: float) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Metadata Sanity Helpers
+# ---------------------------------------------------------------------------
+
+def _safe(v, default=""):
+    """Hardened string casting for NaN/None/Whitespace safety."""
+    if v is None:
+        return default
+    s = str(v).strip().lower()
+    if s in ("", "nan", "none"):
+        return default
+    return s
+
+
+def _dedup_preserve_order(parts: List[str]) -> List[str]:
+    """Removes duplicates from a list while preserving original attack flow order."""
+    seen = set()
+    out = []
+    for p in parts:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
+def _normalize_chain(chain: Any) -> Tuple[str, ...]:
+    """Resolves string (->) vs list inconsistencies into a canonical, deduped tuple."""
+    if not chain:
+        return ()
+
+    if isinstance(chain, str):
+        parts = [p.strip().lower() for p in chain.split("->")]
+    elif isinstance(chain, (list, tuple)):
+        parts = [str(x).strip().lower() for x in chain if x]
+    else:
+        return ()
+
+    parts = _dedup_preserve_order(parts)
+    return tuple(parts)
+
+
+# ---------------------------------------------------------------------------
 # Event Node
 # ---------------------------------------------------------------------------
 
@@ -85,26 +123,33 @@ class EventNode:
         "uid", "image", "parent_image", "computer", "user",
         "kill_chain_stage", "confidence", "ts", "event_id",
         "has_network", "has_persistence", "has_injection",
+        "process_guid", "parent_process_guid",
     )
 
     def __init__(self, event: Dict[str, Any]):
         self.uid             = event.get("event_uid") or event.get("burst_id") or str(uuid.uuid4().hex[:8])
-        self.image           = (event.get("image") or "unknown").lower()
-        self.parent_image    = (event.get("parent_image") or "").lower()
-        self.computer        = (event.get("computer") or "unknown_host").lower()
-        self.user            = (event.get("user") or "").upper()
-        self.kill_chain_stage = event.get("kill_chain_stage") or "Background"
+        self.image           = _safe(event.get("image"), "unknown")
+        self.parent_image    = _safe(event.get("parent_image"), "")
+        self.computer        = _safe(event.get("computer"), "unknown_host")
+        self.user            = str(event.get("user") or "").upper().strip()
+        self.kill_chain_stage = _safe(event.get("kill_chain_stage"), "Background")
         self.confidence      = float(event.get("confidence_score") or event.get("risk_score") or 0.0)
         self.has_network     = bool(event.get("has_net") or event.get("destination_ip"))
         self.has_persistence = bool(event.get("has_persistence"))
         self.has_injection   = bool(event.get("has_injection"))
         self.event_id        = int(event.get("event_id") or 0)
+        self.process_guid    = _safe(event.get("process_guid"), "")
+        self.parent_process_guid = _safe(event.get("parent_process_guid"), "")
 
         ts_raw = event.get("start_time") or event.get("utc_time") or event.get("event_time")
+        import pandas as pd
         try:
             self.ts = pd.to_datetime(ts_raw, errors="coerce", utc=True)
+            if pd.isna(self.ts):
+                self.ts = pd.Timestamp.utcnow() if ts_raw else pd.NaT
         except Exception:
-            self.ts = pd.NaT
+            import pandas as pd
+            self.ts = pd.Timestamp.utcnow()
 
 
 # ---------------------------------------------------------------------------
@@ -137,126 +182,112 @@ class CorrelationGraph:
 
     def build_edges(self) -> None:
         """
-        Compute all edges with three improvements over v1:
-          1. Edge weight threshold — prune weak links before clustering
-          2. reason field — every edge carries a human-readable explanation
-          3. Cross-signal amplification — shared suspicious properties
-             (high entropy + external IP + injection) multiply edge weight
+        Builds edges between nodes using strict chronological temporal and structural relationships.
         """
         self.edges.clear()
-        node_list = sorted(
-            self.nodes.values(),
-            key=lambda n: n.ts if pd.notna(n.ts) else pd.Timestamp.min.tz_localize("UTC"),
-        )
 
-        for i, a in enumerate(node_list):
-            for j in range(i + 1, len(node_list)):
-                b = node_list[j]
-                if pd.isna(a.ts) or pd.isna(b.ts):
-                    continue
-                delta = (b.ts - a.ts).total_seconds()
-                if delta > self.time_window * 4:
-                    break   # Sorted by time → safe early exit
+        # group by host
+        events_by_host = {}
+        for uid, e in self.nodes.items():
+            events_by_host.setdefault(e.computer, []).append(e)
 
-                # ── Cross-host lateral movement edge ─────────────────────
-                if a.computer != b.computer:
-                    if a.user and a.user == b.user and abs(delta) <= self.time_window:
-                        w = _temporal_weight(delta) * 0.6
-                        w = self._cross_signal_amplify(w, a, b)
-                        if w >= EDGE_WEIGHT_THRESHOLD:
-                            self.edges.append({
-                                "from": a.uid, "to": b.uid,
-                                "type": "host_lateral",
-                                "weight": w,
-                                "delta_sec": delta,
-                                "reason": (
-                                    f"Same user '{a.user}' on different hosts "
-                                    f"({a.computer} → {b.computer}) within "
-                                    f"{int(abs(delta))}s"
-                                ),
-                                "confidence_type": "behavioral",
-                            })
-                    continue
+        for host, evts in events_by_host.items():
+            # Sort by time
+            import pandas as pd
+            evts.sort(key=lambda x: x.ts if pd.notna(x.ts) else pd.Timestamp.min.tz_localize("UTC"))
 
-                # ── Parent → Child structural edge ───────────────────────
-                if a.image == b.parent_image and abs(delta) <= self.time_window:
-                    w = _temporal_weight(delta)
-                    w = self._cross_signal_amplify(w, a, b)
-                    # Directional kill-chain flow scoring
-                    w = self._apply_direction_score(w, a, b)
-                    if w >= EDGE_WEIGHT_THRESHOLD:
+            for i in range(len(evts)):
+                e1 = evts[i]
+
+                for j in range(i + 1, len(evts)):
+                    e2 = evts[j]
+
+                    # TIME WINDOW FIX
+                    import pandas as pd
+                    if pd.notna(e1.ts) and pd.notna(e2.ts):
+                        delta = (e2.ts - e1.ts).total_seconds()
+                        if delta < 0:
+                            continue
+                    else:
+                        delta = 100
+
+                    # BASIC STAGE PROGRESSION
+                    # VALID CHAINS PROGRESSION ENFORCEMENT
+                    VALID_CHAINS = {
+                        "Execution": ["Persistence", "Privilege Escalation", "Defense Evasion", "Command and Control"],
+                        "Persistence": ["Privilege Escalation", "Command and Control", "Lateral Movement"],
+                        "Privilege Escalation": ["Lateral Movement", "Defense Evasion"],
+                        "Defense Evasion": ["Persistence", "Privilege Escalation", "Command and Control"],
+                        "Lateral Movement": ["Collection", "Command and Control", "Exfiltration"],
+                        "Command and Control": ["Exfiltration", "Actions on Objectives"],
+                    }
+                    
+                    # Same-stage correlation is now allowed but weighted lower
+                    is_same_stage = (e1.kill_chain_stage == e2.kill_chain_stage)
+                    is_valid_progression = e2.kill_chain_stage in VALID_CHAINS.get(e1.kill_chain_stage, [])
+                    
+                    if not (is_same_stage or is_valid_progression):
+                        continue
+
+                    if "Background" in (e1.kill_chain_stage, e2.kill_chain_stage):
+                        continue
+
+                    # PROCESS RELATIONSHIP (CORE FIX)
+                    is_structural = False
+                    if e1.process_guid and e1.process_guid == e2.parent_process_guid:
+                        is_structural = True
+                    elif e1.image and e1.image == e2.parent_image:
+                        is_structural = True
+                    
+                    # TACTICAL RELATIONSHIP
+                    is_tactical = False
+                    if e2.kill_chain_stage in VALID_CHAINS.get(e1.kill_chain_stage, []):
+                        is_tactical = True
+
+                    # ── Tiered Weights ─────────────────────────────────────
+                    w = 0.0
+                    edge_type = "none"
+                    reason = ""
+                    
+                    if is_structural:
+                        w = 5.0
+                        edge_type = "structural_link"
+                        reason = f"Direct process lineage ({e1.image} -> {e2.image})"
+                    elif is_valid_progression:
+                        w = 3.0
+                        edge_type = "tactic_chain"
+                        reason = f"Tactic progression: {e1.kill_chain_stage} → {e2.kill_chain_stage}"
+                    elif is_same_stage and e1.user == e2.user:
+                        w = 2.0
+                        edge_type = "same_stage_user"
+                        reason = f"Same-stage clustering ({e1.kill_chain_stage})"
+                    else:
+                        # Weak temporal link (same host, same user, close in time)
+                        if e1.user == e2.user:
+                            w = 1.0
+                            edge_type = "temporal_user"
+                            reason = f"Temporal user proximity ({delta:.0f}s)"
+
+                    if w > 0:
+                        # BACKWARD PENALTY (Phase 8: 0.5x)
+                        # If e2 comes BEFORE e1 in kill chain, penalize
+                        if _kc_index(e2.kill_chain_stage) < _kc_index(e1.kill_chain_stage):
+                            w *= 0.5
+                            reason += " (Backward Penalty 0.5x)"
+
                         self.edges.append({
-                            "from": a.uid, "to": b.uid,
-                            "type": "parent_child",
+                            "from": e1.uid,
+                            "to": e2.uid,
+                            "type": edge_type,
                             "weight": w,
                             "delta_sec": delta,
-                            "reason": (
-                                f"'{a.image}' spawned '{b.image}' "
-                                f"{int(abs(delta))}s later (parent-child)"
-                            ),
-                            "confidence_type": "structural",
-                            "direction": "forward" if _kc_index(b.kill_chain_stage) >= _kc_index(a.kill_chain_stage) else "backward",
+                            "host": host,
+                            "from_stage": e1.kill_chain_stage,
+                            "to_stage": e2.kill_chain_stage,
+                            "reason": reason,
+                            "confidence_type": "structural" if is_structural else "behavioral",
+                            "direction": "forward" if _kc_index(e2.kill_chain_stage) >= _kc_index(e1.kill_chain_stage) else "backward"
                         })
-
-                # ── Temporal co-occurrence edge (same image, same host) ───
-                elif a.image == b.image and abs(delta) <= self.time_window:
-                    w = _temporal_weight(delta) * 0.5
-                    w = self._cross_signal_amplify(w, a, b)
-                    w = self._apply_direction_score(w, a, b)
-                    if w >= EDGE_WEIGHT_THRESHOLD:
-                        self.edges.append({
-                            "from": a.uid, "to": b.uid,
-                            "type": "temporal",
-                            "weight": w,
-                            "delta_sec": delta,
-                            "reason": (
-                                f"'{a.image}' active twice within "
-                                f"{int(abs(delta))}s on {a.computer}"
-                            ),
-                            "confidence_type": "temporal",
-                            "direction": "forward" if _kc_index(b.kill_chain_stage) >= _kc_index(a.kill_chain_stage) else "backward",
-                        })
-
-    @staticmethod
-    def _apply_direction_score(weight: float, a: "EventNode", b: "EventNode") -> float:
-        """
-        Real attacks are directional — they advance through the kill chain.
-        Reward forward progression; penalize backward links.
-
-        forward: b's stage index ≥ a's stage index  (Execution → Persistence → C2)
-        backward: b's stage index < a's stage index  (suspicious — possibly noise)
-
-        A backward link (e.g. C2 → Execution in time) is structurally odd;
-        it slightly reduces the edge weight to prevent weak backward chains
-        from merging unrelated clusters.
-        """
-        a_idx = _kc_index(a.kill_chain_stage)
-        b_idx = _kc_index(b.kill_chain_stage)
-        if b_idx > a_idx:
-            return weight * (1.0 + FORWARD_KC_BONUS)    # Kill-chain advance → boost
-        elif b_idx < a_idx:
-            return weight * (1.0 - BACKWARD_KC_PENALTY)  # Backward → slight penalty
-        return weight   # Same stage → neutral
-        """
-        Boost edge weight when both nodes share suspicious properties.
-        This is the cross-signal correlation the v1 engine lacked entirely:
-        injection + external network + high stage together means much more
-        than each does alone.
-        """
-        shared_signals = sum([
-            a.has_injection and b.has_injection,
-            a.has_network   and b.has_network,
-            a.has_persistence and b.has_persistence,
-            # High kill-chain stage on both ends
-            _kc_index(a.kill_chain_stage) >= 5 and _kc_index(b.kill_chain_stage) >= 5,
-        ])
-        if shared_signals >= 3:
-            return weight * 2.0   # Very strong shared signal → double weight
-        if shared_signals == 2:
-            return weight * 1.5
-        if shared_signals == 1:
-            return weight * 1.2
-        return weight
 
     def connected_components(self) -> List[Set[str]]:
         """Union-Find connected components with path compression + union-by-rank."""
@@ -378,6 +409,7 @@ class CampaignBuilder:
         final = min((base + bonus + edge_bonus + direction_bonus) * multiplier, 100.0)
 
         # ── Temporal metadata ─────────────────────────────────────────────
+        import pandas as pd
         valid_ts = [n.ts for n in nodes if pd.notna(n.ts)]
         first_seen = min(valid_ts).isoformat() if valid_ts else None
         last_seen  = max(valid_ts).isoformat() if valid_ts else None
@@ -398,9 +430,13 @@ class CampaignBuilder:
         _safe_img  = _re.sub(r"[^a-z0-9]", "_", base_image[:12].lower())
         _safe_host = _re.sub(r"[^a-z0-9]", "_", computers[0][:8].lower())
         corr_id    = f"CAMP-{_safe_img}-{_safe_host}-{day}"
+        
+        # ── Edges array ───────────────────────────────────────────────────
+        campaign_edges = [e for e in graph.edges if e["from"] in node_uids and e["to"] in node_uids]
 
         return {
             "corr_id":           corr_id,
+            "edges":             campaign_edges,
             "run_id":            run_id,
             "base_image":        base_image,
             "images":            images,
@@ -556,8 +592,8 @@ def persist_campaigns(campaigns: List[Dict[str, Any]]) -> None:
                         "INSERT INTO `correlations` "
                         "(`corr_id`,`run_id`,`base_image`,`start_time`,`end_time`,"
                         "`description`,`event_ids`,`computer`,`kill_chain_stage`,"
-                        "`severity`,`confidence`) "
-                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                        "`severity`,`confidence`, `from_stage`, `to_stage`, `id_burst`) "
+                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                         (
                             cid, run_id,
                             camp.get("base_image"),
@@ -569,6 +605,9 @@ def persist_campaigns(campaigns: List[Dict[str, Any]]) -> None:
                             new_stage,
                             "high" if new_conf >= 70 else "medium" if new_conf >= 40 else "low",
                             new_conf,
+                            None, # from_stage
+                            None, # to_stage
+                            None, # id_burst
                         ),
                     )
             conn.commit()
@@ -587,6 +626,7 @@ def correlate_events(
     run_id: str,
     time_window_seconds: int = 900,
     persist: bool = True,
+    debug_mode: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     Full correlation pipeline.
@@ -615,6 +655,25 @@ def correlate_events(
 
     builder   = CampaignBuilder()
     campaigns = builder.build_campaigns(graph, run_id)
+
+    # ── [10/10] Guarded Dual-Mode Observability ──────────────────────────
+    import os
+    is_dev = os.environ.get("SENTINEL_ENV") == "dev"
+    
+    debug_snapshot = {
+        "node_count": len(graph.nodes),
+        "total_edges": len(graph.edges),
+        "valid_edges": len([e for e in graph.edges if e["weight"] >= EDGE_WEIGHT_THRESHOLD]),
+        "campaign_count": len(campaigns)
+    }
+    
+    if debug_mode and is_dev:
+        # Full snapshot allowed only in dev
+        debug_snapshot["raw_edges"] = graph.edges[:100] # Cap breadth
+    
+    # Store in first event or global context if available
+    if events:
+        events[0]["correlation_debug"] = debug_snapshot
 
     # Tag source events with their campaign id
     uid_to_camp: Dict[str, str] = {}
@@ -656,6 +715,8 @@ def correlate_bursts(
             "event_uid":        b.get("burst_id") or b.get("correlation_id") or uuid.uuid4().hex[:12],
             "image":            b.get("image"),
             "parent_image":     b.get("parent_image"),
+            "process_guid":     b.get("process_guid"),
+            "parent_process_guid": b.get("parent_process_guid"),
             "computer":         b.get("computer"),
             "user":             b.get("user"),
             "kill_chain_stage": b.get("kill_chain_stage") or "Execution",
@@ -681,3 +742,46 @@ def correlate_bursts(
             original["correlation_score"] = m.get("correlation_score", 0)
 
     return bursts, campaigns
+
+
+def deduplicate_chains(chains: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Final truth alignment: removes duplicate attack stories from the pipeline.
+    Uses semantic-aware keying (Chain, Computer, Stage, Confidence Bucket, Net, Persistence).
+    """
+    seen = set()
+    unique = []
+
+    for c in chains:
+        # 1. Normalize chain semantics
+        chain = _normalize_chain(c.get("attack_chain") or c.get("chain_str"))
+        if not chain:
+            continue
+
+        # 2. Hard-overwrite with canonical version
+        c["attack_chain"] = list(chain)
+        c["chain_str"] = " → ".join(chain)
+
+        # 3. Handle signal floor (Stop theSIEM lies)
+        conf_raw = float(c.get("confidence_score") or c.get("confidence") or 0.0)
+        if not math.isfinite(conf_raw):
+            conf_raw = 0.0
+        
+        # Require minimal signal to participate in de-duplication
+        if conf_raw == 0 and not (c.get("has_signal") or c.get("detections")):
+            continue
+
+        # 4. Semantic-aware keying
+        comp = _safe(c.get("computer"), "unknown_host")
+        stage = _safe(c.get("kill_chain_stage"), "Background")
+        conf_bucket = int(conf_raw // 5) * 5
+        has_net = bool(c.get("destination_ip") or c.get("has_net"))
+        has_persist = bool(c.get("has_persistence"))
+
+        key = (chain, comp, stage, conf_bucket, has_net, has_persist)
+
+        if key not in seen:
+            seen.add(key)
+            unique.append(c)
+
+    return unique

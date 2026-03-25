@@ -17,7 +17,6 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import pandas as pd
 import yaml
 
 
@@ -40,6 +39,11 @@ def _get_correlate_bursts():
     return correlate_bursts
 
 
+def _get_sequence_engine():
+    from dashboard.sequence_engine import get_sequence_engine
+    return get_sequence_engine()
+
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -56,6 +60,62 @@ KILL_CHAIN_ORDER = [
     "Discovery", "Lateral Movement", "Collection",
     "Command and Control", "Exfiltration", "Actions on Objectives",
 ]
+
+
+SOURCE_WEIGHT = {
+    "sequence": 1.0,
+    "rule": 0.8,
+    "fallback": 0.6,
+}
+
+SEVERITY_BASE = {
+    "critical": 1.0,
+    "high":     0.8,
+    "medium":   0.5,
+    "low":      0.3,
+    "info":     0.1,
+}
+
+REASON_MAP = {
+    "event_id":     lambda v: f"EventID {v} matched rule criteria",
+    "image":        lambda v: f"Image path '{v}' matched suspicious pattern",
+    "parent":       lambda v: f"Suspicious parent process: {v}",
+    "cmd":          lambda v: f"Command line contains: {v}",
+    "path":         lambda v: f"Path starts with suspicious prefix: {v}",
+    "reg":          lambda v: f"Registry path matched: {v}",
+    "high_entropy": lambda _: "High-entropy command line detected (+15 confidence)",
+    "b64":          lambda _: "Base64-encoded command detected (+10 confidence)",
+}
+
+
+def compute_signal_strength(d: Dict[str, Any]) -> float:
+    """
+    Authoritative signal strength calculation for primary detection selection.
+    Weighting: Confidence * SourcePriority * Severity.
+    """
+    conf = float(d.get("confidence_score", 50))
+    src  = SOURCE_WEIGHT.get(d.get("detection_source", ""), 0.5)
+    sev  = SEVERITY_BASE.get(d.get("severity", ""), 0.5)
+    return conf * src * sev
+
+
+def pick_primary_detection(detections: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    Select the authoritative primary detection using weighted signal strength.
+    Tie-breaks: Strength > Severity > Source Weight > Raw Confidence.
+    """
+    if not detections:
+        return None
+
+    def tie_break_key(d):
+        return (
+            compute_signal_strength(d),
+            SEVERITY_BASE.get(d.get("severity", ""), 0.5),
+            SOURCE_WEIGHT.get(d.get("detection_source", ""), 0.5),
+            int(d.get("confidence_score", 0)),
+        )
+
+    return max(detections, key=tie_break_key)
 
 
 # ---------------------------------------------------------------------------
@@ -113,7 +173,7 @@ def _safe_lower(v: Any) -> str:
     return s.lower() if s not in ("None", "nan", "") else ""
 
 
-def match_rules(event: Dict[str, Any], rules: List[Dict]) -> List[Dict[str, Any]]:
+def match_rules(event: Dict[str, Any], rules: Optional[List[Dict]] = None) -> List[Dict[str, Any]]:
     """
     Test a single event dict against all loaded YAML rules.
     Returns a list of hit dicts (one per matched rule).
@@ -122,9 +182,15 @@ def match_rules(event: Dict[str, Any], rules: List[Dict]) -> List[Dict[str, Any]
       event_id, image_contains, image_any, parent_any,
       cmd_any, path_prefix_any, severity_required, filter_benign_parent
     """
+    if rules is None:
+        rules = load_yaml_rules()
     hits = []
+    # Force int conversion for robust matching
     try:
-        eid = int(event.get("event_id") or 0)
+        eid_raw = event.get("event_id")
+        if isinstance(eid_raw, list):
+            eid_raw = eid_raw[0] if eid_raw else None
+        eid = int(float(str(eid_raw).strip()))
     except (TypeError, ValueError):
         eid = 0
 
@@ -135,6 +201,13 @@ def match_rules(event: Dict[str, Any], rules: List[Dict]) -> List[Dict[str, Any]
         event.get("file_path") or event.get("target_filename")
         or event.get("reg_key") or ""
     )
+
+    # Normalize Sysmon registry paths (\REGISTRY\MACHINE\ -> hklm\)
+    if fpath.startswith("\\registry\\machine\\"):
+        fpath = "hklm\\" + fpath[len("\\registry\\machine\\"):]
+    elif fpath.startswith("\\registry\\user\\"):
+        fpath = "hkcu\\" + fpath[len("\\registry\\user\\"):]
+    
     sev     = _safe_lower(event.get("severity"))
 
     for rule in rules:
@@ -186,6 +259,36 @@ def match_rules(event: Dict[str, Any], rules: List[Dict]) -> List[Dict[str, Any]
         if event.get("cmd_b64_detected") or event.get("cmd_has_encoded_flag"):
             conf = min(conf + 10, 100)
 
+        # --- Build explainability reason list ---
+        reason: List[str] = []
+        mf: Dict[str, Any] = {"event_id": eid}
+
+        if rule_eids:
+            reason.append(REASON_MAP["event_id"](eid))
+        if ic:
+            reason.append(REASON_MAP["image"](ic))
+            mf["image_contains"] = ic
+        if ia:
+            matched_ia = [x for x in ia if x.lower() in image]
+            reason.append(REASON_MAP["image"](", ".join(matched_ia)))
+            mf["image_any"] = matched_ia
+        if pa:
+            matched_pa = [x for x in pa if x.lower() in parent]
+            reason.append(REASON_MAP["parent"](", ".join(matched_pa)))
+            mf["parent_any"] = matched_pa
+        if ca:
+            matched_ca = [s for s in ca if s.lower() in cmd]
+            reason.append(REASON_MAP["cmd"](", ".join(matched_ca)))
+            mf["cmd_any"] = matched_ca
+        if pp:
+            matched_pp = [x for x in pp if fpath.startswith(x.lower())]
+            reason.append(REASON_MAP["path"](", ".join(matched_pp)))
+            mf["path_prefix_any"] = matched_pp
+        if event.get("cmd_b64_detected"):
+            reason.append(REASON_MAP["b64"](None))
+        if event.get("cmd_high_entropy"):
+            reason.append(REASON_MAP["high_entropy"](None))
+
         hits.append({
             "rule_id":          rule.get("rule_id"),
             "rule_name":        rule.get("name"),
@@ -195,7 +298,18 @@ def match_rules(event: Dict[str, Any], rules: List[Dict]) -> List[Dict[str, Any]
             "severity":         rule.get("severity", "medium"),
             "confidence_score": conf,
             "description":      rule.get("description", ""),
-            # Propagate event context
+            # ── Explainability ──────────────────────────────────────────
+            "detection_source": "rule",
+            "match_reason":     reason,
+            "matched_fields": {
+                **mf,
+                "image":        event.get("image"),
+                "parent_image": event.get("parent_image"),
+                "command_line": event.get("command_line"),
+                "reg_key":      event.get("reg_key") or event.get("targetobject"),
+                "file_path":    event.get("file_path") or event.get("target_filename"),
+            },
+            # ── Event context ───────────────────────────────────────────
             "utc_time":         event.get("utc_time") or event.get("event_time"),
             "event_time":       event.get("event_time") or event.get("utc_time"),
             "image":            event.get("image"),
@@ -211,6 +325,85 @@ def match_rules(event: Dict[str, Any], rules: List[Dict]) -> List[Dict[str, Any]
             "target_filename":  event.get("file_path") or event.get("target_filename"),
             "command_line":     event.get("command_line"),
         })
+
+    if not hits:
+        import logging as _log
+        _det_log = _log.getLogger("detection_engine")
+
+        # Known-benign reg key fragments — suppress fallback for these
+        _BENIGN_NOISE = frozenset([
+            "\\clsid\\", "\\typelib\\", "\\interface\\", "\\wow6432node\\clsid",
+            "\\installedsdb\\", "\\mui\\", "\\capabilities\\",
+        ])
+
+        # Persistence fallback table: (keywords, rule_id, rule_name, mitre_id, confidence, severity)
+        _PERSIST_RULES: List = [
+            (["\\run\\", "\\runonce\\", "currentversion\\run", "policies\\explorer\\run"],
+             "FB-RUN", "Registry Run key persistence (fallback)", "T1547.001", 75, "high"),
+            (["image file execution options"],
+             "FB-IFEO", "IFEO Debugger persistence (fallback)", "T1546.012", 80, "high"),
+            (["appinit_dlls"],
+             "FB-APPINIT", "AppInit_DLLs persistence (fallback)", "T1546.010", 80, "high"),
+            (["\\services\\"],
+             "FB-SVC", "Suspicious service registry key (fallback)", "T1543.003", 65, "medium"),
+            (["\\microsoft\\windows\\currentversion\\run", "\\software\\microsoft\\windows nt\\currentversion\\winlogon"],
+             "FB-WINLOGON", "Winlogon persistence (fallback)", "T1547.004", 75, "high"),
+            (["\\microsoft\\windows\\currentversion\\explorer\\shell folders",
+              "\\microsoft\\windows\\currentversion\\explorer\\user shell folders"],
+             "FB-SHELLFOLDER", "Shell folder hijack (fallback)", "T1547.001", 70, "medium"),
+            (["\\environment", "\\userinitmprlogonscript"],
+             "FB-LOGINSCRIPT", "Logon script persistence (fallback)", "T1037.001", 70, "medium"),
+            (["\\currentcontrolset\\control\\session manager"],
+             "FB-BOOTEXEC", "Boot execution persistence (fallback)", "T1547.006", 70, "medium"),
+        ]
+
+        if eid in (12, 13, 14) and fpath:
+            if not any(noise in fpath for noise in _BENIGN_NOISE):
+                for kws, rid, rname, mid, conf, sev in _PERSIST_RULES:
+                    if any(k in fpath for k in kws):
+                        matched_kws = [k for k in kws if k in fpath]
+                        hits.append({
+                            "rule_id":          rid,
+                            "rule_name":        rname,
+                            "mitre_id":         mid,
+                            "mitre_tactic":     "Persistence",
+                            "kill_chain_stage": "Persistence",
+                            "severity":         sev,
+                            "confidence_score": conf,
+                            "description":      f"{rname}: {fpath}",
+                            # ── Explainability ──────────────────────────────
+                            "detection_source": "fallback",
+                            "match_reason": [
+                                REASON_MAP["event_id"](eid),
+                                REASON_MAP["reg"](", ".join(matched_kws)),
+                                f"Full registry key: {fpath}",
+                            ],
+                            "matched_fields": {
+                                "event_id":     eid,
+                                "matched_keywords": matched_kws,
+                                "reg_key":      event.get("reg_key") or event.get("targetobject") or fpath,
+                                "image":        event.get("image"),
+                                "parent_image": event.get("parent_image"),
+                                "command_line": event.get("command_line"),
+                                "file_path":    fpath,
+                            },
+                            # ── Event context ────────────────────────────────
+                            "utc_time":         event.get("utc_time") or event.get("event_time"),
+                            "event_time":       event.get("event_time") or event.get("utc_time"),
+                            "image":            event.get("image"),
+                            "event_id":         eid,
+                            "computer":         event.get("computer"),
+                            "process_id":       event.get("pid") or event.get("process_id"),
+                            "parent_process_id":event.get("ppid") or event.get("parent_process_id"),
+                            "parent_image":     event.get("parent_image"),
+                            "source_ip":        event.get("src_ip") or event.get("source_ip"),
+                            "source_port":      event.get("source_port"),
+                            "destination_ip":   event.get("dst_ip") or event.get("destination_ip"),
+                            "destination_port": event.get("dst_port") or event.get("destination_port"),
+                            "target_filename":  event.get("file_path") or event.get("target_filename") or event.get("reg_key"),
+                            "command_line":     event.get("command_line"),
+                        })
+                        break  # one hit per event is enough
 
     return hits
 
@@ -229,13 +422,14 @@ DETECTION_OUTPUT_COLS = [
 
 
 def find_detections(
-    df: pd.DataFrame,
+    df: 'pd.DataFrame',
     rules: Optional[List[Dict]] = None,
-) -> pd.DataFrame:
+) -> 'pd.DataFrame':
     """
     Run YAML rule matching across a DataFrame of events.
     Falls back to heuristic EID mapping if no rules supplied.
     """
+    import pandas as pd
     if df.empty:
         return pd.DataFrame(columns=DETECTION_OUTPUT_COLS)
 
@@ -251,6 +445,37 @@ def find_detections(
         for hit in match_rules(ev, rules):
             hits.append(hit)
 
+    # --- SEQUENCE DETECTION (Issue 1) ---
+    try:
+        seq_engine = _get_sequence_engine()
+        # Ensure time column exists for sequence engine
+        df_seq = df.copy()
+        if "event_time" not in df_seq.columns and "utc_time" in df_seq.columns:
+            df_seq["event_time"] = df_seq["utc_time"]
+            
+        sequence_hits = seq_engine.process_dataframe(df_seq)
+        for seq in sequence_hits:
+            # Map sequence detection to main detection schema
+            hits.append({
+                "rule_id":          seq.get("rule_id"),
+                "rule_name":        seq.get("rule_name"),
+                "mitre_id":         seq.get("mitre_id"),
+                "mitre_tactic":     seq.get("mitre_tactic"),
+                "kill_chain_stage": seq.get("kill_chain_stage"),
+                "severity":         seq.get("severity") or "high",
+                "confidence_score": seq.get("confidence_score") or 85,
+                "description":      seq.get("description"),
+                "detection_source": "sequence",
+                "match_reason":     [f"Sequence pattern matched: {seq.get('rule_name')}"],
+                "image":            seq.get("image"),
+                "event_time":       seq.get("event_time"),
+                "utc_time":         seq.get("utc_time"),
+                "computer":         seq.get("computer"),
+                "is_sequence":      True
+            })
+    except Exception as e:
+        print(f"[WARN] Sequence detection failed in find_detections: {e}")
+
     if not hits:
         return pd.DataFrame(columns=DETECTION_OUTPUT_COLS)
 
@@ -261,8 +486,9 @@ def find_detections(
     return result[DETECTION_OUTPUT_COLS]
 
 
-def _heuristic_detections(df: pd.DataFrame) -> pd.DataFrame:
+def _heuristic_detections(df: 'pd.DataFrame') -> 'pd.DataFrame':
     """Minimal EID-based detection when no rules.yaml is available."""
+    import pandas as pd
     EID_MAP = {
         1:  ("T1059",     "Execution",           "Execution",           "Process Create"),
         3:  ("T1071",     "Command and Control",  "Command and Control",  "Network Connection"),
@@ -309,7 +535,9 @@ def _heuristic_detections(df: pd.DataFrame) -> pd.DataFrame:
         })
 
     if not hits:
+        import pandas as pd
         return pd.DataFrame(columns=DETECTION_OUTPUT_COLS)
+    import pandas as pd
     result = pd.DataFrame(hits)
     for col in DETECTION_OUTPUT_COLS:
         if col not in result.columns:
@@ -386,6 +614,7 @@ def analyze_burst_batch(
             "file_path":       burst.get("target_filename"),
             "target_object":   burst.get("target_object"),
             "target_filename": burst.get("target_filename"),
+            "reg_key":         burst.get("reg_key") or burst.get("target_object"),
             # Severity + time
             "severity":   burst.get("severity") or "low",
             "utc_time":   burst.get("start_time"),
@@ -415,7 +644,21 @@ def analyze_burst_batch(
         }
 
         hits = match_rules(rich_event, rules)
-        burst["_detection_hits"] = hits
+        
+        # ── Step 2.1: Authoritative Primary Detection Selection ──────────
+        primary = None
+        supporting = []
+        if hits:
+            # Align confidence: primary adopts max confidence across all hits
+            max_conf = max(h.get("confidence_score", 0) for h in hits)
+            primary = pick_primary_detection(hits)
+            if primary:
+                primary["confidence_score"] = max_conf
+                supporting = [h for h in hits if h is not primary]
+
+        burst["primary_detection"] = primary
+        burst["supporting_detections"] = supporting
+        burst["_detection_hits"] = hits  # keep for internal scoring
         all_detection_hits.extend(hits)
 
         # Persistence / injection flags from detection hits

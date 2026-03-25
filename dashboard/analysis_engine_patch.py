@@ -21,12 +21,20 @@ from __future__ import annotations
 import logging
 from typing import Any, Callable, Dict
 
-import pandas as pd
+from sqlalchemy import text
 
 log = logging.getLogger("analysis_engine_patch")
 
 
-def _load_events_for_pipeline(run_id: str) -> pd.DataFrame:
+def score_to_priority(score: float) -> str:
+    """SOC-grade score to priority mapping."""
+    if score >= 75: return "P1"
+    if score >= 45: return "P2"
+    if score >= 20: return "P3"
+    return "P4"
+
+
+def _load_events_for_pipeline(run_id: str) -> 'pd.DataFrame':
     """
     Load events from sentinel_cases for the given run_id.
     Returns a clean DataFrame with the columns the sequence engine needs.
@@ -38,41 +46,22 @@ def _load_events_for_pipeline(run_id: str) -> pd.DataFrame:
         from dashboard.db import get_engine
         engine = get_engine("cases")
 
-        df = pd.read_sql_query(
-            """
-            SELECT
-                event_uid,
-                event_time,
-                event_time       AS utc_time,
-                event_id,
-                image,
-                parent_image,
-                command_line,
-                user,
-                pid,
-                ppid,
-                src_ip           AS source_ip,
-                dst_ip           AS destination_ip,
-                dst_port         AS destination_port,
-                severity,
-                computer,
-                file_path        AS target_filename,
-                run_id,
-                is_lolbin,
-                cmd_entropy,
-                has_encoded_flag,
-                is_external_ip
-            FROM events
-            WHERE run_id = %s
-            ORDER BY event_time ASC
-            """,
-            engine,
-            params=(run_id,),
+        sql = text(
+            "SELECT event_uid, event_time, event_id, image, parent_image,"
+            " command_line, `user`, pid, ppid,"
+            " src_ip AS source_ip, dst_ip AS destination_ip,"
+            " dst_port AS destination_port, severity, computer,"
+            " file_path AS target_filename, run_id,"
+            " cmd_entropy, cmd_has_encoded_flag AS has_encoded_flag"
+            " FROM events WHERE run_id = :run_id ORDER BY event_time ASC"
         )
 
+        print(f"[DEBUG] Querying events for run_id={run_id}")
+        import pandas as pd
+        df = pd.read_sql_query(sql, engine, params={"run_id": run_id})
+
         if df.empty:
-            log.warning("[Patch] No events in sentinel_cases for run_id=%s", run_id)
-            return df
+            raise RuntimeError(f"[FATAL] No events loaded for run_id={run_id}")
 
         # Parse event_time as UTC datetime — required by sequence engine
         df["event_time"] = pd.to_datetime(df["event_time"], errors="coerce", utc=True)
@@ -89,22 +78,27 @@ def _load_events_for_pipeline(run_id: str) -> pd.DataFrame:
 
     except Exception as exc:
         log.error("[Patch] _load_events_for_pipeline failed: %s", exc, exc_info=True)
+        import pandas as pd
         return pd.DataFrame()
 
 
-def _load_detections_for_pipeline(run_id: str) -> pd.DataFrame:
+def _load_detections_for_pipeline(run_id: str) -> 'pd.DataFrame':
     """Load detections from sentinel_cases."""
     try:
         from dashboard.db import get_engine
         engine = get_engine("cases")
+        import pandas as pd
         df = pd.read_sql_query(
-            "SELECT * FROM detections WHERE run_id = %s ORDER BY utc_time DESC",
+            text("SELECT * FROM detections WHERE run_id = :run_id ORDER BY utc_time DESC"),
             engine,
-            params=(run_id,),
+            params={"run_id": run_id},
         )
+        if df.empty:
+            print(f"[WARN] No detections loaded for run_id={run_id}")
         return df
     except Exception as exc:
         log.warning("[Patch] _load_detections_for_pipeline failed: %s", exc)
+        import pandas as pd
         return pd.DataFrame()
 
 
@@ -130,7 +124,7 @@ def patched_run_full_analysis(run_id: str) -> Dict[str, Any]:
         return context
 
     # CRITICAL: use actual run_id from context, not the upload tracking id
-    actual_run_id = context.get("analysis_run_id") or run_id
+    actual_run_id = run_id
     if actual_run_id != run_id:
         log.info(
             "[Patch] run_id corrected: %s → %s",
@@ -146,7 +140,58 @@ def patched_run_full_analysis(run_id: str) -> Dict[str, Any]:
             len(events_df), len(detections_df), actual_run_id[:16],
         )
 
+        # ── Intelligence Layer: Run Unified Pipeline ──────────────────────
         context = run_full_pipeline(events_df, detections_df, actual_run_id, context)
+
+        # ── Pipeline Guard & Hard Defaults (AFTER context is built) ────────
+        context.setdefault("attack_conf_score", 0)
+        context.setdefault("highest_kill_chain", "Background")
+        context.setdefault("detections_count", len(detections_df))
+        context.setdefault("action_priority", "P4")
+        context.setdefault("action_reason", "Baseline analysis complete.")
+        context.setdefault("response_tasks", [])
+        
+        for field in ("attack_narrative", "recommended_action", "action_priority", "attack_conf_score"):
+            if field not in context:
+                log.error(f"[Guard] Pipeline missing field: {field}")
+                if field == "attack_narrative":
+                    context[field] = {
+                        "summary": "No strong attack evidence.",
+                        "bullets": [f"{len(detections_df)} signals observed.", f"Stage: {context.get('highest_kill_chain')}"],
+                        "full_text": "No specific attack chains identified.",
+                        "score": context.get("attack_conf_score", 0),
+                        "is_attack": False
+                    }
+                else:
+                    context[field] = "P4" if "priority" in field else ("Baseline" if "action" in field else 0)
+        
+        # Ensure attack narrative and story are synced (Issue 14)
+        narrative = context.get("attack_narrative")
+        if not isinstance(narrative, dict) or "summary" not in narrative or "No strong" in str(narrative.get("summary")):
+            log.warning("[Guard] Fixing malformed or missing attack narrative")
+            
+            primary = context.get("primary_detection")
+            if not primary and context.get("detections"):
+                primary = context["detections"][0]
+            
+            summary = f"Suspicious activity: {primary.get('rule_name')}" if primary else "Attack sequence identified"
+            context["attack_narrative"] = {
+                "summary": summary,
+                "bullets": ["Review process timeline and correlated events for investigation."],
+                "full_text": summary,
+                "score": context.get("attack_conf_score", 0),
+                "is_attack": context.get("attack_conf_score", 0) >= 45
+            }
+        
+        # 🔥 Synchronize fields for UI compatibility
+        context["attack_story"] = context["attack_narrative"]
+
+        # --- REMOVED MANUAL OVERRIDES THAT DESTROYED PIPELINE OUTPUT ---
+        final_score = context.get("attack_conf_score", 0)
+        priority = context.get("action_priority", "P4")
+        
+        log.debug(f"[PIPELINE] events={len(events_df)} bursts={len(context.get('timeline', []))} detections={len(detections_df)}")
+        log.debug(f"[DECISION] action={context.get('recommended_action')} score={final_score} priority={priority}")
 
     except Exception as exc:
         log.error("[Patch] Pipeline enrichment failed: %s", exc, exc_info=True)
@@ -158,6 +203,7 @@ def patch_run_full_analysis(original_fn: Callable) -> Callable:
     """Decorator-style wrapper."""
     def wrapped(run_id: str) -> Dict[str, Any]:
         from dashboard.pipeline import run_full_pipeline
+        from dashboard.analysis_engine import build_attack_story
 
         context = original_fn(run_id)
         if not context:
@@ -169,8 +215,58 @@ def patch_run_full_analysis(original_fn: Callable) -> Callable:
             events_df     = _load_events_for_pipeline(actual_run_id)
             detections_df = _load_detections_for_pipeline(actual_run_id)
             context = run_full_pipeline(events_df, detections_df, actual_run_id, context)
+
+            # ── Attack Storyline Reconstruction (Explainability) ─────────────────
+            try:
+                _events = events_df.to_dict(orient="records")
+                _dets   = detections_df.to_dict(orient="records")
+                attack_story = build_attack_story(_events, _dets)
+                
+                # --- Issue 2: Attack Story Fallback ---
+                if not attack_story or not attack_story.get("summary") or "missing narrative metadata" in attack_story.get("summary", "").lower():
+                    log.error("[ATTACK STORY] Missing/broken summary — forcing fallback")
+                    primary = context.get("primary_detection")
+                    if not primary and _dets:
+                        primary = _dets[0]
+                    
+                    if primary:
+                        summary = f"Suspicious activity detected: {primary.get('rule_name')}"
+                    else:
+                        summary = "No clear attack chain identified"
+                        
+                    attack_story = {
+                        "summary": summary,
+                        "bullets": ["Check process timeline for details."],
+                        "full_text": summary,
+                        "score": context.get("attack_conf_score", 0),
+                        "is_attack": context.get("attack_conf_score", 0) >= 45
+                    }
+                
+                context["attack_story"]      = attack_story
+                context["kill_chain_depth"]   = len(attack_story.get("kill_chain", [])) if isinstance(attack_story.get("kill_chain"), list) else 1
+
+                # --- REMOVED DESTRUCTIVE OVERRIDES ---
+                # [STAGE] Telemetry
+                log.debug(f"[STAGE] events_loaded: {len(events_df)}")
+                log.debug(f"[STAGE] pipeline_done: score={context.get('attack_conf_score')}")
+
+            except Exception as e:
+                log.warning("[Patch Wrapper] Storyline reconstruction failed: %s", e)
+
         except Exception as exc:
             log.error("[Patch] Pipeline enrichment failed: %s", exc, exc_info=True)
+
+        # --- SOC Validation Assertions (Issue 1) ---
+        try:
+            assert context.get("detections") is not None, "Pipeline Error: 'detections' missing from context"
+            # sequence_detections might be empty but key should exist
+            assert "sequence_detections" in context, "Pipeline Error: 'sequence_detections' missing"
+            # It might be attack_story or attack_narrative depending on which engine called it
+            assert "attack_story" in context or "attack_narrative" in context, "Pipeline Error: Story missing"
+            assert "recommended_action" in context, "Pipeline Error: 'recommended_action' missing"
+            log.info("[Validation] Pipeline integrity check passed.")
+        except AssertionError as e:
+            log.error("[Validation] Pipeline integrity check FAILED: %s", e)
 
         return context
 

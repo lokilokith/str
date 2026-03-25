@@ -21,14 +21,13 @@ Architecture:
 
 from __future__ import annotations
 
+import re
 import hashlib
 import uuid
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
-
-import pandas as pd
 
 
 # ---------------------------------------------------------------------------
@@ -266,6 +265,37 @@ BUILTIN_PATTERNS: List[SequencePattern] = [
 ]
 
 
+def normalize_command(cmd: str) -> str:
+    """SOC-grade command line normalization with evasion resilience (Base64/backticks)."""
+    if not cmd: return ""
+    c = cmd.lower().strip()
+    
+    # 1. Remove PowerShell backtick obfuscation: P`o`w`e`r -> power
+    c = c.replace("`", "")
+    
+    # 2. Handle Base64 space splitting: "-enc Z m 9 v" -> "-enc Zm9v"
+    # Look for -enc, -e, -encodedcommand followed by spaces/chars
+    if any(x in c for x in ["-enc ", "-e ", "-encoded"]):
+        # Simple heuristic: if we see lots of spaces in a long string after -enc
+        match = re.search(r"(-enc|-e|-encoded\w+)\s+([a-z0-9+/= ]{10,})", c)
+        if match:
+            flag, payload = match.groups()
+            normalized_payload = payload.replace(" ", "")
+            c = c.replace(payload, normalized_payload)
+
+    # 3. Strip hex payloads / random strings ([a-f0-9]{20,})
+    c = re.sub(r"[a-f0-9]{20,}", "[HEX]", c)
+    
+    # 4. Normalize whitespace
+    c = " ".join(c.split())
+    
+    # Trace for debug
+    # print(f"[NORM] {cmd[:30]}... -> {c[:30]}...")
+    
+    # 5. Truncate for stable comparison
+    return c[:100]
+
+
 # ---------------------------------------------------------------------------
 # Step matching helper
 # ---------------------------------------------------------------------------
@@ -335,16 +365,16 @@ class _HostTracker:
     def _prune_timed_out(
         self, chains: List[_ChainState], pat: SequencePattern, now: datetime
     ) -> List[_ChainState]:
-        """Remove chains whose last-matched step has exceeded its time window."""
+        """Remove chains whose last-matched step has exceeded its time window with 5s tolerance."""
         live = []
+        WINDOW_TOLERANCE = 5  # seconds
         for chain in chains:
             if chain.step_idx < len(pat.steps):
                 step       = pat.steps[chain.step_idx]
-                max_gap    = step.max_gap_seconds
+                max_gap    = step.max_gap_seconds + WINDOW_TOLERANCE
                 elapsed    = (now - chain.last_time).total_seconds()
                 if elapsed <= max_gap:
                     live.append(chain)
-                # else: timed out — drop silently
         return live
 
     def process_event(
@@ -441,12 +471,14 @@ def _build_sequence_detection(
         "chain_depth":      len(matched_events),
         "chain_str":        chain_str,
         "image":            str(first_ev.get("image") or ""),
+        "parent_image":     str(first_ev.get("parent_image") or "").lower(),
         "computer":         str(first_ev.get("computer") or ""),
         "utc_time":         first_ev.get("event_time") or first_ev.get("utc_time"),
         "event_time":       first_ev.get("event_time") or first_ev.get("utc_time"),
         "end_time":         last_ev.get("event_time") or last_ev.get("utc_time"),
         "matched_event_ids": [str(e.get("event_id")) for e in matched_events],
         "run_id":           str(first_ev.get("run_id") or ""),
+        "detection_source": "sequence",
         "is_sequence":      True,
     }
 
@@ -486,12 +518,33 @@ class SequenceEngine:
         self._trackers: Dict[str, _HostTracker] = defaultdict(
             lambda: _HostTracker(window_seconds)
         )
+        # 🔥 Memory-capped fired cache (prevents duplicate firing)
+        # Key: (pattern_id, computer, first_event_ts, last_event_ts)
+        self._fired_sequences: Dict[Tuple[str, str, float, float], float] = {}
+        self._max_fired_cache = 20000
 
-    def process_dataframe(self, df: pd.DataFrame) -> List[Dict[str, Any]]:
+    def _evict_fired_cache(self) -> None:
+        """Stable-sort eviction: drop oldest 25% of entries."""
+        if len(self._fired_sequences) < self._max_fired_cache:
+            return
+        
+        # 🔥 Stable sort (time + key) as requested
+        items = sorted(
+            self._fired_sequences.items(),
+            key=lambda x: (x[1], x[0])
+        )
+        # Drop 25%
+        drop_count = self._max_fired_cache // 4
+        to_drop = items[:drop_count]
+        for key, _ in to_drop:
+            del self._fired_sequences[key]
+
+    def process_dataframe(self, df: 'pd.DataFrame') -> List[Dict[str, Any]]:
         """
         Process a sorted DataFrame of events and return all sequence detections.
         Events MUST be sorted by event_time ascending for correct ordering.
         """
+        import pandas as pd
         if df.empty:
             return []
 
@@ -507,6 +560,12 @@ class SequenceEngine:
             # Coerce NaN → None for safety
             event = {k: (None if (isinstance(v, float) and v != v) else v)
                      for k, v in event.items()}
+            
+            # --- Issue 6: Normalize command line before tracking ---
+            if "command_line" in event:
+                event["command_line"] = normalize_command(event["command_line"])
+            elif "commandline" in event:
+                event["commandline"] = normalize_command(event["commandline"])
 
             computer = str(event.get("computer") or "unknown_host")
 
@@ -524,7 +583,19 @@ class SequenceEngine:
 
             tracker   = self._trackers[computer]
             completed = tracker.process_event(event, self.patterns, now)
-            detections.extend(completed)
+            
+            # 🔥 Deduplicate against fired cache
+            for det in completed:
+                # Key: (pattern, host, start_ts, end_ts)
+                import pandas as pd
+                start_ts = pd.to_datetime(det["event_time"], utc=True).timestamp()
+                end_ts   = pd.to_datetime(det["end_time"], utc=True).timestamp()
+                f_key = (det["pattern_id"], computer, start_ts, end_ts)
+                
+                if f_key not in self._fired_sequences:
+                    self._evict_fired_cache()
+                    self._fired_sequences[f_key] = now.timestamp()
+                    detections.append(det)
 
         return detections
 

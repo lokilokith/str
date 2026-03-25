@@ -110,9 +110,9 @@ FIX 4 — api_alerts/latest reads from wrong DB
 #   engine = get_engine(mode)
 #   import pandas as pd
 #   df = pd.read_sql_query(
-#       "SELECT utc_time, image, computer, rule_name, severity, mitre_id "
-#       "FROM detections WHERE run_id = %s ORDER BY utc_time DESC LIMIT 20",
-#       engine, params=(run_id or "live",)
+#       text("SELECT utc_time, image, computer, rule_name, severity, mitre_id "
+#            "FROM detections WHERE run_id = :run_id ORDER BY utc_time DESC LIMIT 20"),
+#       engine, params={"run_id": run_id or "live"}
 #   )
 #
 # REPLACE WITH:
@@ -123,19 +123,19 @@ FIX 4 — api_alerts/latest reads from wrong DB
 #   # Try detections table; fall back to empty if utc_time col named differently
 #   try:
 #       df = pd.read_sql_query(
-#           "SELECT COALESCE(utc_time, event_time) AS utc_time, "
-#           "image, computer, rule_name, severity, mitre_id "
-#           "FROM detections WHERE run_id = %s "
-#           "ORDER BY COALESCE(utc_time, event_time) DESC LIMIT 20",
-#           engine, params=(run_id or "live",)
+#           text("SELECT COALESCE(utc_time, event_time) AS utc_time, "
+#                "image, computer, rule_name, severity, mitre_id "
+#                "FROM detections WHERE run_id = :run_id "
+#                "ORDER BY COALESCE(utc_time, event_time) DESC LIMIT 20"),
+#           engine, params={"run_id": run_id or "live"}
 #       )
 #   except Exception:
 #       df = pd.read_sql_query(
-#           "SELECT event_time AS utc_time, image, computer, "
-#           "rule_name, severity, mitre_id "
-#           "FROM detections WHERE run_id = %s "
-#           "ORDER BY event_time DESC LIMIT 20",
-#           engine, params=(run_id or "live",)
+#           text("SELECT event_time AS utc_time, image, computer, "
+#                "rule_name, severity, mitre_id "
+#                "FROM detections WHERE run_id = :run_id "
+#                "ORDER BY event_time DESC LIMIT 20"),
+#           engine, params={"run_id": run_id or "live"}
 #       )
 #
 
@@ -149,9 +149,9 @@ FIX 4 — api_alerts/latest reads from wrong DB
 #   engine = get_engine(mode)
 #   import pandas as pd
 #   df = pd.read_sql_query(
-#       f"SELECT event_time as utc_time, image, command_line, {_user_col} as user, computer "
-#       f"FROM events WHERE run_id = %s ORDER BY event_time DESC LIMIT 100",
-#       engine, params=(run_id or "live",)
+#       text(f"SELECT event_time as utc_time, image, command_line, {_user_col} as user, computer "
+#            f"FROM events WHERE run_id = :run_id ORDER BY event_time DESC LIMIT 100"),
+#       engine, params={"run_id": run_id or "live"}
 #   )
 #
 # REPLACE WITH:
@@ -160,10 +160,10 @@ FIX 4 — api_alerts/latest reads from wrong DB
 #   engine = get_engine(mode)
 #   import pandas as pd
 #   df = pd.read_sql_query(
-#       f"SELECT event_time AS utc_time, image, command_line, "
-#       f"COALESCE({_user_col}, '') AS user, computer "
-#       f"FROM events WHERE run_id = %s ORDER BY event_time DESC LIMIT 100",
-#       engine, params=(run_id or "live",)
+#       text(f"SELECT event_time AS utc_time, image, command_line, "
+#            f"COALESCE({_user_col}, '') AS user, computer "
+#            f"FROM events WHERE run_id = :run_id ORDER BY event_time DESC LIMIT 100"),
+#       engine, params={"run_id": run_id or "live"}
 #   )
 #
 

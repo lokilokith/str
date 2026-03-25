@@ -75,27 +75,27 @@ else:
 # ── FIX 3: api_alerts_latest — handle utc_time OR event_time column ───────
 OLD_ALERTS = (
     '        df = pd.read_sql_query(\n'
-    '            "SELECT utc_time, image, computer, rule_name, severity, mitre_id "\n'
-    '            "FROM detections WHERE run_id = %s ORDER BY utc_time DESC LIMIT 20",\n'
-    '            engine, params=(run_id or "live",)\n'
+    '            text("SELECT utc_time, image, computer, rule_name, severity, mitre_id "\n'
+    '                 "FROM detections WHERE run_id = :run_id ORDER BY utc_time DESC LIMIT 20"),\n'
+    '            engine, params={"run_id": run_id or "live"}\n'
     '        )'
 )
 NEW_ALERTS = (
     '        try:\n'
     '            df = pd.read_sql_query(\n'
-    '                "SELECT COALESCE(utc_time, event_time) AS utc_time, "\n'
-    '                "image, computer, rule_name, severity, mitre_id "\n'
-    '                "FROM detections WHERE run_id = %s "\n'
-    '                "ORDER BY COALESCE(utc_time, event_time) DESC LIMIT 20",\n'
-    '                engine, params=(run_id or "live",)\n'
+    '                text("SELECT COALESCE(utc_time, event_time) AS utc_time, "\n'
+    '                     "image, computer, rule_name, severity, mitre_id "\n'
+    '                     "FROM detections WHERE run_id = :run_id "\n'
+    '                     "ORDER BY COALESCE(utc_time, event_time) DESC LIMIT 20"),\n'
+    '                engine, params={"run_id": run_id or "live"}\n'
     '            )\n'
     '        except Exception:\n'
     '            df = pd.read_sql_query(\n'
-    '                "SELECT event_time AS utc_time, image, computer, "\n'
-    '                "rule_name, severity, mitre_id "\n'
-    '                "FROM detections WHERE run_id = %s "\n'
-    '                "ORDER BY event_time DESC LIMIT 20",\n'
-    '                engine, params=(run_id or "live",)\n'
+    '                text("SELECT event_time AS utc_time, image, computer, "\n'
+    '                     "rule_name, severity, mitre_id "\n'
+    '                     "FROM detections WHERE run_id = :run_id "\n'
+    '                     "ORDER BY event_time DESC LIMIT 20"),\n'
+    '                engine, params={"run_id": run_id or "live"}\n'
     '            )'
 )
 if '"FROM detections WHERE run_id = %s ORDER BY utc_time DESC LIMIT 20"' in code:
@@ -107,17 +107,17 @@ else:
 # ── FIX 4: api_events_latest — COALESCE user column ──────────────────────
 OLD_EVENTS_QUERY = (
     '        df = pd.read_sql_query(\n'
-    '            f"SELECT event_time as utc_time, image, command_line, {_user_col} as user, computer "\n'
-    '            f"FROM events WHERE run_id = %s ORDER BY event_time DESC LIMIT 100",\n'
-    '            engine, params=(run_id or "live",)\n'
+    '            text(f"SELECT event_time as utc_time, image, command_line, {_user_col} as user, computer "\n'
+    '                 f"FROM events WHERE run_id = :run_id ORDER BY event_time DESC LIMIT 100"),\n'
+    '            engine, params={"run_id": run_id or "live"}\n'
     '        )'
 )
 NEW_EVENTS_QUERY = (
     '        df = pd.read_sql_query(\n'
-    '            f"SELECT event_time AS utc_time, image, command_line, "\n'
-    '            f"COALESCE({_user_col}, \'\') AS user, computer "\n'
-    '            f"FROM events WHERE run_id = %s ORDER BY event_time DESC LIMIT 100",\n'
-    '            engine, params=(run_id or "live",)\n'
+    '            text(f"SELECT event_time AS utc_time, image, command_line, "\n'
+    '                 f"COALESCE({_user_col}, \'\') AS user, computer "\n'
+    '                 f"FROM events WHERE run_id = :run_id ORDER BY event_time DESC LIMIT 100"),\n'
+    '            engine, params={"run_id": run_id or "live"}\n'
     '        )'
 )
 if 'f"SELECT event_time as utc_time, image, command_line, {_user_col} as user, computer "' in code:

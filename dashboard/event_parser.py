@@ -31,7 +31,6 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import pandas as pd
 
 log = logging.getLogger("event_parser")
 
@@ -374,7 +373,8 @@ def load_all_sources_from_xml(xml_path) -> List[Dict[str, Any]]:
     return parsed
 
 
-def parse_xml_to_dataframe(xml_path) -> pd.DataFrame:
+def parse_xml_to_dataframe(xml_path) -> 'pd.DataFrame':
+    import pandas as pd
     return pd.DataFrame(load_all_sources_from_xml(xml_path))
 
 
@@ -382,7 +382,7 @@ def parse_xml_to_dataframe(xml_path) -> pd.DataFrame:
 # Parent-chain enrichment
 # ---------------------------------------------------------------------------
 
-def enrich_parent_chains(df: pd.DataFrame) -> pd.DataFrame:
+def enrich_parent_chains(df: 'pd.DataFrame') -> 'pd.DataFrame':
     if df.empty or "ppid" not in df.columns:
         return df
     df = df.copy()
@@ -482,7 +482,8 @@ def _match_rule(event: Dict[str, Any], rule: Dict[str, Any]) -> bool:
     return True
 
 
-def find_detections(df: pd.DataFrame, rules: Optional[List[Dict]] = None) -> pd.DataFrame:
+def find_detections(df: 'pd.DataFrame', rules: Optional[List[Dict]] = None) -> 'pd.DataFrame':
+    import pandas as pd
     out_cols = [
         "rule_id", "rule_name", "mitre_id", "mitre_tactic", "kill_chain_stage",
         "utc_time", "event_time", "image", "event_id", "description", "severity",
@@ -568,4 +569,5 @@ def find_detections(df: pd.DataFrame, rules: Optional[List[Dict]] = None) -> pd.
                 "command_line":      ev.get("command_line"),
                 "confidence_score":  40,
             })
+    import pandas as pd
     return pd.DataFrame(hits, columns=out_cols) if hits else pd.DataFrame(columns=out_cols)

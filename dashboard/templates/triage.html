@@ -77,6 +77,21 @@ tr:hover td{background:rgba(255,255,255,.02)}
 .action-btn.dismiss{border-color:rgba(52,211,153,.4);color:var(--green)}
 .action-btn.dismiss:hover{background:rgba(52,211,153,.1)}
 
+/* ── Attack Storyline inline row ── */
+.story-row{display:none;background:rgba(15,23,42,.6);border-top:1px solid var(--border)}
+.story-row.open{display:table-row}
+.story-cell{padding:14px 20px;border-bottom:1px solid var(--border)}
+.story-steps{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.story-step{padding:4px 10px;border-radius:4px;font-size:11px;background:rgba(96,165,250,.1);
+  color:var(--cyan);border:1px solid rgba(96,165,250,.2);font-family:var(--mono)}
+.story-arrow{color:var(--dim);align-self:center;font-size:12px}
+.explain-panel{background:rgba(15,23,42,.8);border:1px solid rgba(96,165,250,.2);
+  border-radius:8px;padding:12px 16px;margin-top:8px}
+.explain-item{font-size:11px;color:var(--muted);padding:3px 0;
+  border-bottom:1px solid rgba(255,255,255,.05)}
+.explain-item:last-child{border-bottom:none}
+.explain-why{color:var(--orange);font-weight:600;font-size:10px;margin-right:6px}
+
 /* Nav */
 .nav-link{color:var(--muted);text-decoration:none;font-size:13px;padding:6px 12px;border-radius:6px;transition:all .15s}
 .nav-link:hover{background:rgba(255,255,255,.05);color:var(--text)}
@@ -262,9 +277,43 @@ tr:hover td{background:rgba(255,255,255,.02)}
               <a href="/dashboard/{{ inc.run_id }}" class="action-btn investigate">Investigate</a>
               <button class="action-btn escalate" onclick="transition('{{ inc.incident_id }}','Escalated')">Escalate</button>
               <button class="action-btn dismiss" onclick="transition('{{ inc.incident_id }}','Closed - False Positive')">FP</button>
+              {% if inc.attack_story %}
+              <button class="action-btn" onclick="toggleStory('{{ inc.incident_id }}')">▸ Story</button>
+              {% endif %}
             </div>
           </td>
         </tr>
+        {% if inc.attack_story %}
+        <tr id="story-{{ inc.incident_id }}" class="story-row">
+          <td colspan="10" class="story-cell">
+            <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;margin-bottom:8px">
+              ⚡ Attack Storyline
+            </div>
+            <div class="story-steps">
+              {% for step in inc.attack_story.steps[:8] %}
+                <span class="story-step">{{ loop.index }}. {{ step }}</span>
+                {% if not loop.last %}<span class="story-arrow">→</span>{% endif %}
+              {% endfor %}
+            </div>
+            {% if inc.attack_story.kill_chain %}
+            <div style="margin-top:10px;display:flex;gap:6px;align-items:center">
+              <span style="font-size:10px;color:var(--dim);text-transform:uppercase">Kill Chain:</span>
+              {% for stage in inc.attack_story.kill_chain %}
+                <span class="badge badge-chain">{{ stage }}</span>
+              {% endfor %}
+            </div>
+            {% endif %}
+            {% if inc.top_detection_reasons %}
+            <div class="explain-panel">
+              <div style="font-size:10px;color:var(--dim);text-transform:uppercase;margin-bottom:6px">Detection Explanation</div>
+              {% for reason in inc.top_detection_reasons %}
+                <div class="explain-item"><span class="explain-why">WHY</span>{{ reason }}</div>
+              {% endfor %}
+            </div>
+            {% endif %}
+          </td>
+        </tr>
+        {% endif %}
         {% endfor %}
       </tbody>
     </table>
@@ -300,6 +349,11 @@ async function transition(incidentId, newStatus) {
   const data = await resp.json();
   if (data.success) { location.reload(); }
   else { alert('Error: ' + (data.error || 'Unknown error')); }
+}
+
+function toggleStory(incidentId) {
+  const row = document.getElementById('story-' + incidentId);
+  if (row) row.classList.toggle('open');
 }
 
 // Auto-refresh every 60 seconds

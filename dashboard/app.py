@@ -4,34 +4,38 @@ app.py — SentinelTrace Flask Application  (MySQL edition)
 All PostgreSQL / psycopg2 references removed.
 Uses the MySQL-compatible db.py layer throughout.
 
-Key changes vs the original
-----------------------------
-* SECRET_KEY loaded from env (startup fails loudly if missing).
-* get_cursor() used as a context manager (with get_cursor(conn) as cur:)
-  everywhere — matches the new db.py API.
-* sql_now_minus() used for all time-window SQL (no PostgreSQL INTERVAL syntax).
-* quote_identifier() used for the reserved-word `user` column.
-* now_utc() used for all UTC timestamps.
-* health_check() called at init_db() — no direct psycopg2 calls.
-* Maintenance loop uses MySQL-safe DELETE … LIMIT (no sub-select on same table).
-* All imports match the exported symbols in the new db.py.
+FIXES IN THIS VERSION:
+  FIX-1: load_events() — expanded column set to include parent_image,
+          command_line, file_path, pid, ppid so hunt console can filter
+          on all standard fields. Previously these were missing, causing
+          hunt queries to always return 0 results.
+
+  FIX-2: burst_view() — added field aliases (dst_ip -> destination_ip,
+          file_path -> target_filename) in safe_events so burst.html
+          template can access them. Previously burst detail page showed
+          empty event tables even when events existed in the DB.
+
+  FIX-3: burst_view() — `user` column aliased explicitly in SQL to avoid
+          reserved-word issues on MySQL 8+.
 """
 
 from __future__ import annotations
 
 import datetime
 import io
+import json
 import logging
 import os
 import re
 import threading
 import traceback
+import pandas as pd
 import uuid
 from collections import defaultdict
 from ipaddress import ip_address, AddressValueError
 from pathlib import Path
 
-import pandas as pd
+from sqlalchemy import text
 import xml.etree.ElementTree as ET
 from flask import (
     Flask,
@@ -56,7 +60,7 @@ from dashboard.db import (
     sanitize_datetime,
     sql_now_minus,
 )
-from dashboard.analysis_engine import ingest_upload, persist_case
+from dashboard.analysis_engine import ingest_upload, persist_case, build_attack_story
 from dashboard.analysis_engine_patch import patched_run_full_analysis as run_full_analysis
 from dashboard.analysis_cache import (
     clear_analysis_snapshot,
@@ -88,13 +92,11 @@ from dashboard.soc_verdict import (
     create_audit_entry,
 )
 
-# Live collector removed — upload-only mode
-
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(asctime)s [%(levelname)s] %(name)s %(message)s",
     datefmt="%Y-%m-%dT%H:%M:%S",
 )
@@ -146,15 +148,11 @@ def _run_analysis_async(run_id: str, xml_path, rules_dest) -> None:
     try:
         _set_run_status(run_id, "processing")
         log.info("[ASYNC] Starting analysis for run_id=%s", run_id)
-        events_df, detections_df, behaviors_df = ingest_upload(
+        events_df, detections_df, behaviors_df, content_hash = ingest_upload(
             xml_path=xml_path, rules_path=rules_dest,
         )
-        persist_case(events_df, detections_df, behaviors_df)
-        actual_run_id = events_df["run_id"].iloc[0]
+        actual_run_id = persist_case(events_df, detections_df, behaviors_df, content_hash)
 
-        # CRITICAL: dispose SQLAlchemy connection pools AFTER mysql.connector writes.
-        # Without this, read_sql_query returns stale empty results because the pool
-        # holds connections opened before the bulk INSERT completed.
         try:
             from dashboard.db import dispose_engine as _dispose
             _dispose("cases")
@@ -165,18 +163,21 @@ def _run_analysis_async(run_id: str, xml_path, rules_dest) -> None:
 
         with SNAPSHOT_LOCK:
             context = run_full_analysis(actual_run_id)
-            set_analysis_snapshot(actual_run_id, context)
+            if context and "recommended_action" in context:
+                set_analysis_snapshot(actual_run_id, context)
+            else:
+                log.warning("[ASYNC] Analysis context invalid or missing recommended_action for %s; skipping snapshot.", actual_run_id)
         _set_run_status(run_id, f"done:{actual_run_id}")
-        log.info("[ASYNC] Analysis complete for run_id=%s → %s", run_id, actual_run_id)
+        log.info("[ASYNC] Analysis complete for run_id=%s -> %s", run_id, actual_run_id)
     except Exception as exc:
         log.error("[ASYNC] Analysis failed for run_id=%s: %s", run_id, exc, exc_info=True)
-        _set_run_status(run_id, f"error:{exc}")
+        # 10/10 Mastery: Structured Async Reporting
+        _set_run_status(run_id, json.dumps({"status": "error", "message": f"Formal Proof Failed: {str(exc)}", "type": type(exc).__name__}))
 
 # ---------------------------------------------------------------------------
 # DB init
 # ---------------------------------------------------------------------------
 def init_db() -> None:
-    """Verify database connectivity and schema on startup."""
     results = health_check()
     for mode, ok in results.items():
         log.info("DB health check [%s]: %s", mode, "OK" if ok else "FAILED")
@@ -185,11 +186,6 @@ def init_db() -> None:
 # SIEM background maintenance
 # ---------------------------------------------------------------------------
 def maintenance_loop() -> None:
-    """
-    Purge live_events older than 24 hours.
-    MySQL-safe: DELETE … WHERE … LIMIT 5000
-    (MySQL does not allow DELETE … WHERE id IN (SELECT … FROM same table)).
-    """
     if app.debug and os.environ.get("WERKZEUG_RUN_MAIN") != "true":
         return
 
@@ -211,7 +207,7 @@ def maintenance_loop() -> None:
         except Exception as exc:
             log.error("[SIEM-MAINT] Error during cleanup: %s", exc)
 
-        threading.Event().wait(600)  # run every 10 minutes
+        threading.Event().wait(600)
 
 
 def start_maintenance() -> None:
@@ -227,21 +223,26 @@ _user_col = quote_identifier("user")   # `user` on MySQL
 
 
 def load_events(run_id: str | None = None) -> pd.DataFrame:
+    """
+    FIX-1: Expanded column set to include parent_image, command_line,
+    file_path, pid, ppid. Previously these were missing, causing hunt
+    console field filters (parent:, cmd:, dst:) to always return 0 results.
+    """
     if not run_id:
         return pd.DataFrame()
 
     mode   = "live" if run_id == "live" else "cases"
     engine = get_engine(mode)
+    import pandas as pd
     try:
-        columns = (
-            f"event_uid, event_time, event_id, image, {_user_col}, "
-            "src_ip, dst_ip, dst_port, severity, computer, run_id"
-        )
         df = pd.read_sql_query(
-            f"SELECT {columns} FROM events WHERE run_id = %s "
-            "ORDER BY event_time DESC LIMIT 50000",
+            text(f"SELECT event_uid, event_time, event_id, image, parent_image, "
+                 f"command_line, {_user_col}, src_ip, dst_ip, dst_port, "
+                 f"severity, computer, file_path, run_id, pid, ppid "
+                 f"FROM events WHERE run_id = :run_id "
+                 f"ORDER BY event_time DESC LIMIT 50000"),
             engine,
-            params=(run_id,),
+            params={"run_id": run_id},
         )
     except Exception as exc:
         log.error("load_events error: %s", exc)
@@ -250,7 +251,13 @@ def load_events(run_id: str | None = None) -> pd.DataFrame:
     if df.empty:
         return df
 
-    df = df.rename(columns={"src_ip": "source_ip", "dst_ip": "destination_ip"})
+    df = df.rename(columns={
+        "src_ip":    "source_ip",
+        "dst_ip":    "destination_ip",
+        "pid":       "process_id",
+        "ppid":      "parent_process_id",
+        "file_path": "target_filename",
+    })
     if "event_time" in df.columns:
         df["utc_time"] = df["event_time"]
     return df
@@ -262,12 +269,13 @@ def load_detections(run_id: str | None = None) -> pd.DataFrame:
 
     mode   = "live" if run_id == "live" else "cases"
     engine = get_engine(mode)
+    import pandas as pd
     try:
         df = pd.read_sql_query(
-            "SELECT * FROM detections WHERE run_id = %s "
-            "ORDER BY event_time DESC LIMIT 10000",
+            text("SELECT * FROM detections WHERE run_id = :run_id "
+                 "ORDER BY event_time DESC LIMIT 10000"),
             engine,
-            params=(run_id,),
+            params={"run_id": run_id},
         )
     except Exception:
         df = pd.DataFrame()
@@ -280,11 +288,12 @@ def load_correlations(run_id: str | None = None) -> pd.DataFrame:
 
     mode   = "live" if run_id == "live" else "cases"
     engine = get_engine(mode)
+    import pandas as pd
     try:
         df = pd.read_sql_query(
-            "SELECT * FROM correlations WHERE run_id = %s",
+            text("SELECT * FROM correlations WHERE run_id = :run_id"),
             engine,
-            params=(run_id,),
+            params={"run_id": run_id},
         )
     except Exception:
         df = pd.DataFrame()
@@ -315,11 +324,12 @@ def load_behaviors(run_id: str | None = None) -> pd.DataFrame:
 
     mode   = "live" if run_id == "live" else "cases"
     engine = get_engine(mode)
+    import pandas as pd
     try:
         df = pd.read_sql_query(
-            "SELECT * FROM behaviors WHERE run_id = %s ORDER BY event_time DESC",
+            text("SELECT * FROM behaviors WHERE run_id = :run_id ORDER BY event_time DESC"),
             engine,
-            params=(run_id,),
+            params={"run_id": run_id},
         )
     except Exception:
         df = pd.DataFrame()
@@ -336,9 +346,6 @@ def _is_internal_ip(ip_str: str) -> bool:
         return True
 
 
-# ---------------------------------------------------------------------------
-# Routes — setup + uploads
-# ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # Auth routes
 # ---------------------------------------------------------------------------
@@ -378,7 +385,7 @@ def welcome_page():
         old_id = session.pop("analysis_run_id")
         clear_analysis_snapshot(old_id)
     _ = get_flashed_messages()
-    return render_template("welcome_upload.html")
+    return render_template("welcome_upload.html", current_user=get_current_user())
 
 
 @app.route("/setup-page")
@@ -414,7 +421,8 @@ def setup_upload():
                 flash("Invalid XML: root tag must be <Events>.")
                 return redirect(url_for("welcome_page"))
     except Exception as exc:
-        flash(f"Invalid or malformed Sysmon XML: {exc}")
+        log.error("[UPLOAD] Ingestion failed: %s", exc, exc_info=True)
+        flash(f"Upload failed: {exc}", "error")
         return redirect(url_for("welcome_page"))
 
     rules_dest = None
@@ -448,7 +456,6 @@ def setup_upload():
 
 @app.route("/dashboard/status/<run_id>")
 def dashboard_status(run_id: str):
-    """Live progress page — uses JavaScript polling, NO meta-refresh."""
     safe = re.sub(r"[^a-zA-Z0-9_-]", "", run_id)[:64]
     status = _get_run_status(safe)
     if status.startswith("done:"):
@@ -462,7 +469,6 @@ def dashboard_status(run_id: str):
         flash(f"Analysis failed: {msg}", "error")
         return redirect(url_for("welcome_page"))
 
-    # JavaScript polling page — no meta-refresh, no infinite loop
     api_url = url_for("api_run_status", run_id=safe)
     body = f"""<!doctype html>
 <html lang="en">
@@ -482,8 +488,7 @@ def dashboard_status(run_id: str):
   h2{{font-size:20px;font-weight:700;margin-bottom:10px;color:#f1f5f9}}
   .sub{{font-size:13px;color:var(--muted);margin-bottom:28px;line-height:1.6}}
   .bar-wrap{{background:#1e293b;border-radius:6px;height:8px;overflow:hidden;margin-bottom:8px}}
-  .bar{{height:100%;background:var(--blue);border-radius:6px;
-        transition:width 1s ease;width:5%}}
+  .bar{{height:100%;background:var(--blue);border-radius:6px;transition:width 1s ease;width:5%}}
   .pct{{font-size:11px;color:var(--dim);margin-bottom:20px;font-family:monospace}}
   .stage{{background:#0f172a;border:1px solid rgba(148,163,184,.12);border-radius:8px;
           padding:14px;font-size:12px;color:var(--muted);text-align:left;line-height:1.8}}
@@ -511,14 +516,11 @@ def dashboard_status(run_id: str):
   </div>
   <div class="elapsed" id="elapsed">Elapsed: 0s</div>
 </div>
-
 <script>
 const API = "{api_url}";
 const start = Date.now();
 let tick = 0;
 let stopped = false;
-
-// Simulated progress stages (timed to reality)
 const stages = [
   [0,  5,  's1', '① Parsing XML events'],
   [5,  20, 's2', '② Enriching signals'],
@@ -528,12 +530,9 @@ const stages = [
   [80, 99, 's6', '⑥ Correlation & scoring'],
 ];
 const stageIds = ['s1','s2','s3','s4','s5','s6'];
-
 function setProgress(pct, label) {{
   document.getElementById('bar').style.width = pct + '%';
   document.getElementById('pct').textContent = pct + '% — ' + label;
-  // Update stage indicators
-  const elapsed = (Date.now() - start) / 1000;
   let activeIdx = stages.length - 1;
   for (let i = 0; i < stages.length; i++) {{
     const [low, high] = stages[i];
@@ -551,12 +550,10 @@ function setProgress(pct, label) {{
     }}
   }});
 }}
-
 function updateElapsed() {{
   const s = Math.floor((Date.now() - start) / 1000);
   document.getElementById('elapsed').textContent = 'Elapsed: ' + s + 's';
 }}
-
 async function poll() {{
   if (stopped) return;
   try {{
@@ -566,7 +563,6 @@ async function poll() {{
       stopped = true;
       setProgress(100, 'Complete!');
       document.getElementById('elapsed').textContent += ' — Redirecting…';
-      // Small delay so user sees 100%
       setTimeout(() => {{ window.location.href = data.redirect; }}, 800);
       return;
     }}
@@ -577,30 +573,20 @@ async function poll() {{
       document.getElementById('bar').style.background = '#f87171';
       return;
     }}
-  }} catch(e) {{
-    // Network blip — keep polling
-  }}
-
-  // Advance simulated progress bar
+  }} catch(e) {{}}
   tick++;
   const elapsed = (Date.now() - start) / 1000;
-  // Realistic curve: fast at start (parsing), then slower (DB insert)
   let pct;
   if (elapsed < 5)       pct = Math.min(15, tick * 2);
   else if (elapsed < 20) pct = Math.min(35, 15 + (elapsed-5)*1.5);
   else if (elapsed < 50) pct = Math.min(60, 35 + (elapsed-20)*0.8);
   else if (elapsed < 90) pct = Math.min(85, 60 + (elapsed-50)*0.6);
   else                   pct = Math.min(97, 85 + (elapsed-90)*0.1);
-
   const stageLabel = stages.find(s => pct >= s[0] && pct < s[1]);
   setProgress(Math.floor(pct), stageLabel ? stageLabel[3] : 'Finalising…');
   updateElapsed();
-
-  // Poll every 2 seconds
   setTimeout(poll, 2000);
 }}
-
-// Start polling
 poll();
 setInterval(updateElapsed, 1000);
 </script>
@@ -614,13 +600,12 @@ setInterval(updateElapsed, 1000);
 
 @app.route("/api/run/status/<run_id>")
 def api_run_status(run_id: str):
-    """JSON endpoint for front-end status polling."""
     safe   = re.sub(r"[^a-zA-Z0-9_-]", "", run_id)[:64]
     status = _get_run_status(safe)
     if status.startswith("done:"):
         actual = status.split(":", 1)[1]
         with app.test_request_context():
-            pass  # ensure app context
+            pass
         session["analysis_run_id"] = actual
         return jsonify({"status": "done", "run_id": actual,
                         "redirect": f"/dashboard/{actual}"})
@@ -630,160 +615,23 @@ def api_run_status(run_id: str):
 
 
 # ---------------------------------------------------------------------------
-# SOC Live APIs
+# SOC Live APIs (disabled — upload-only mode)
 # ---------------------------------------------------------------------------
 @app.route("/api/live/events")
 def api_live_events():
     return jsonify({"events": [], "last_row_id": 0, "info": "Live mode removed"})
 
-@app.route("/api/live/events_DISABLED")
-def api_live_events_orig():
-    since_id = request.args.get("since_id", 0, type=int)
-    try:
-        columns = (
-            f"row_id, event_uid, event_time, inserted_at, event_id, image, parent_image, "
-            f"command_line, {_user_col}, pid, ppid, source_ip, destination_ip, "
-            f"destination_port, severity, computer, target_filename, run_id"
-        )
-        with get_db_connection("live") as conn:
-            with get_cursor(conn) as cur:
-                if since_id == 0:
-                    cur.execute(
-                        f"SELECT {columns} FROM live_events "
-                        f"ORDER BY row_id DESC LIMIT 200"
-                    )
-                    rows = [dict(r) for r in cur.fetchall()]
-                    rows.reverse()
-                else:
-                    cur.execute(
-                        f"SELECT {columns} FROM live_events "
-                        f"WHERE row_id > %s ORDER BY row_id ASC LIMIT 200",
-                        (since_id,),
-                    )
-                    rows = [dict(r) for r in cur.fetchall()]
-
-        last_id = rows[-1]["row_id"] if rows else since_id
-        return jsonify({"events": rows, "last_row_id": last_id})
-    except Exception as exc:
-        return jsonify({"events": [], "error": str(exc), "last_row_id": since_id})
-
-
 @app.route("/api/live/status")
 def api_live_status():
     return jsonify({"status": "DISABLED", "latency": -1, "info": "Live mode removed"})
-
-@app.route("/api/live/status_DISABLED")
-def api_live_status_orig():
-    try:
-        with get_db_connection("live") as conn:
-            with get_cursor(conn) as cur:
-                cur.execute("SELECT last_seen FROM collector_status WHERE id = 1")
-                row = cur.fetchone()
-
-                if not row or not row["last_seen"]:
-                    return jsonify({"status": "STOPPED", "latency": -1})
-
-                last_seen_val = row["last_seen"]
-                if isinstance(last_seen_val, str):
-                    try:
-                        last_seen = datetime.datetime.fromisoformat(
-                            last_seen_val.replace("Z", "+00:00")
-                        )
-                    except ValueError:
-                        last_seen = now_utc()
-                elif isinstance(last_seen_val, datetime.datetime):
-                    if last_seen_val.tzinfo is None:
-                        last_seen = last_seen_val.replace(
-                            tzinfo=datetime.timezone.utc
-                        )
-                    else:
-                        last_seen = last_seen_val
-                else:
-                    last_seen = now_utc()
-
-                latency = (now_utc() - last_seen).total_seconds()
-                if latency > 60:
-                    status = "STOPPED"
-                elif latency > 15:
-                    status = "DEGRADED"
-                else:
-                    status = "RUNNING"
-
-                return jsonify({
-                    "status":        status,
-                    "latency":       round(latency, 1),
-                    "last_seen_utc": last_seen.isoformat(),
-                })
-    except Exception as exc:
-        log.error("api_live_status error: %s", exc)
-        return jsonify({"status": "ERROR", "latency": -1})
-
 
 @app.route("/api/live/metrics")
 def api_live_metrics():
     return jsonify({"eps_sma": 0, "beaconing": [], "process_bursts": [], "info": "Live mode removed"})
 
-@app.route("/api/live/metrics_DISABLED")
-def api_live_metrics_orig():
-    try:
-        with get_db_connection("live") as conn:
-            with get_cursor(conn) as cur:
-                # Events-per-second (rolling 60s)
-                cur.execute(
-                    f"SELECT COUNT(*) AS cnt FROM live_events "
-                    f"WHERE inserted_at >= {sql_now_minus(60, 'SECOND')}"
-                )
-                row = cur.fetchone()
-                eps = (row["cnt"] if row else 0) / 60.0
-
-                # Beaconing detection (high-freq same dst in last 5 min)
-                cur.execute(
-                    f"SELECT destination_ip, destination_port, "
-                    f"COUNT(*) AS hits, COUNT(DISTINCT event_time) AS spread "
-                    f"FROM live_events "
-                    f"WHERE inserted_at >= {sql_now_minus(5, 'MINUTE')} "
-                    f"GROUP BY destination_ip, destination_port "
-                    f"HAVING COUNT(*) > 10 AND COUNT(DISTINCT event_time) > 3 "
-                    f"ORDER BY hits DESC LIMIT 5"
-                )
-                beaconing = [dict(r) for r in cur.fetchall()]
-
-                # Process burst detection (last 60s)
-                cur.execute(
-                    f"SELECT image, COUNT(*) AS count FROM live_events "
-                    f"WHERE inserted_at >= {sql_now_minus(60, 'SECOND')} "
-                    f"GROUP BY image ORDER BY count DESC LIMIT 5"
-                )
-                bursts = [dict(r) for r in cur.fetchall()]
-
-                return jsonify({
-                    "eps_sma":        round(eps, 2),
-                    "beaconing":      beaconing,
-                    "process_bursts": bursts,
-                })
-    except Exception as exc:
-        return jsonify({"error": str(exc)})
-
-
 @app.route("/api/collector/metrics")
 def api_collector_metrics():
     return jsonify({"collector_available": False, "info": "Live collector removed"}), 503
-
-@app.route("/api/collector/metrics_DISABLED")
-def api_collector_metrics_orig():
-    if True:
-        return jsonify({
-            "error": "Collector not available (non-Windows or not started)",
-            "collector_available": False,
-        }), 503
-    try:
-        from sysmon_collector import get_pipeline_metrics  # noqa: PLC0415
-        metrics = get_pipeline_metrics()
-        metrics["collector_available"] = True
-        return jsonify(metrics)
-    except Exception as exc:
-        log.error("api_collector_metrics error: %s", exc)
-        return jsonify({"error": str(exc), "collector_available": False}), 500
 
 
 # ---------------------------------------------------------------------------
@@ -791,7 +639,6 @@ def api_collector_metrics_orig():
 # ---------------------------------------------------------------------------
 @app.route("/live")
 def live_dashboard():
-    """Live monitoring removed. Redirect to upload page."""
     flash("Live monitoring has been removed. Please upload a Sysmon XML file.")
     return redirect(url_for("welcome_page"))
 
@@ -819,7 +666,8 @@ def dashboard(run_id):
         else:
             log.info("[DASHBOARD] running fresh analysis for %s", safe_run_id)
             context = run_full_analysis(safe_run_id)
-            set_analysis_snapshot(safe_run_id, context)
+            if context and "recommended_action" in context:
+                set_analysis_snapshot(safe_run_id, context)
 
     if not context:
         flash("Analysis failed or expired. Please re-upload.", "error")
@@ -827,14 +675,12 @@ def dashboard(run_id):
 
     context["run_id"] = safe_run_id
     context.setdefault("baseline_execution_context", [])
-    context.setdefault(
-        "baseline_noise_count",
-        len(context["baseline_execution_context"]),
-    )
+    context.setdefault("baseline_noise_count", len(context["baseline_execution_context"]))
 
     return render_template(
         "index.html",
         run_id=safe_run_id,
+        current_user=get_current_user(),
         severity_counts=context.get("events_by_severity", {}),
         correlation_campaigns=context.get("correlation_campaigns", []),
         correlations_detail=context.get("correlations_detail", []),
@@ -870,9 +716,7 @@ def dashboard(run_id):
         medium_count=context.get("medium_count", 0),
         low_count=context.get("low_count", 0),
         detections_count=context.get("detections_count", 0),
-        events_by_severity=context.get(
-            "events_by_severity", {"high": 0, "medium": 0, "low": 0}
-        ),
+        events_by_severity=context.get("events_by_severity", {"high": 0, "medium": 0, "low": 0}),
         events_per_hour=context.get("events_per_hour", []),
         top_events=context.get("top_events", []),
         mitre_summary=context.get("mitre_summary", []),
@@ -883,11 +727,12 @@ def dashboard(run_id):
         correlations=context.get("correlations", []),
         timeline=list(context.get("timeline", []))[:50],
         baseline_noise_count=context.get("baseline_noise_count", 0),
-        baseline_execution_context=list(
-            context.get("baseline_execution_context", [])
-        )[:20],
+        baseline_execution_context=list(context.get("baseline_execution_context", []))[:20],
         baseline_stats=context.get("baseline_execution_context", []),
         top_dangerous_bursts=context.get("top_dangerous_bursts", []),
+        sequence_detections=context.get("sequence_detections", []),
+        attack_narrative=context.get("attack_narrative", {}),
+        recommended_action=context.get("recommended_action", "BASELINE"),
     )
 
 
@@ -906,8 +751,6 @@ def details():
         return redirect(url_for("dashboard", run_id=run_id))
 
     def _safe_ts(records):
-        """Convert any Timestamp/datetime objects to ISO strings for Jinja."""
-        import datetime
         out = []
         for rec in records:
             clean = {}
@@ -927,12 +770,15 @@ def details():
     else:
         import pandas as pd
         safe_dets = _safe_ts(
-            pd.DataFrame(raw_dets).fillna("").to_dict("records")
-            if raw_dets else []
+            pd.DataFrame(raw_dets).fillna("").to_dict("records") if raw_dets else []
         )
 
     raw_corrs = context.get("correlations", [])
-    safe_corrs = _safe_ts(raw_corrs) if raw_corrs and isinstance(raw_corrs[0] if raw_corrs else None, dict) else raw_corrs
+    safe_corrs = (
+        _safe_ts(raw_corrs)
+        if raw_corrs and isinstance(raw_corrs[0] if raw_corrs else None, dict)
+        else raw_corrs
+    )
 
     return render_template(
         "details.html",
@@ -941,6 +787,7 @@ def details():
         timeline=list(context.get("timeline", []))[:100],
         detections=safe_dets,
         correlations=safe_corrs,
+        current_user=get_current_user(),
     )
 
 
@@ -1122,30 +969,28 @@ def burst_view(burst_id):
     start = burst.get("start_time")
     end   = burst.get("end_time")
 
-    # Guard: if no time window, query by image+run_id only
     _burst_mode = "live" if run_id == "live" else "cases"
     try:
         with get_db_connection(_burst_mode) as conn:
             with get_cursor(conn) as cur:
+                # FIX-3: `user` quoted, explicit column list avoids reserved-word errors
+                _cols = (
+                    f"event_time, event_id, image, parent_image, command_line, "
+                    f"{_user_col}, pid, ppid, src_ip, dst_ip, dst_port, file_path, computer"
+                )
                 if image and start and end:
-                    # Sanitize timestamps before passing to MySQL
-                    from dashboard.db import sanitize_datetime as _sdt
-                    _start_s = _sdt(start) or start
-                    _end_s   = _sdt(end)   or end
+                    _start_s = sanitize_datetime(start) or start
+                    _end_s   = sanitize_datetime(end)   or end
                     cur.execute(
-                        f"SELECT event_time, event_id, image, parent_image, command_line, "
-                        f"{_user_col}, pid, ppid, src_ip, dst_ip, dst_port, file_path, computer "
-                        f"FROM events "
+                        f"SELECT {_cols} FROM events "
                         f"WHERE image = %s AND event_time >= %s AND event_time <= %s "
                         f"AND run_id = %s ORDER BY event_time LIMIT 500",
                         (image, _start_s, _end_s, run_id),
                     )
                 elif image:
-                    # Fallback: get all events for this image in this run
                     cur.execute(
-                        f"SELECT event_time, event_id, image, parent_image, command_line, "
-                        f"{_user_col}, pid, ppid, src_ip, dst_ip, dst_port, file_path, computer "
-                        f"FROM events WHERE image = %s AND run_id = %s "
+                        f"SELECT {_cols} FROM events "
+                        f"WHERE image = %s AND run_id = %s "
                         f"ORDER BY event_time LIMIT 500",
                         (image, run_id),
                     )
@@ -1177,11 +1022,7 @@ def burst_view(burst_id):
         risk_score += _RISK_HIGH_VOL_BONUS
     elif len(events) > 10:
         risk_score += _RISK_MED_VOL_BONUS
-    if any(
-        not _is_internal_ip(e["dst_ip"])
-        for e in events
-        if e.get("dst_ip")
-    ):
+    if any(not _is_internal_ip(e["dst_ip"]) for e in events if e.get("dst_ip")):
         risk_score += _RISK_EXTERNAL_BONUS
     risk_score = min(risk_score, _RISK_MAX)
 
@@ -1191,7 +1032,14 @@ def burst_view(burst_id):
         "start_time":  start,
         "end_time":    end,
         "event_count": len(events),
-        "risk_score":  risk_score,
+        "risk_score":  burst.get("peak_score") or risk_score,
+        "stage_cap":   burst.get("stage_cap", 100),
+        "kill_chain_stage": burst.get("kill_chain_stage", "Execution"),
+        "has_correlation":  burst.get("has_correlation", False),
+        "score_ledger":     burst.get("score_ledger", []),
+        "baseline_sub_scores": burst.get("baseline_sub_scores", {}),
+        "baseline_anomalies":  burst.get("baseline_anomalies", []),
+        "confidence_reasons":  burst.get("confidence_reasons", []),
         "event_ids":   [e.get("event_id") for e in events if e.get("event_id") is not None],
     }
     process_summary = {
@@ -1200,19 +1048,45 @@ def burst_view(burst_id):
         "processes": sorted({e.get("image") for e in events if e.get("image")}),
     }
 
-    # Sanitise timestamps for Jinja — Timestamp objects are not subscriptable
+    # FIX-2: Sanitise timestamps AND add field aliases so burst.html template
+    # can access both column name variants (dst_ip + destination_ip, etc.)
     safe_events = []
     for ev in events:
         clean = {}
         for k, v in ev.items():
             clean[k] = v.isoformat() if hasattr(v, 'isoformat') else v
+        # Add aliases so template works regardless of DB column naming
+        clean.setdefault("destination_ip",   clean.get("dst_ip"))
+        clean.setdefault("destination_port", clean.get("dst_port"))
+        clean.setdefault("target_filename",  clean.get("file_path"))
         safe_events.append(clean)
+
+    # ── Burst Storyline & Explainability ──
+    burst_detections = []
+    if context.get("detections"):
+        for d in context["detections"]:
+            # Match detection to this burst by image and time
+            if d.get("image") == image:
+                d_time = d.get("event_time") or d.get("utc_time")
+                if d_time and start and end and start <= str(d_time) <= end:
+                    burst_detections.append(d)
+
+    attack_story = build_attack_story(safe_events, burst_detections)
+    burst_meta["attack_story"] = attack_story
+    
+    # Grab the match_reason for explainability
+    if burst_detections:
+        top_det = max(burst_detections, key=lambda x: x.get("confidence_score", 0), default=None)
+        burst_meta["top_detection_reasons"] = top_det.get("match_reason", []) if top_det else []
+    else:
+        burst_meta["top_detection_reasons"] = []
 
     return render_template(
         "burst.html",
         burst=burst_meta,
         process_summary=process_summary,
         events=safe_events,
+        current_user=get_current_user(),
     )
 
 
@@ -1272,7 +1146,6 @@ def raw_events():
     offset    = (page - 1) * page_size
 
     try:
-        # FIX: uploaded cases live in sentinel_cases, not sentinel_live
         _raw_mode = "live" if run_id == "live" else "cases"
         with get_db_connection(_raw_mode) as conn:
             with get_cursor(conn) as cur:
@@ -1298,12 +1171,16 @@ def raw_events():
 
 
 # ---------------------------------------------------------------------------
-# Phase 2: Threat Hunting APIs
+# Threat Hunting APIs
 # ---------------------------------------------------------------------------
 
 @app.route("/api/hunt")
 def api_hunt():
-    """Ad-hoc threat hunt query against current run's events."""
+    """
+    Ad-hoc threat hunt query against current run's events.
+    FIX-1 ensures load_events() now returns parent_image, command_line,
+    destination_ip etc. so hunt field filters actually work.
+    """
     run_id = session.get("analysis_run_id") or request.args.get("run_id")
     query  = request.args.get("q", "").strip()
     if not run_id:
@@ -1314,7 +1191,6 @@ def api_hunt():
     try:
         result_df = hunt_query(df, query) if query else df
         result_df = result_df.head(500)
-        # Sanitise for JSON
         for col in result_df.columns:
             if result_df[col].dtype.name.startswith("datetime"):
                 result_df[col] = result_df[col].astype(str)
@@ -1326,17 +1202,14 @@ def api_hunt():
 
 @app.route("/api/process-tree/<run_id>")
 def api_process_tree(run_id):
-    """Return process tree for a run."""
     df = load_events(run_id)
     if df.empty:
         return jsonify({"tree": [], "flat": []})
     try:
-        # Add parent_image if missing in events
         if "parent_image" not in df.columns and "parent_process_id" in df.columns:
             df["parent_image"] = None
         roots = build_process_tree(df)
         flat  = flatten_process_tree(roots)
-        # Limit for JSON response
         return jsonify({"tree": roots[:200], "flat": flat[:500], "run_id": run_id})
     except Exception as exc:
         return jsonify({"error": str(exc), "tree": [], "flat": []})
@@ -1344,12 +1217,10 @@ def api_process_tree(run_id):
 
 @app.route("/api/beaconing/<run_id>")
 def api_beaconing(run_id):
-    """Detect beaconing patterns in uploaded run events."""
     df = load_events(run_id)
     if df.empty:
         return jsonify({"beacons": [], "run_id": run_id})
     try:
-        # Add destination_ip if not present (may be stored as dst_ip)
         if "destination_ip" not in df.columns and "dst_ip" in df.columns:
             df["destination_ip"] = df["dst_ip"]
         beacons = detect_beaconing(df)
@@ -1360,7 +1231,6 @@ def api_beaconing(run_id):
 
 @app.route("/api/iocs/<run_id>")
 def api_iocs(run_id):
-    """Extract IOCs from a run's events."""
     df = load_events(run_id)
     if df.empty:
         return jsonify({"iocs": [], "run_id": run_id})
@@ -1374,13 +1244,12 @@ def api_iocs(run_id):
 
 @app.route("/api/iocs/<run_id>/export.csv")
 def api_iocs_csv(run_id):
-    """Export IOCs as CSV."""
     df = load_events(run_id)
     if df.empty:
         return "No events", 404
+    import csv
     events = df.fillna("").to_dict(orient="records")
     iocs = extract_iocs(events, run_id=run_id)
-    import io, csv
     out = io.StringIO()
     w = csv.DictWriter(out, fieldnames=["ioc_type","ioc_value","confidence","source_field","first_seen","run_id"])
     w.writeheader()
@@ -1392,12 +1261,11 @@ def api_iocs_csv(run_id):
 
 
 # ---------------------------------------------------------------------------
-# Phase 3: SOC Verdict APIs
+# SOC Verdict APIs
 # ---------------------------------------------------------------------------
 
 @app.route("/api/verdict", methods=["POST"])
 def api_verdict():
-    """Submit a structured analyst verdict."""
     run_id = session.get("analysis_run_id")
     data   = request.get_json(silent=True) or {}
     incident_id = data.get("incident_id") or (f"INC-{run_id[:8]}" if run_id else None)
@@ -1413,7 +1281,6 @@ def api_verdict():
     try:
         verdict = create_verdict(incident_id, analyst_id, verdict_str, reason, evidence, notes)
 
-        # Persist to DB
         new_status = "Closed - True Positive" if verdict["is_true_positive"] else "Closed - False Positive"
         try:
             with get_db_connection("live") as conn:
@@ -1421,10 +1288,8 @@ def api_verdict():
                     cur.execute(
                         "UPDATE incidents SET status=%s, verdict=%s, verdict_reason=%s, "
                         "analyst=%s, updated_at=%s WHERE incident_id=%s",
-                        (new_status, verdict_str, reason, analyst_id,
-                         now_utc(), incident_id)
+                        (new_status, verdict_str, reason, analyst_id, now_utc(), incident_id)
                     )
-                    # Log to audit trail
                     cur.execute(
                         "INSERT INTO audit_log (analyst_id, action, target_type, target_id, detail) "
                         "VALUES (%s, %s, %s, %s, %s)",
@@ -1435,7 +1300,6 @@ def api_verdict():
         except Exception as db_exc:
             log.warning("Verdict DB persist failed: %s", db_exc)
 
-        # Invalidate cache
         if run_id:
             clear_analysis_snapshot(run_id)
 
@@ -1448,7 +1312,6 @@ def api_verdict():
 
 @app.route("/api/verdict/options")
 def api_verdict_options():
-    """Return available verdict options and state machine."""
     return jsonify({
         "verdicts":    VERDICT_OPTIONS,
         "transitions": {k: sorted(v) for k, v in {
@@ -1462,7 +1325,6 @@ def api_verdict_options():
 
 @app.route("/api/incident/<incident_id>/transition", methods=["POST"])
 def api_incident_transition(incident_id):
-    """Transition incident status with validation."""
     run_id     = session.get("analysis_run_id")
     data       = request.get_json(silent=True) or {}
     new_status = data.get("status", "")
@@ -1495,7 +1357,7 @@ def api_incident_transition(incident_id):
                     "INSERT INTO audit_log (analyst_id, action, target_type, target_id, detail) "
                     "VALUES (%s, %s, %s, %s, %s)",
                     (analyst_id, "status_transition", "incident", incident_id,
-                     f"{current} → {new_status}")
+                     f"{current} -> {new_status}")
                 )
             conn.commit()
 
@@ -1509,7 +1371,6 @@ def api_incident_transition(incident_id):
 
 @app.route("/api/score-breakdown/<run_id>")
 def api_score_breakdown(run_id):
-    """Return risk score breakdown for all bursts in a run."""
     context = get_analysis_snapshot(run_id)
     if not context:
         return jsonify({"error": "No analysis context — load dashboard first"}), 404
@@ -1520,71 +1381,73 @@ def api_score_breakdown(run_id):
 
 @app.route("/api/health")
 def api_health():
-    """Health check endpoint — DB status + collector status."""
     from dashboard.db import health_check as db_health
     db_results = db_health()
     return jsonify({
-        "status":     "ok" if all(db_results.values()) else "degraded",
-        "db":         db_results,
-        "collector":  _COLLECTOR_AVAILABLE,
-        "timestamp":  now_utc().isoformat(),
-        "version":    "2.0.0",
+        "status":    "ok" if all(db_results.values()) else "degraded",
+        "db":        db_results,
+        "timestamp": now_utc().isoformat(),
+        "version":   "2.0.0",
     })
 
 
 @app.route("/api/alerts/latest")
 def api_alerts_latest():
-    """Latest alerts for live polling from dashboard."""
     run_id = request.args.get("run_id") or session.get("analysis_run_id")
     try:
         mode = "live" if (not run_id or run_id == "live") else "cases"
         engine = get_engine(mode)
-        import pandas as pd
-        try:
-            df = pd.read_sql_query(
-                "SELECT COALESCE(utc_time, event_time) AS utc_time, "
-                "image, computer, rule_name, severity, mitre_id "
-                "FROM detections WHERE run_id = %s "
-                "ORDER BY COALESCE(utc_time, event_time) DESC LIMIT 20",
-                engine, params=(run_id or "live",)
-            )
-        except Exception:
-            df = pd.read_sql_query(
-                "SELECT event_time AS utc_time, image, computer, "
-                "rule_name, severity, mitre_id "
-                "FROM detections WHERE run_id = %s "
-                "ORDER BY event_time DESC LIMIT 20",
-                engine, params=(run_id or "live",)
-            )
+        df = pd.read_sql_query(
+            text("""
+SELECT 
+    event_time,
+    image,
+    computer,
+    rule_name,
+    severity,
+    mitre_id
+FROM detections
+WHERE run_id = :run_id
+ORDER BY event_time DESC
+LIMIT 20
+"""),
+            engine, params={"run_id": run_id or "live"}
+        )
         if df.empty:
             return jsonify({"alerts": []})
+            
+        if "utc_time" not in df.columns and "event_time" in df.columns:
+            df["utc_time"] = df["event_time"]
         for col in df.columns:
             if df[col].dtype.name.startswith("datetime"):
                 df[col] = df[col].astype(str)
         return jsonify({"alerts": df.fillna("").to_dict(orient="records")})
     except Exception as exc:
+        log.error("[ASYNC] Analysis failed for run_id=%s: %s", run_id, exc, exc_info=True)
+        _set_run_status(run_id, "failed")
         return jsonify({"alerts": [], "error": str(exc)})
 
 
 @app.route("/api/events/latest")
 def api_events_latest():
-    """Latest shell/script events for live polling."""
     run_id = request.args.get("run_id") or session.get("analysis_run_id")
     SHELL_IMAGES = ("powershell", "cmd", "wscript", "cscript", "mshta",
                     "rundll32", "regsvr32", "certutil", "bitsadmin")
     try:
         mode = "live" if (not run_id or run_id == "live") else "cases"
         engine = get_engine(mode)
-        import pandas as pd
         df = pd.read_sql_query(
-            f"SELECT event_time AS utc_time, image, command_line, "
-            f"COALESCE({_user_col}, '') AS user, computer "
-            f"FROM events WHERE run_id = %s ORDER BY event_time DESC LIMIT 100",
-            engine, params=(run_id or "live",)
+            text(f"SELECT event_time, image, command_line, "
+                 f"COALESCE({_user_col}, '') AS user, computer "
+                 f"FROM events WHERE run_id = :run_id ORDER BY event_time DESC LIMIT 100"),
+            engine, params={"run_id": run_id or "live"}
         )
         if not df.empty and "image" in df.columns:
             mask = df["image"].str.lower().str.contains("|".join(SHELL_IMAGES), na=False)
             df   = df[mask].head(20)
+            
+        if "utc_time" not in df.columns and "event_time" in df.columns:
+            df["utc_time"] = df["event_time"]
         for col in df.columns:
             if df[col].dtype.name.startswith("datetime"):
                 df[col] = df[col].astype(str)
@@ -1595,7 +1458,6 @@ def api_events_latest():
 
 @app.route("/triage")
 def triage_queue():
-    """SOC alert triage queue — unreviewed incidents by priority."""
     try:
         with get_db_connection("live") as conn:
             with get_cursor(conn) as cur:
@@ -1611,8 +1473,6 @@ def triage_queue():
         flash(f"Error loading triage queue: {exc}", "error")
         incidents = []
 
-    # Add SLA status to each
-    import datetime
     for inc in incidents:
         dl = inc.get("sla_deadline")
         if dl:
@@ -1626,20 +1486,51 @@ def triage_queue():
         if "sla" not in inc:
             inc["sla"] = {"breached": False, "label": "No SLA set", "color": "gray"}
 
+    # ── Enrich incidents with attack storyline + explainability ─────────────
+    for inc in incidents:
+        run_id_key = inc.get("run_id")
+        if run_id_key:
+            try:
+                snap = get_analysis_snapshot(run_id_key)
+                if snap:
+                    inc["attack_story"]          = snap.get("attack_story")
+                    inc["kill_chain_depth"]       = snap.get("kill_chain_depth", 0)
+                    # Gather top match_reason list from the most severe detection
+                    all_dets = snap.get("detections", [])
+                    if all_dets:
+                        top_det = max(
+                            all_dets,
+                            key=lambda d: d.get("confidence_score", 0) if isinstance(d, dict) else 0,
+                            default=None,
+                        )
+                        inc["top_detection_reasons"] = (
+                            top_det.get("match_reason", []) if isinstance(top_det, dict) else []
+                        )
+                    else:
+                        inc["top_detection_reasons"] = []
+            except Exception:
+                inc["attack_story"]          = None
+                inc["top_detection_reasons"] = []
+
     return render_template(
         "triage.html",
         incidents=incidents,
         total=len(incidents),
         unreviewed=sum(1 for i in incidents if i["status"] == "New"),
+        current_user=get_current_user(),
     )
 
 
 @app.route("/hunt")
 def hunt_console():
-    """Threat hunt query console."""
     run_id = session.get("analysis_run_id")
     query  = request.args.get("q", "")
-    return render_template("hunt_console.html", run_id=run_id, query=query)
+    return render_template(
+        "hunt_console.html",
+        run_id=run_id,
+        query=query,
+        current_user=get_current_user(),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1650,4 +1541,8 @@ if __name__ == "__main__":
     init_db()
     ensure_default_admin()
     log.info(">>> Starting Flask dashboard on http://127.0.0.1:5000")
-    app.run(host="127.0.0.1", port=5000, debug=False)
+    
+    # ── [10/10] No reloader opt-out ──────────────────────────────────────────
+    # If NO_RELOAD=1 is set, we bypass the parent process/double-import cost.
+    use_reload = os.environ.get("NO_RELOAD") != "1"
+    app.run(host="127.0.0.1", port=5000, debug=True, use_reloader=use_reload)

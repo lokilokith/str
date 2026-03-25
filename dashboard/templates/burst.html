@@ -95,12 +95,15 @@ body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(
     <div class="eyebrow">Burst Analysis</div>
     <h1>
       {{ burst.image }}
-      <span class="badge b-{% if burst.risk_score >= 70 %}red{% elif burst.risk_score >= 40 %}amber{% else %}cyan{% endif %}">
-        Risk {{ burst.risk_score }}/{{ burst.stage_cap or 100 }}
+      <span class="badge b-{% if burst.risk_score >= 75 %}red{% elif burst.risk_score >= 45 %}amber{% else %}cyan{% endif %}">
+        Risk {{ burst.risk_score }}/100
       </span>
-      <span class="badge b-{% if burst.kill_chain_stage in ['Actions on Objectives','Command and Control'] %}red{% elif burst.kill_chain_stage in ['Persistence','Privilege Escalation'] %}amber{% else %}cyan{% endif %}">
+      <span class="badge b-{% if burst.risk_score >= 75 %}red{% elif burst.risk_score >= 45 %}amber{% else %}cyan{% endif %}">
         {{ burst.kill_chain_stage or 'Execution' }}
       </span>
+      {% if burst.stage_hint %}
+      <span class="badge b-purple" style="margin-left:4px">Hint: {{ burst.stage_hint }}</span>
+      {% endif %}
     </h1>
     <div class="sub">
       ID: {{ burst.burst_id }}
@@ -111,9 +114,9 @@ body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(
 
   {# Meta strip #}
   <div class="meta-strip">
-    <div class="meta-card {% if burst.risk_score >= 70 %}c-red{% elif burst.risk_score >= 40 %}c-amber{% else %}{% endif %}">
+    <div class="meta-card {% if burst.risk_score >= 75 %}c-red{% elif burst.risk_score >= 45 %}c-amber{% else %}{% endif %}">
       <div class="meta-label">Risk Score</div>
-      <div class="meta-val" style="color:{% if burst.risk_score >= 70 %}var(--red){% elif burst.risk_score >= 40 %}var(--amber){% else %}var(--cyan){% endif %}">
+      <div class="meta-val" style="color:{% if burst.risk_score >= 75 %}var(--red){% elif burst.risk_score >= 45 %}var(--amber){% else %}var(--cyan){% endif %}">
         {{ burst.risk_score }}<span style="font-size:14px;color:var(--muted)">/{{ burst.stage_cap or 100 }}</span>
       </div>
       <div class="meta-sub">Stage cap: {{ burst.stage_cap or 100 }}</div>
@@ -125,8 +128,8 @@ body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(
     </div>
     <div class="meta-card">
       <div class="meta-label">Classification</div>
-      <span class="badge b-{% if burst.risk_score >= 40 %}red{% else %}gray{% endif %}">
-        {% if burst.risk_score >= 40 %}Attack Candidate{% else %}Background{% endif %}
+      <span class="badge b-{% if burst.risk_score >= 75 %}red{% elif burst.risk_score >= 45 %}amber{% else %}gray{% endif %}">
+        {% if burst.risk_score >= 75 %}Confirmed Attack{% elif burst.risk_score >= 45 %}Attack Candidate{% else %}Background{% endif %}
       </span>
       {% if burst.has_correlation %}<div style="margin-top:6px"><span class="badge b-purple">Multi-stage Campaign</span></div>{% endif %}
     </div>
@@ -140,6 +143,39 @@ body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(
       </div>
     </div>
   </div>
+
+  {# Attack Storyline #}
+  {% if burst.attack_story and burst.attack_story.steps %}
+  <div class="card" style="margin-bottom:14px; background:rgba(0,212,255,0.03); border-color:rgba(0,212,255,0.2); animation:fadeUp .4s .08s ease both">
+    <div class="card-hdr" style="color:var(--cyan)">⚡ Attack Storyline</div>
+    <div class="card-body" style="padding:20px">
+      <div style="display:flex; flex-wrap:wrap; gap:10px; align-items:center">
+        {% for step in burst.attack_story.steps %}
+          <div style="padding:8px 14px; background:rgba(0,212,255,0.08); border:1px solid rgba(0,212,255,0.15); border-radius:8px; font-size:12.5px; font-family:var(--mono); color:var(--text)">
+            <span style="color:var(--cyan); font-weight:700; margin-right:6px">{{ loop.index }}.</span> {{ step }}
+          </div>
+          {% if not loop.last %}
+            <div style="color:var(--dim); font-size:18px">→</div>
+          {% endif %}
+        {% endfor %}
+      </div>
+    </div>
+  </div>
+  {% endif %}
+
+  {# Detection Explainability #}
+  {% if burst.top_detection_reasons %}
+  <div class="card" style="margin-bottom:14px; background:rgba(255,184,0,0.03); border-color:rgba(255,184,0,0.2); animation:fadeUp .4s .09s ease both">
+    <div class="card-hdr" style="color:var(--amber)">🔍 Detection Explainability</div>
+    <div class="card-body" style="padding:20px">
+      {% for reason in burst.top_detection_reasons %}
+        <div style="font-size:13px; color:var(--text); margin-bottom:8px; padding-left:14px; border-left:3px solid var(--amber); line-height:1.4">
+          <span style="color:var(--amber); font-weight:800; font-size:10px; text-transform:uppercase; margin-right:10px; letter-spacing:0.5px">Insight</span> {{ reason }}
+        </div>
+      {% endfor %}
+    </div>
+  </div>
+  {% endif %}
 
   <div class="grid-2">
     {# Score Ledger #}
@@ -177,13 +213,18 @@ body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(
         <div class="sub-grid">
           {% for factor, val in burst.baseline_sub_scores.items() %}
           {% set pct = (val * 100)|int %}
-          {% set col = 'var(--red)' if pct >= 70 else 'var(--amber)' if pct >= 40 else 'var(--cyan)' %}
+          {% set col = 'var(--red)' if pct >= 75 else 'var(--amber)' if pct >= 45 else 'var(--cyan)' %}
           <div class="sub-cell">
             <div class="sub-label">{{ factor }}</div>
             <div class="sub-bar"><div class="sub-fill" style="width:{{ pct }}%;background:{{ col }}"></div></div>
             <div class="sub-val" style="color:{{ col }}">{{ pct }}%</div>
           </div>
           {% endfor %}
+        </div>
+        {% elif burst.baseline_count and burst.baseline_count > 0 %}
+        <div style="color:var(--cyan);font-size:12px;padding:10px;background:rgba(0,212,255,0.05);border:1px solid rgba(0,212,255,0.1);border-radius:8px">
+            <strong>Baseline observed:</strong> {{ burst.baseline_count }} historical events matching this entity.
+            <div style="font-size:11px;color:var(--muted);margin-top:4px">Anomaly depth is being calculated based on these {{ burst.baseline_count }} samples.</div>
         </div>
         {% else %}
         <div style="color:var(--dim);font-size:12px;font-style:italic">No baseline data for this burst.</div>
@@ -228,6 +269,27 @@ body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(
       </div>
     </div>
   </div>
+
+  {# IOC Summary (NEW) #}
+  {% if burst.iocs %}
+  <div class="card" style="margin-bottom:14px; animation:fadeUp .4s .12s ease both">
+    <div class="card-hdr">Indicators of Compromise (IOCs)</div>
+    <div class="card-body" style="padding:0">
+      <table class="data-table">
+        <thead><tr><th>Type</th><th>Value</th><th>Context</th></tr></thead>
+        <tbody>
+          {% for ioc in burst.iocs %}
+          <tr>
+            <td class="mono" style="color:var(--cyan)">{{ ioc.type }}</td>
+            <td class="mono" style="word-break:break-all">{{ ioc.value }}</td>
+            <td style="color:var(--muted)">{{ ioc.context | default('—') }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+  {% endif %}
 
   {# Event timeline #}
   <div class="card" style="animation-delay:.15s">

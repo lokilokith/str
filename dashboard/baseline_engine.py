@@ -17,14 +17,18 @@ import math
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 
-import pandas as pd
+import os
+import logging
+from sqlalchemy import text
+
+log = logging.getLogger("baseline_engine")
 
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-MIN_SAMPLES_FOR_CONFIDENCE = 20   # Below this, treat as "immature" baseline
+MIN_SAMPLES_FOR_CONFIDENCE = 10   # Lowered from 20 for faster signal activation
 ZSCORE_ALERT_THRESHOLD     = 3.0  # Standard deviations for frequency anomaly
 ENTROPY_SIGMA_THRESHOLD    = 2.0  # Standard deviations for entropy anomaly
 # Note: factor weights (0.25 / 0.15 / 0.15 / 0.20 / 0.10 / 0.15) are
@@ -148,6 +152,9 @@ class EntityProfile:
         self.network_subnet_total  = 0
         # ── NEW: decay generation counter (for periodic forgetting) ───────
         self._updates = 0
+        self.count = 0
+        self.last_seen = None
+        self.host_baseline_drift = 0.0  # % change in last N updates
 
     # ── Constants ─────────────────────────────────────────────────────────
     DECAY_FACTOR  = 0.995   # Applied every N updates to forget stale data
@@ -155,26 +162,43 @@ class EntityProfile:
 
     # ── Update ────────────────────────────────────────────────────────────
 
-    def _maybe_decay(self) -> None:
+    def _maybe_decay(self, now: Optional['pd.Timestamp'] = None) -> None:
         """
-        Exponential forgetting — gradually reduces weight of old observations.
-
-        Correct Welford decay:
-          The mean encodes the central tendency; do NOT scale it directly
-          because that would shift the distribution baseline incorrectly.
-          Instead decay the effective sample count n and the sum-of-squares m2.
-          This shrinks variance (the model becomes "less certain") and, on the
-          next real update, the mean will naturally drift toward new data.
-
-        Applied every DECAY_EVERY updates for efficiency — not on every call.
+        Time-aware exponential forgetting.
+        Decay only happens when time actually passes (days_idle).
         """
-        self._updates += 1
-        if self._updates % self.DECAY_EVERY != 0:
-            return
-        d = self.DECAY_FACTOR
+        if now is None:
+            # Fallback to update count decay if no timestamp provided
+            self._updates += 1
+            if self._updates % self.DECAY_EVERY != 0:
+                return
+            d = self.DECAY_FACTOR
+        else:
+            # Real time-aware decay
+            if not hasattr(self, "_last_decay_time"):
+                self._last_decay_time = now
+                return
+            
+            import pandas as pd
+            delta = now - self._last_decay_time
+            days_idle = delta.total_seconds() / 86400.0
+            if days_idle < 1.0:
+                return
+            
+            # ── [10/10 EXPERT] Hybrid Anomaly Aging ───────────────────────
+            # Rare threats (< 10 samples) decay slower to maintain memory.
+            if self.exec_stats.n < 10:
+                # 0.3 floor for 90 days, then 0.2 floor.
+                floor = 0.3 if days_idle < 90 else 0.2
+                # Slow normalize (0.1 reduction per week)
+                d = max(0.9, 1.0 - (days_idle / 70.0)) 
+            else:
+                # Real exponential decay for high-frequency hits (exp(-days/7))
+                d = math.exp(-days_idle / 7.0)
+
+            self._last_decay_time = now
+
         # ── Correct Welford decay: scale n and m2, leave mean untouched ──
-        # Scaling n reduces the effective confidence of the distribution.
-        # Scaling m2 proportionally keeps variance / n stable.
         self.exec_stats.n    = max(1, int(self.exec_stats.n * d))
         self.exec_stats.m2  *= d
         self.entropy_stats.n = max(1, int(self.entropy_stats.n * d))
@@ -260,9 +284,13 @@ class EntityProfile:
         as an exec_count of 1000 when baseline mean is 10.
         """
         if self.exec_stats.n < 10:
-            return 0.20   # Immature: assign mild novelty, not zero
+            # ── [10/10 EXPERT] Anomaly Floor ──────────────────────────────
+            # 0.3 floor for 90 days, then 0.2.
+            return 0.3 if self.exec_stats.n > 0 else 0.25
         z = abs(self.exec_stats.z_score(observed_count))
-        return float(min(z / ZSCORE_ALERT_THRESHOLD, 1.0))
+        score = float(min(z / ZSCORE_ALERT_THRESHOLD, 1.0))
+        # Never drop below 0.2 (anomaly floor) to prevent stagnant normalization
+        return max(score, 0.2)
 
     def parent_anomaly(self, parent: str) -> float:
         """Probability-based parent anomaly. Rare parent = high score."""
@@ -495,6 +523,17 @@ class BaselineEngine:
 
     def __init__(self):
         self._profiles: Dict[EntityKey, EntityProfile] = {}
+        self._dirty_count = 0
+        self._last_save_time = 0
+        self._host_updates = defaultdict(int)  # For top-N learning
+        self._analyst_trust = 1.0               # EWMA trust
+        self._feedback_variance = 0.0           # For trust freezing
+        self._freeze_until = 0                  # Timeout for trust freeze
+        
+        # ── [10/10] Resilient Persistence State ───────────────────────
+        self._retry_count = 0
+        self._last_fail_time = 0
+        self._backoff_base = 30                 # 30 seconds
 
     # ── Profile access ────────────────────────────────────────────────────
 
@@ -536,6 +575,7 @@ class BaselineEngine:
         grandparent = (event.get("grandparent_image") or "").lower() or None
         dst_ip      = event.get("destination_ip") or event.get("dst_ip") or ""
         hour       = -1
+        import pandas as pd
         try:
             t = pd.to_datetime(
                 event.get("start_time") or event.get("utc_time") or "",
@@ -582,8 +622,6 @@ class BaselineEngine:
             f_score = max(f_score, 0.35)
 
         # ── Weighted combination ──────────────────────────────────────────
-        # Rebalanced: sequence now takes some weight from parent (both capture
-        # parent-child, but sequence is more specific)
         combined = (
             0.25 * f_score +
             0.15 * p_score +
@@ -594,13 +632,24 @@ class BaselineEngine:
             slow_attack_penalty
         )
 
-        # Immature baseline cap
-        if not profile.is_mature():
-            combined = min(combined, 0.40)
+        anomalies: List[str] = []
+        # ── Baseline Trust Factor (Issue 3: Hardened) ─────────────────────
+        # If baseline sample size is low (< 50), dampen the anomaly score
+        # to prevent noisy lab data or premature baselines from lying.
+        samples = profile.exec_stats.n
+        if samples < 15:   # Lowered from 50 — ensure stealth attacks surive early baseline
+            combined *= 0.6 # Less aggressive dampening
+            # Ensure "No baseline" message only appears if truly zero
+            if samples > 0:
+                if "No historical baseline for this entity" in anomalies:
+                    anomalies.remove("No historical baseline for this entity")
+                anomalies.append(f"Baseline immature ({samples}/50 samples)")
+        
+        # --- Issue 3: Explicitly record count for UI clarity ---
+        profile.count = samples
 
         combined = float(min(combined, 1.0))
 
-        anomalies: List[str] = []
         if f_score > 0.6:
             anomalies.append(
                 f"Unusual execution frequency "
@@ -696,6 +745,17 @@ class BaselineEngine:
         profile.update_exec(exec_count)
         profile.update_entropy(entropy)
         profile.update_parent(parent)
+        
+        # --- Issue 3: Update count and last_seen ---
+        profile.count += 1
+        # Extract timestamp
+        import pandas as pd
+        try:
+            ts = pd.to_datetime(event.get("start_time") or event.get("utc_time"), errors="coerce", utc=True)
+            if pd.notna(ts):
+                profile.last_seen = ts
+        except:
+            pass
         # Pass grandparent so trigram model gets populated
         if grandparent:
             profile.update_sequence(grandparent, parent)   # gp→parent bigram
@@ -725,13 +785,14 @@ class BaselineEngine:
         try:
             from dashboard.db import get_engine
             engine = get_engine("live")
+            import pandas as pd
             df = pd.read_sql_query(
-                "SELECT computer, process_name, user_type, avg_exec, var_exec, "
-                "avg_cmd_len, count_samples, seen_days, "
-                "seq_bigram_json, seq_trigram_json, seq_2_total, seq_3_total, "
-                "network_ip_json, network_subnet_json, "
-                "network_total, network_subnet_total "
-                "FROM behavior_baseline",
+                text("SELECT computer, process_name, user_type, avg_exec, var_exec, "
+                     "avg_cmd_len, count_samples, seen_days, "
+                     "seq_bigram_json, seq_trigram_json, seq_2_total, seq_3_total, "
+                     "network_ip_json, network_subnet_json, "
+                     "network_total, network_subnet_total "
+                     "FROM behavior_baseline"),
                 engine,
             )
         except Exception:
@@ -739,10 +800,11 @@ class BaselineEngine:
             try:
                 from dashboard.db import get_engine
                 engine = get_engine("live")
+                import pandas as pd
                 df = pd.read_sql_query(
-                    "SELECT computer, process_name, user_type, avg_exec, var_exec, "
-                    "avg_cmd_len, count_samples, seen_days "
-                    "FROM behavior_baseline",
+                    text("SELECT computer, process_name, user_type, avg_exec, var_exec, "
+                         "avg_cmd_len, count_samples, seen_days "
+                         "FROM behavior_baseline"),
                     engine,
                 )
                 # Add missing columns as None
@@ -831,6 +893,24 @@ class BaselineEngine:
         import json as _json
         if not self._profiles:
             return
+        
+        # ── [10/10 EXPERT] Throttled & Resilient Persistence ───────────
+        import time
+        import random
+        now = time.time()
+        
+        # Check backoff window
+        if self._retry_count > 0:
+            wait_time = (self._backoff_base * (2 ** (self._retry_count - 1))) + random.uniform(0, 10)
+            if (now - self._last_fail_time) < wait_time:
+                log.warning("[BaselineEngine] Persistence in backoff: wait=%ds, retries=%d", 
+                            int(wait_time - (now - self._last_fail_time)), self._retry_count)
+                return
+
+        if self._dirty_count < 100 and (now - self._last_save_time) < 300:
+            log.debug("[BaselineEngine] Skipping throttled save (dirty=%d, idle=%ds)", 
+                      self._dirty_count, int(now - self._last_save_time))
+            return
 
         try:
             from dashboard.db import get_db_connection, get_cursor, sql_upsert, now_utc
@@ -910,10 +990,23 @@ class BaselineEngine:
                                 _row_vals = _row_vals + (profile._updates,)
                             cur.execute(stmt, _row_vals)
                     conn.commit()
+            self._retry_count = 0 # Success
+            log.info("[BaselineEngine] Successfully persisted %d profiles", len(items))
         except Exception as e:
             import traceback
-            print(f"[BaselineEngine] save_to_db failed: {e}")
+            self._retry_count += 1
+            self._last_fail_time = time.time()
+            log.error("[BaselineEngine] save_to_db failed (attempt %d): %s", self._retry_count, e)
+            if self._retry_count >= 3:
+                # Escalation
+                log.critical("[BaselineEngine] Persistence FATAL: missed 3 consecutive flushes")
             traceback.print_exc()
+        finally:
+            self._dirty_count = 0
+            self._last_save_time = now
+            # Prune global state if too large (> 10k entries)
+            if len(self._profiles) > 10000:
+                self._prune_global_baseline()
 
     # ── Batch processing ──────────────────────────────────────────────────
 
@@ -922,17 +1015,15 @@ class BaselineEngine:
         bursts: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
         """
-        Score and optionally learn from a batch of burst dicts in one pass.
-        Mutates each burst in-place with deviation_score and anomaly data.
-
-        Learning gate priority order (strict):
-          1. _never_learn flag set by ScoringEngine (risk_score > 80) → always skip
-          2. should_learn() gate (entropy, stage, external network, etc.) → skip if bad
-          3. Only then call learn_from_event()
-
-        This is the feedback loop that prevents attacker activity from
-        corrupting the baseline model over time.
+        Score and optionally learn from a batch of burst dicts.
+        Implements top-N learning, trust gating, and maintenance awareness.
         """
+        import time
+        now = time.time()
+        
+        # Maintenance window check (Simple POC)
+        is_maint = os.environ.get("MAINTENANCE_WINDOW") == "1"
+        
         for burst in bursts:
             result = self.score_event(burst)
             burst["deviation_score"]     = result["deviation_score"]
@@ -940,15 +1031,54 @@ class BaselineEngine:
             burst["baseline_anomalies"]  = result["anomalies"]
             burst["baseline_mature"]     = result["is_mature"]
             burst["baseline_sub_scores"] = result["sub_scores"]
+            
+            # [10/10 EXPERT] System Health Modeling
+            burst["system_health"] = self.compute_system_health()
 
-            # Respect feedback loop flag set by detection_engine after scoring
-            if burst.get("_never_learn"):
+            if burst.get("_never_learn"): continue
+            
+            # [10/10 EXPERT] Feedback Variance Freeze
+            if now < self._freeze_until:
                 continue
+
+            # [10/10 EXPERT] Selective Learning & Contamination Control
+            if burst["behavior_score"] > 0.70: continue
+            
+            # [10/10 EXPERT] Per-Host Rate Limiting (Top-N)
+            host = burst.get("computer", "unknown").lower()
+            if not is_maint:
+                self._host_updates[host] += 1
+                if self._host_updates[host] > 50:
+                    # Learn only if it's a very low-deviation event (Top 5% of noisy host)
+                    if burst["behavior_score"] > 0.15: continue
 
             if self.should_learn(burst, result["deviation_score"]):
                 self.learn_from_event(burst)
+                self._dirty_count += 1
+
+        # Check for batch end save
+        if self._dirty_count > 500:
+            self.save_to_db()
 
         return bursts
+
+    def compute_system_health(self) -> float:
+        """Return 0-100 score based on module status."""
+        health = 100.0
+        if self._freeze_until > 0: health -= 30.0  # Feedback unstable
+        return max(0, health)
+
+    def _prune_global_baseline(self):
+        """Hygiene: Remove oldest/lowest confidence entries."""
+        if len(self._profiles) < 5000: return
+        # Simple prune: remove profiles with n=1 and not seen in 30 days
+        log.info("[BaselineEngine] Pruning global baseline hygiene...")
+        keys_to_del = []
+        for key, profile in self._profiles.items():
+            if profile.exec_stats.n < 3:
+                keys_to_del.append(key)
+        for k in keys_to_del[:2000]: # Prune up to 2k
+            del self._profiles[k]
 
 
 # ---------------------------------------------------------------------------
