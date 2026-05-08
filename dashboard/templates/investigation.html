@@ -12,40 +12,53 @@
         table { border-collapse: collapse; width: 100%; margin-bottom: 2rem; background-color: #ffffff; }
         th, td { border: 1px solid #dddddd; padding: 0.5rem 0.75rem; text-align: left; font-size: 0.9rem; }
         th { background-color: #f0f0f0; }
-        tr:nth-child(even) { background-color: #fafafa; }
-        
-        /* Context Assessment Box */
-        .context-verdict {
-            background: #fff;
-            border-left: 4px solid #1976d2;
-            padding: 12px;
-            margin: 16px 0;
-            font-size: 13px;
-            line-height: 1.5;
+        .collapsible-section {
+            max-height: 400px;
+            overflow: hidden;
+            transition: max-height 0.3s ease-out;
+            position: relative;
         }
-        .context-verdict strong {
-            color: #1976d2;
+        .collapsible-section.expanded {
+            max-height: 5000px;
         }
-        
-        /* Table subsection labels */
-        .table-context {
+        .toggle-btn {
+            background: #eee;
+            border: 1px solid #ddd;
+            padding: 4px 12px;
+            border-radius: 4px;
             font-size: 11px;
-            color: #777;
-            margin: -12px 0 12px 0;
-            font-style: italic;
+            cursor: pointer;
+            margin-bottom: 8px;
         }
+        .toggle-btn:hover { background: #e5e5e5; }
+        .collapse-overlay {
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            height: 40px;
+            background: linear-gradient(transparent, #fff);
+            pointer-events: none;
+        }
+        .expanded .collapse-overlay { display: none; }
     </style>
+    <script>
+        function toggleSection(id) {
+            const el = document.getElementById(id);
+            el.classList.toggle('expanded');
+            const btn = el.previousElementSibling;
+            btn.innerText = el.classList.contains('expanded') ? 'Collapse View' : 'Expand Full View';
+        }
+    </script>
 </head>
 <body>
-    <h1>{{ title }}</h1>
+    <h1>{{ title | default('Process Investigation') }}</h1>
     <p><a href="{{ url_for('dashboard', run_id=session.get('analysis_run_id','')) }}">&larr; Back to dashboard</a></p>
-
-
 
     <!-- ===== CONTEXT VERDICT BOX (REQUIRED) ===== -->
     <div class="context-verdict">
         <strong>Context Assessment:</strong><br>
-        PowerShell execution was observed {% if timeline %}{{ timeline | length }} time(s){% else %}in this dataset{% endif %}, 
+        Process execution was observed {% if timeline %}{{ timeline | length }} time(s){% else %}in this dataset{% endif %}, 
         primarily launched by <em>{{ parents[0].parent_image if parents else 'unknown parent' }}</em>.
         No evidence of payload delivery, persistence mechanisms, or command-and-control activity was observed in this telemetry.
         <br><br>
@@ -59,45 +72,49 @@
     </p>
 
     <!-- ===== TIMELINE ===== -->
-    <h2>Execution Timeline (Repeated PowerShell Activity)</h2>
+    <h2>Execution Timeline (Repeated Activity)</h2>
     <p class="table-context">
-        Shows when PowerShell ran, which event types were logged, and process identifiers.
+        Shows when the process ran, which event types were logged, and process identifiers.
     </p>
-    <table>
-        <thead>
-        <tr>
-            <th>Time (UTC)</th>
-            <th>Event ID</th>
-            <th>Description</th>
-            <th>Image</th>
-            <th>Computer</th>
-            <th>Process ID</th>
-            <th>Parent image</th>
-        </tr>
-        </thead>
-        <tbody>
-        {% if timeline %}
-            {% for ev in timeline %}
+    <button class="toggle-btn" onclick="toggleSection('timeline-sec')">Expand Full View</button>
+    <div id="timeline-sec" class="collapsible-section">
+        <table>
+            <thead>
             <tr>
-                <td>{{ ev.utc_time }}</td>
-                <td>{{ ev.event_id }}</td>
-                <td>{{ ev.description }}</td>
-                <td>{{ ev.image }}</td>
-                <td>{{ ev.computer }}</td>
-                <td>{{ ev.process_id }}</td>
-                <td>{{ ev.parent_image }}</td>
+                <th>Time (UTC)</th>
+                <th>Event ID</th>
+                <th>Description</th>
+                <th>Image</th>
+                <th>Computer</th>
+                <th>Process ID</th>
+                <th>Parent image</th>
             </tr>
-            {% endfor %}
-        {% else %}
-        <tr><td colspan="7" style="color:#999;">No timeline events available.</td></tr>
-        {% endif %}
-        </tbody>
-    </table>
+            </thead>
+            <tbody>
+            {% if timeline %}
+                {% for ev in timeline %}
+                <tr>
+                    <td>{{ ev.utc_time | default('—') }}</td>
+                    <td>{{ ev.event_id | default('—') }}</td>
+                    <td>{{ ev.description | default('—') }}</td>
+                    <td>{{ ev.image | default('—') }}</td>
+                    <td>{{ ev.computer | default('—') }}</td>
+                    <td>{{ ev.process_id | default('—') }}</td>
+                    <td>{{ ev.parent_image | default('—') }}</td>
+                </tr>
+                {% endfor %}
+            {% else %}
+            <tr><td colspan="7" style="color:#999;">No timeline events available.</td></tr>
+            {% endif %}
+            </tbody>
+        </table>
+        <div class="collapse-overlay"></div>
+    </div>
 
     <!-- ===== PARENT PROCESSES ===== -->
-    <h2>Who launches PowerShell?</h2>
+    <h2>Who launches this process?</h2>
     <p class="table-context">
-        Indicates whether PowerShell was user-initiated, service-driven, or automated.
+        Indicates whether execution was user-initiated, service-driven, or automated.
     </p>
     <table>
         <thead>
@@ -110,8 +127,8 @@
         {% if parents %}
             {% for row in parents %}
             <tr>
-                <td>{{ row.parent_image }}</td>
-                <td>{{ row.count }}</td>
+                <td>{{ row.parent_image | default('—') }}</td>
+                <td>{{ row.count | default(0) }}</td>
             </tr>
             {% endfor %}
         {% else %}
@@ -121,7 +138,7 @@
     </table>
 
     <!-- ===== CHILD PROCESSES ===== -->
-    <h2>What does PowerShell spawn?</h2>
+    <h2>What does this process spawn?</h2>
     <p class="table-context">
         Child processes may indicate follow-on execution, scripting behavior, or system administration tasks.
     </p>
@@ -136,8 +153,8 @@
         {% if children %}
             {% for row in children %}
             <tr>
-                <td>{{ row.image }}</td>
-                <td>{{ row.count }}</td>
+                <td>{{ row.image | default('—') }}</td>
+                <td>{{ row.count | default(0) }}</td>
             </tr>
             {% endfor %}
         {% else %}
@@ -147,40 +164,44 @@
     </table>
 
     <!-- ===== DETECTIONS ===== -->
-    <h2>Detection hits involving PowerShell</h2>
+    <h2>Detection hits involving this process</h2>
     <p class="table-context">
         Rules that fired during this process execution window.
     </p>
-    <table>
-        <thead>
-        <tr>
-            <th>Time (UTC)</th>
-            <th>Rule ID</th>
-            <th>Rule name</th>
-            <th>MITRE ID</th>
-            <th>Tactic</th>
-            <th>Severity</th>
-            <th>Context</th>
-        </tr>
-        </thead>
-        <tbody>
-        {% if detections %}
-            {% for d in detections %}
+    <button class="toggle-btn" onclick="toggleSection('det-sec')">Expand Full View</button>
+    <div id="det-sec" class="collapsible-section">
+        <table>
+            <thead>
             <tr>
-                <td>{{ d.utc_time }}</td>
-                <td>{{ d.rule_id }}</td>
-                <td>{{ d.rule_name }}</td>
-                <td>{{ d.mitre_id }}</td>
-                <td>{{ d.mitre_tactic }}</td>
-                <td>{{ d.severity }}</td>
-                <td>{{ d.context }}</td>
+                <th>Time (UTC)</th>
+                <th>Rule ID</th>
+                <th>Rule name</th>
+                <th>MITRE ID</th>
+                <th>Tactic</th>
+                <th>Severity</th>
+                <th>Context</th>
             </tr>
-            {% endfor %}
-        {% else %}
-        <tr><td colspan="7" style="color:#999;">No detection hits for this process.</td></tr>
-        {% endif %}
-        </tbody>
-    </table>
+            </thead>
+            <tbody>
+            {% if detections %}
+                {% for d in detections %}
+                <tr>
+                    <td>{{ d.utc_time | default('—') }}</td>
+                    <td>{{ d.rule_id | default('—') }}</td>
+                    <td>{{ d.rule_name | default('—') }}</td>
+                    <td>{{ d.mitre_id | default('—') }}</td>
+                    <td>{{ d.mitre_tactic | default('—') }}</td>
+                    <td>{{ d.severity | default('—') }}</td>
+                    <td>{{ d.context | default('—') }}</td>
+                </tr>
+                {% endfor %}
+            {% else %}
+            <tr><td colspan="7" style="color:#999;">No detection hits for this process.</td></tr>
+            {% endif %}
+            </tbody>
+        </table>
+        <div class="collapse-overlay"></div>
+    </div>
 
     <p style="font-size:11px; color:#999; margin-top:40px; padding-top:20px; border-top:1px solid #ddd;">
         Process detail view for <strong>{{ title }}</strong>. Shows timeline, parent/child relationships, and detection matches.

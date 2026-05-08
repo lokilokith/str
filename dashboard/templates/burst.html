@@ -94,52 +94,54 @@ body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(
   <div class="page-hdr">
     <div class="eyebrow">Burst Analysis</div>
     <h1>
-      {{ burst.image }}
-      <span class="badge b-{% if burst.risk_score >= 75 %}red{% elif burst.risk_score >= 45 %}amber{% else %}cyan{% endif %}">
-        Risk {{ burst.risk_score }}/100
+      {{ burst.image | default('Unknown Process') }}
+      <span class="badge b-{% if (burst.risk_score | default(0)) >= 75 %}red{% elif (burst.risk_score | default(0)) >= 45 %}amber{% else %}cyan{% endif %}">
+        Risk {{ burst.risk_score | default(0) | round(1) }}/100
       </span>
-      <span class="badge b-{% if burst.risk_score >= 75 %}red{% elif burst.risk_score >= 45 %}amber{% else %}cyan{% endif %}">
-        {{ burst.kill_chain_stage or 'Execution' }}
+      <span class="badge b-{% if (burst.risk_score | default(0)) >= 75 %}red{% elif (burst.risk_score | default(0)) >= 45 %}amber{% else %}cyan{% endif %}">
+        {{ burst.kill_chain_stage | default('Execution') }}
       </span>
       {% if burst.stage_hint %}
       <span class="badge b-purple" style="margin-left:4px">Hint: {{ burst.stage_hint }}</span>
       {% endif %}
     </h1>
     <div class="sub">
-      ID: {{ burst.burst_id }}
-      &nbsp;·&nbsp; {{ burst.event_count }} events
-      &nbsp;·&nbsp; {{ burst.start_time }} → {{ burst.end_time }}
+      ID: {{ burst.burst_id | default('N/A') }}
+      &nbsp;·&nbsp; {{ burst.event_count | default(0) }} events
+      &nbsp;·&nbsp; {{ burst.start_time | default('—') }} → {{ burst.end_time | default('—') }}
     </div>
   </div>
 
   {# Meta strip #}
   <div class="meta-strip">
-    <div class="meta-card {% if burst.risk_score >= 75 %}c-red{% elif burst.risk_score >= 45 %}c-amber{% else %}{% endif %}">
+    <div class="meta-card {% if (burst.risk_score | default(0)) >= 75 %}c-red{% elif (burst.risk_score | default(0)) >= 45 %}c-amber{% else %}{% endif %}">
       <div class="meta-label">Risk Score</div>
-      <div class="meta-val" style="color:{% if burst.risk_score >= 75 %}var(--red){% elif burst.risk_score >= 45 %}var(--amber){% else %}var(--cyan){% endif %}">
-        {{ burst.risk_score }}<span style="font-size:14px;color:var(--muted)">/{{ burst.stage_cap or 100 }}</span>
+      <div class="meta-val" style="color:{% if (burst.risk_score | default(0)) >= 75 %}var(--red){% elif (burst.risk_score | default(0)) >= 45 %}var(--amber){% else %}var(--cyan){% endif %}">
+        {{ burst.risk_score | default(0) | round(1) }}<span style="font-size:14px;color:var(--muted)">/{{ burst.stage_cap | default(100) }}</span>
       </div>
-      <div class="meta-sub">Stage cap: {{ burst.stage_cap or 100 }}</div>
+      <div class="meta-sub">Stage cap: {{ burst.stage_cap | default(100) }}</div>
     </div>
     <div class="meta-card">
       <div class="meta-label">Event Window</div>
-      <div class="meta-val" style="font-size:14px">{{ burst.event_count }}</div>
-      <div class="meta-sub">{{ burst.start_time[:10] if burst.start_time else '—' }}</div>
+      <div class="meta-val" style="font-size:14px">{{ burst.event_count | default(0) }}</div>
+      <div class="meta-sub">{{ (burst.start_time[:10]) if burst.start_time else '—' }}</div>
     </div>
     <div class="meta-card">
       <div class="meta-label">Classification</div>
-      <span class="badge b-{% if burst.risk_score >= 75 %}red{% elif burst.risk_score >= 45 %}amber{% else %}gray{% endif %}">
-        {% if burst.risk_score >= 75 %}Confirmed Attack{% elif burst.risk_score >= 45 %}Attack Candidate{% else %}Background{% endif %}
+      <span class="badge b-{% if (burst.risk_score | default(0)) >= 75 %}red{% elif (burst.risk_score | default(0)) >= 45 %}amber{% else %}gray{% endif %}">
+        {% if (burst.risk_score | default(0)) >= 75 %}Confirmed Attack{% elif (burst.risk_score | default(0)) >= 45 %}Attack Candidate{% else %}Background{% endif %}
       </span>
       {% if burst.has_correlation %}<div style="margin-top:6px"><span class="badge b-purple">Multi-stage Campaign</span></div>{% endif %}
     </div>
     <div class="meta-card">
       <div class="meta-label">Process Chain</div>
       <div style="font-family:var(--mono);font-size:11px;margin-top:4px">
-        {% for p in process_summary.parents[:2] %}
-          <div style="color:var(--muted)">{{ p }}</div>
-        {% endfor %}
-        <div style="color:var(--cyan);margin-top:2px">→ {{ burst.image }}</div>
+        {% if process_summary and process_summary.parents %}
+          {% for p in process_summary.parents[:2] %}
+            <div style="color:var(--muted)">{{ p }}</div>
+          {% endfor %}
+        {% endif %}
+        <div style="color:var(--cyan);margin-top:2px">→ {{ burst.image | default('unknown') }}</div>
       </div>
     </div>
   </div>
@@ -152,7 +154,7 @@ body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(
       <div style="display:flex; flex-wrap:wrap; gap:10px; align-items:center">
         {% for step in burst.attack_story.steps %}
           <div style="padding:8px 14px; background:rgba(0,212,255,0.08); border:1px solid rgba(0,212,255,0.15); border-radius:8px; font-size:12.5px; font-family:var(--mono); color:var(--text)">
-            <span style="color:var(--cyan); font-weight:700; margin-right:6px">{{ loop.index }}.</span> {{ step }}
+            <span style="color:var(--cyan); font-weight:700; margin-right:6px">{{ loop.index }}.</span> {{ step | default('unknown step') }}
           </div>
           {% if not loop.last %}
             <div style="color:var(--dim); font-size:18px">→</div>
@@ -170,7 +172,7 @@ body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(
     <div class="card-body" style="padding:20px">
       {% for reason in burst.top_detection_reasons %}
         <div style="font-size:13px; color:var(--text); margin-bottom:8px; padding-left:14px; border-left:3px solid var(--amber); line-height:1.4">
-          <span style="color:var(--amber); font-weight:800; font-size:10px; text-transform:uppercase; margin-right:10px; letter-spacing:0.5px">Insight</span> {{ reason }}
+          <span style="color:var(--amber); font-weight:800; font-size:10px; text-transform:uppercase; margin-right:10px; letter-spacing:0.5px">Insight</span> {{ reason | default('Data point unavailable') }}
         </div>
       {% endfor %}
     </div>
@@ -186,17 +188,17 @@ body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(
           {% for entry in burst.score_ledger %}
           {% if entry.delta and entry.delta != 0 %}
           <div class="ledger-item">
-            <div class="ledger-label" title="{{ entry.reason }}">{{ entry.label }}</div>
+            <div class="ledger-label" title="{{ entry.reason | default('') }}">{{ entry.label | default('Adjustment') }}</div>
             <div class="ledger-bar-wrap">
-              <div class="ledger-fill" style="width:{{ [([entry.delta|abs, 40]|min) * 2, 3]|max }}%;background:{% if entry.delta >= 20 %}var(--red){% elif entry.delta >= 10 %}var(--amber){% elif entry.delta > 0 %}var(--cyan){% else %}var(--dim){% endif %}"></div>
+              <div class="ledger-fill" style="width:{{ [([ (entry.delta | default(0) | abs), 40]|min) * 2, 3]|max }}%;background:{% if (entry.delta | default(0)) >= 20 %}var(--red){% elif (entry.delta | default(0)) >= 10 %}var(--amber){% elif (entry.delta | default(0)) > 0 %}var(--cyan){% else %}var(--dim){% endif %}"></div>
             </div>
-            <div class="ledger-val" style="color:{% if entry.delta >= 20 %}var(--red){% elif entry.delta >= 10 %}var(--amber){% elif entry.delta > 0 %}var(--cyan){% else %}var(--dim){% endif %}">{{ entry.delta | round(1) }}</div>
+            <div class="ledger-val" style="color:{% if (entry.delta | default(0)) >= 20 %}var(--red){% elif (entry.delta | default(0)) >= 10 %}var(--amber){% elif (entry.delta | default(0)) > 0 %}var(--cyan){% else %}var(--dim){% endif %}">{{ entry.delta | default(0) | round(1) }}</div>
           </div>
           {% endif %}
           {% endfor %}
         {% else %}
-          {% for r in burst.confidence_reasons or [] %}
-          <div style="font-size:12px;color:var(--muted);margin-bottom:5px;padding-left:8px;border-left:2px solid var(--border)">{{ r }}</div>
+          {% for r in (burst.confidence_reasons or []) %}
+          <div style="font-size:12px;color:var(--muted);margin-bottom:5px;padding-left:8px;border-left:2px solid var(--border)">{{ r | default('Confidence factor applied') }}</div>
           {% endfor %}
           {% if not burst.score_ledger and not burst.confidence_reasons %}
           <div style="color:var(--dim);font-size:12px;font-style:italic">No score ledger available.</div>
@@ -212,7 +214,7 @@ body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(
         {% if burst.baseline_sub_scores %}
         <div class="sub-grid">
           {% for factor, val in burst.baseline_sub_scores.items() %}
-          {% set pct = (val * 100)|int %}
+          {% set pct = ((val | default(0)) * 100)|int %}
           {% set col = 'var(--red)' if pct >= 75 else 'var(--amber)' if pct >= 45 else 'var(--cyan)' %}
           <div class="sub-cell">
             <div class="sub-label">{{ factor }}</div>
@@ -221,7 +223,7 @@ body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(
           </div>
           {% endfor %}
         </div>
-        {% elif burst.baseline_count and burst.baseline_count > 0 %}
+        {% elif (burst.baseline_count | default(0)) > 0 %}
         <div style="color:var(--cyan);font-size:12px;padding:10px;background:rgba(0,212,255,0.05);border:1px solid rgba(0,212,255,0.1);border-radius:8px">
             <strong>Baseline observed:</strong> {{ burst.baseline_count }} historical events matching this entity.
             <div style="font-size:11px;color:var(--muted);margin-top:4px">Anomaly depth is being calculated based on these {{ burst.baseline_count }} samples.</div>
@@ -234,7 +236,7 @@ body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(
         <div class="anomaly-box">
           <div class="anomaly-title">⚠ Behavioral Anomalies</div>
           {% for a in burst.baseline_anomalies %}
-          <div style="font-size:11px;color:var(--amber);margin-bottom:2px;opacity:.85">• {{ a }}</div>
+          <div style="font-size:11px;color:var(--amber);margin-bottom:2px;opacity:.85">• {{ a | default('Unspecified behavioral shift') }}</div>
           {% endfor %}
         </div>
         {% endif %}

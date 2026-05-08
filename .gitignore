@@ -1,50 +1,43 @@
-# =====================
 # Python
-# =====================
 __pycache__/
 *.pyc
 *.pyo
-
-# =====================
-# Virtual environment
-# =====================
+*.pyd
 venv/
 .env
 
-# =====================
-# Databases (LOCAL ONLY)
-# =====================
-*.db
-*.sqlite
-*.sqlite3
-
-# =====================
-# Runtime / Generated Data (CRITICAL)
-# =====================
-data/runs/
-data/uploads/
-uploads/
-dashboard/instance/
-
-# =====================
-# Generated output
-# =====================
-output/
-.dist/
-
-# =====================
 # Logs
-# =====================
 *.log
 
-# =====================
-# OS junk
-# =====================
+# Runtime data
+dashboard/data/runs/
+tmp/
+
+# Database
+*.db
+*.sqlite3
+
+# IDE
+.vscode/
+.idea/
+
+# OS
 .DS_Store
 Thumbs.db
 
-# =====================
-# Editors / IDEs
-# =====================
-.vscode/
-.idea/
+# Cache
+.cache/
+
+# Test cache
+.pytest_cache/
+
+# Coverage
+.coverage
+htmlcov/
+
+# Secrets
+secrets.json
+
+# Runtime artifacts
+*.tmp
+*.bak

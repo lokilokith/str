@@ -70,9 +70,12 @@ tr:hover td{background:rgba(255,255,255,.02)}
       </tbody>
     </table>
     <div class="pager">
-      {% if page > 1 %}<a href="{{ url_for('raw_events', page=page-1) }}" class="btn">← Previous</a>{% endif %}
-      <span style="font-size:12px;color:var(--muted)">Page {{ page }}</span>
-      {% if has_next %}<a href="{{ url_for('raw_events', page=page+1) }}" class="btn">Next →</a>{% endif %}
+      {% if last_id > 0 %}<a href="{{ url_for('raw_events', last_id=0) }}" class="btn">Jump to Top</a>{% endif %}
+      {% if next_cursor %}
+      <a href="{{ url_for('raw_events', last_id=next_cursor) }}" class="btn btn-primary">Next Batch →</a>
+      {% else %}
+      <span style="font-size:12px;color:var(--dim)">End of Event Stream</span>
+      {% endif %}
     </div>
     {% else %}
     <div style="padding:40px;text-align:center;color:var(--dim)">No events available.</div>

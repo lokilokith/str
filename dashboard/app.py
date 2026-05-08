@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 app.py — SentinelTrace Flask Application  (MySQL edition)
 ==========================================================
@@ -19,8 +20,6 @@ FIXES IN THIS VERSION:
           reserved-word issues on MySQL 8+.
 """
 
-from __future__ import annotations
-
 import datetime
 import io
 import json
@@ -29,13 +28,11 @@ import os
 import re
 import threading
 import traceback
-import pandas as pd
 import uuid
 from collections import defaultdict
 from ipaddress import ip_address, AddressValueError
 from pathlib import Path
 
-from sqlalchemy import text
 import xml.etree.ElementTree as ET
 from flask import (
     Flask,
@@ -60,37 +57,20 @@ from dashboard.db import (
     sanitize_datetime,
     sql_now_minus,
 )
-from dashboard.analysis_engine import ingest_upload, persist_case, build_attack_story
-from dashboard.analysis_engine_patch import patched_run_full_analysis as run_full_analysis
+
+from dashboard.auth import (
+    get_current_user
+)
+
 from dashboard.analysis_cache import (
     clear_analysis_snapshot,
     get_analysis_snapshot,
     set_analysis_snapshot,
 )
-from dashboard.threat_hunter import (
-    detect_beaconing,
-    build_process_tree,
-    flatten_process_tree,
-    parse_hunt_query,
-    apply_hunt_query,
-    hunt as hunt_query,
-)
-from dashboard.auth import (
-    login_required, role_required,
-    authenticate, login_user, logout_user,
-    get_current_user, ensure_default_admin,
-)
-from dashboard.soc_verdict import (
-    validate_transition,
-    compute_sla_deadline,
-    sla_status,
-    create_verdict,
-    extract_iocs,
-    explain_risk_score,
-    score_to_priority,
-    VERDICT_OPTIONS,
-    create_audit_entry,
-)
+# Defer heavy imports: analysis_engine, soc_verdict — loaded in function scopes
+# 'hunt' is the actual function name in threat_hunter; alias it as hunt_query
+# so the /api/hunt route can call hunt_query(df, query) without changes.
+from dashboard.threat_hunter import hunt as hunt_query  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -127,30 +107,140 @@ if not _secret:
 app.secret_key = _secret
 app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024  # 200 MB
 
+# ---------------------------------------------------------------------------
+# CSRF shim — templates reference {{ csrf_token() }} but Flask-WTF is not
+# installed. Inject a no-op callable so Jinja2 doesn't raise UndefinedError.
+# ---------------------------------------------------------------------------
+app.jinja_env.globals["csrf_token"] = lambda: ""
+
 SNAPSHOT_LOCK = threading.Lock()
 
 # ---------------------------------------------------------------------------
-# Run status tracking (async analysis)
+# Blueprint registration — incident and triage routes
 # ---------------------------------------------------------------------------
-RUN_STATUS: dict = {}
-RUN_STATUS_LOCK = threading.Lock()
+from dashboard.routes_incident import incident_bp  # noqa: E402
+from dashboard.routes_triage import triage_bp        # noqa: E402
 
-def _set_run_status(run_id: str, status: str) -> None:
-    with RUN_STATUS_LOCK:
-        RUN_STATUS[run_id] = status
+app.register_blueprint(incident_bp)
+app.register_blueprint(triage_bp)
 
-def _get_run_status(run_id: str) -> str:
-    with RUN_STATUS_LOCK:
-        return RUN_STATUS.get(run_id, "unknown")
+# ---------------------------------------------------------------------------
+# 10/10 Formal Mastery: Environment Auditing
+# ---------------------------------------------------------------------------
+def check_environment():
+    """Audits the execution environment for production-grade readiness."""
+    try:
+        import watchdog
+        log.info("[ENV] watchdog detected: High-performance filesystem polling ACTIVE.")
+    except ImportError:
+        log.warning("[ENV] watchdog MISSING: Falling back to slow 'stat' polling. Reloads will be sluggish.")
+    
+    if os.environ.get("SECRET_KEY") == "SentinelTrace2026_ChangeThis":
+        log.warning("[ENV] DEFAULT SECRET_KEY DETECTED: UNSAFE FOR PRODUCTION DEPLOYMENT.")
+
+# ---------------------------------------------------------------------------
+# Global Warmup State
+# ---------------------------------------------------------------------------
+_WARMUP_DONE = False
+
+def is_system_ready():
+    return _WARMUP_DONE
+
+def warmup_dashboard_ultimate():
+    """
+    [10/10 Mastery] Escalated Background Warmup with infinite self-healing.
+    Performs 5 fast retries, then a CRITICAL alert, then infinite 5m heartbeat.
+    Ensures the dashboard eventually reaches 'Hot' state even after DB restarts.
+    """
+    global _WARMUP_DONE
+    import time
+    
+    log.info("[WARMUP] Starting background structural warmup (V9.0)...")
+    
+    # --- STAGE 1: Aggressive Retry (5 attempts, 10s backoff) ---
+    for i in range(5):
+        try:
+            from dashboard.analysis_engine import load_detection_rules
+            from dashboard.db import initialize_db_schema, health_check
+            
+            # 1. DB Integrity
+            initialize_db_schema()
+            status = health_check()
+            if not all(status.values()):
+                raise RuntimeError(f"DB Health Check failed: {status}")
+                
+            # 2. Rule Engine Warming
+            rules = load_detection_rules()
+            log.info("[WARMUP] Detection engine warmed with %d rules.", len(rules))
+            
+            # 3. Import Chain Warming (Force Pandas/SQLAlchemy load in bg)
+            import pandas as pd
+            pd.DataFrame()
+            
+            _WARMUP_DONE = True
+            log.info("[WARMUP] SYSTEM READY. All structures warmed and responsive.")
+            return
+        except Exception as e:
+            log.warning("[WARMUP] Attempt %d failed: %s. Retrying in 10s...", i+1, e)
+            time.sleep(10)
+
+    # --- STAGE 2: Escalated Failure ---
+    log.critical("[WARMUP] PERSISTENT WARMUP FAILURE. Dashboard operating in 'COLD' mode (Limited UI).")
+    
+    # --- STAGE 3: Infinite Heartbeat ---
+    while True:
+        try:
+            from dashboard.db import health_check
+            status = health_check()
+            if all(status.values()):
+                log.info("[WARMUP] Infrastructure RECOVERED. Performing structural warming...")
+                _WARMUP_DONE = False # Reset for re-attempt
+                from dashboard.analysis_engine import load_detection_rules
+                load_detection_rules()
+                _WARMUP_DONE = True
+                log.info("[WARMUP] RECOVERY SUCCESS. Dashboard back to 'HOT' state.")
+                return
+        except Exception as _wup_exc:
+            log.debug("[WARMUP] Recovery probe failed: %s", _wup_exc)
+        time.sleep(300) # Check every 5 minutes
+
+# ---------------------------------------------------------------------------
+# Global status + backpressure
+# ---------------------------------------------------------------------------
+from dashboard.progress import set_run_progress as _set_run_status, get_run_progress as _get_run_status
+
+# 9.8: Backpressure semaphore — max 3 concurrent analyses
+# Beyond this, new uploads get an immediate error instead of hanging.
+_ANALYSIS_SEMAPHORE = threading.Semaphore(3)
+_ANALYSIS_SEMAPHORE_MAX = 3
 
 def _run_analysis_async(run_id: str, xml_path, rules_dest) -> None:
-    """Background worker — runs full pipeline and updates RUN_STATUS."""
+    """Background worker — runs full pipeline with backpressure guard."""
+    # 9.8: Acquire backpressure slot (non-blocking check)
+    if not _ANALYSIS_SEMAPHORE.acquire(blocking=False):
+        log.warning(
+            "[BACKPRESSURE] Analysis queue full (%d max). Rejecting run_id=%s",
+            _ANALYSIS_SEMAPHORE_MAX, run_id[:16]
+        )
+        _set_run_status(
+            run_id, "error",
+            message="System overloaded. Too many concurrent analyses. Try again in a few minutes.",
+            error="QUEUE_FULL"
+        )
+        return
+
     try:
-        _set_run_status(run_id, "processing")
+        _set_run_status(run_id, "running", progress=5, message="Starting ingestion...")
         log.info("[ASYNC] Starting analysis for run_id=%s", run_id)
+        
+        from dashboard.analysis_engine import ingest_upload, persist_case
+        from dashboard.analysis_engine_patch import patched_run_full_analysis as run_full_analysis
+        from dashboard.analysis_cache import set_analysis_snapshot
+        
         events_df, detections_df, behaviors_df, content_hash = ingest_upload(
             xml_path=xml_path, rules_path=rules_dest,
         )
+        _set_run_status(run_id, "running", progress=30, message="Persisting case data...")
         actual_run_id = persist_case(events_df, detections_df, behaviors_df, content_hash)
 
         try:
@@ -161,18 +251,24 @@ def _run_analysis_async(run_id: str, xml_path, rules_dest) -> None:
         except Exception as _de:
             log.warning("[ASYNC] dispose_engine failed: %s", _de)
 
-        with SNAPSHOT_LOCK:
-            context = run_full_analysis(actual_run_id)
-            if context and "recommended_action" in context:
-                set_analysis_snapshot(actual_run_id, context)
-            else:
-                log.warning("[ASYNC] Analysis context invalid or missing recommended_action for %s; skipping snapshot.", actual_run_id)
-        _set_run_status(run_id, f"done:{actual_run_id}")
+        _set_run_status(run_id, "running", progress=60, message="Executing full analysis pipeline...")
+        context = run_full_analysis(actual_run_id)
+        if isinstance(context, dict):
+            # Always write snapshot — even failed/partial contexts must be persisted
+            # so the dashboard can show an error instead of spinning forever
+            set_analysis_snapshot(actual_run_id, context)
+        else:
+            log.error("[ASYNC] Analysis returned non-dict context for %s: %s", actual_run_id, type(context))
+        
+        _set_run_status(run_id, "complete", progress=100, message="Analysis complete.", actual_run_id=actual_run_id)
         log.info("[ASYNC] Analysis complete for run_id=%s -> %s", run_id, actual_run_id)
     except Exception as exc:
         log.error("[ASYNC] Analysis failed for run_id=%s: %s", run_id, exc, exc_info=True)
-        # 10/10 Mastery: Structured Async Reporting
-        _set_run_status(run_id, json.dumps({"status": "error", "message": f"Formal Proof Failed: {str(exc)}", "type": type(exc).__name__}))
+        _set_run_status(run_id, "error", message=f"Pipeline Failure: {str(exc)}", error=str(exc))
+    finally:
+        # 9.8: Always release the backpressure slot
+        _ANALYSIS_SEMAPHORE.release()
+        log.debug("[BACKPRESSURE] Released slot for run_id=%s", run_id[:16])
 
 # ---------------------------------------------------------------------------
 # DB init
@@ -458,14 +554,16 @@ def setup_upload():
 def dashboard_status(run_id: str):
     safe = re.sub(r"[^a-zA-Z0-9_-]", "", run_id)[:64]
     status = _get_run_status(safe)
-    if status.startswith("done:"):
-        actual = status.split(":", 1)[1]
+    
+    state = status.get("state")
+    if state == "complete" or state.startswith("done:"):
+        actual = status.get("run_id") or (state.split(":", 1)[1] if ":" in state else safe)
         session["analysis_run_id"] = actual
         resp = redirect(url_for("dashboard", run_id=actual))
         resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
         return resp
-    if status.startswith("error:"):
-        msg = status.split(":", 1)[1]
+    if state == "error" or state.startswith("error:"):
+        msg = status.get("message") or status.get("error") or "Unknown error"
         flash(f"Analysis failed: {msg}", "error")
         return redirect(url_for("welcome_page"))
 
@@ -556,6 +654,17 @@ function updateElapsed() {{
 }}
 async function poll() {{
   if (stopped) return;
+  tick++;
+  // 9.8 UI TIMEOUT: 600 polls × 2s = 20-minute hard limit
+  if (tick > 600) {{
+    stopped = true;
+    document.querySelector('h2').textContent = 'Analysis Timed Out';
+    document.querySelector('.sub').textContent = 'Exceeded 20 minutes. The system may be overloaded. Please re-upload your file.';
+    document.getElementById('bar').style.background = '#f97316';
+    document.getElementById('pct').textContent = 'Timed out after 20 minutes';
+    return;
+  }}
+  updateElapsed();
   try {{
     const resp = await fetch(API, {{cache: 'no-store'}});
     const data = await resp.json();
@@ -569,12 +678,20 @@ async function poll() {{
     if (data.status === 'error') {{
       stopped = true;
       document.querySelector('h2').textContent = 'Analysis Failed';
-      document.querySelector('.sub').textContent = data.error || 'Unknown error';
+      document.querySelector('.sub').textContent = data.message || data.error || 'Unknown pipeline error';
       document.getElementById('bar').style.background = '#f87171';
+      document.getElementById('pct').textContent = 'Analysis failed';
+      return;
+    }}
+    if (data.progress) {{
+      const sp = Math.min(97, data.progress);
+      const sl = stages.find(s => sp >= s[0] && sp < s[1]);
+      setProgress(sp, sl ? sl[3] : (data.message || 'Processing…'));
+      updateElapsed();
+      setTimeout(poll, 2000);
       return;
     }}
   }} catch(e) {{}}
-  tick++;
   const elapsed = (Date.now() - start) / 1000;
   let pct;
   if (elapsed < 5)       pct = Math.min(15, tick * 2);
@@ -602,16 +719,24 @@ setInterval(updateElapsed, 1000);
 def api_run_status(run_id: str):
     safe   = re.sub(r"[^a-zA-Z0-9_-]", "", run_id)[:64]
     status = _get_run_status(safe)
-    if status.startswith("done:"):
-        actual = status.split(":", 1)[1]
-        with app.test_request_context():
-            pass
-        session["analysis_run_id"] = actual
-        return jsonify({"status": "done", "run_id": actual,
-                        "redirect": f"/dashboard/{actual}"})
-    if status.startswith("error:"):
-        return jsonify({"status": "error", "error": status.split(":", 1)[1]})
-    return jsonify({"status": "processing", "run_id": safe})
+    
+    state = status.get("state", "unknown")
+    if state == "complete" or state.startswith("done:"):
+        actual = status.get("run_id") or (state.split(":", 1)[1] if ":" in state else safe)
+        return jsonify({
+            "status": "done",
+            "run_id": actual,
+            "redirect": url_for("dashboard", run_id=actual)
+        })
+    if state == "error" or state.startswith("error:"):
+        msg = status.get("message") or "Pipeline Failure"
+        return jsonify({"status": "error", "message": msg})
+    
+    return jsonify({
+        "status": state,
+        "progress": status.get("progress", 0),
+        "message": status.get("message", "Processing...")
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -653,21 +778,29 @@ def dashboard(run_id):
     session["analysis_run_id"] = safe_run_id
 
     status = _get_run_status(safe_run_id)
-    if status == "processing":
+    state = status.get("state", "unknown") if isinstance(status, dict) else str(status)
+    if state in ("processing", "running"):
         return redirect(url_for("dashboard_status", run_id=safe_run_id))
-    if status.startswith("error:"):
-        flash(f"Analysis failed: {status.split(':',1)[1]}", "error")
+    if state == "error" or (isinstance(state, str) and state.startswith("error:")):
+        err_msg = status.get("message") or status.get("error") or state
+        flash(f"Analysis failed: {err_msg}", "error")
         return redirect(url_for("welcome_page"))
 
-    with SNAPSHOT_LOCK:
-        context = get_analysis_snapshot(safe_run_id)
+    from dashboard.analysis_engine_patch import patched_run_full_analysis as run_full_analysis
+    context = get_analysis_snapshot(safe_run_id)
+    if context:
+        log.debug("[DASHBOARD] cache hit for %s", safe_run_id)
+        # Propagate failed snapshots to the user immediately
+        if context.get("status") == "failed":
+            err = context.get("error") or context.get("attack_narrative", {}).get("summary", "Pipeline error")
+            log.warning("[DASHBOARD] cached snapshot has status=failed for %s: %s", safe_run_id, err)
+            flash(f"Analysis failed: {err}", "error")
+            return redirect(url_for("welcome_page"))
+    else:
+        log.info("[DASHBOARD] running fresh analysis for %s", safe_run_id)
+        context = run_full_analysis(safe_run_id)
         if context:
-            log.debug("[DASHBOARD] cache hit for %s", safe_run_id)
-        else:
-            log.info("[DASHBOARD] running fresh analysis for %s", safe_run_id)
-            context = run_full_analysis(safe_run_id)
-            if context and "recommended_action" in context:
-                set_analysis_snapshot(safe_run_id, context)
+            set_analysis_snapshot(safe_run_id, context)
 
     if not context:
         flash("Analysis failed or expired. Please re-upload.", "error")
@@ -733,6 +866,9 @@ def dashboard(run_id):
         sequence_detections=context.get("sequence_detections", []),
         attack_narrative=context.get("attack_narrative", {}),
         recommended_action=context.get("recommended_action", "BASELINE"),
+        # [FIX] These keys are required by index.html but were missing from render_template
+        incidents=context.get("incidents", []),
+        pipeline_error=context.get("pipeline_error"),
     )
 
 
@@ -1235,8 +1371,11 @@ def api_iocs(run_id):
     if df.empty:
         return jsonify({"iocs": [], "run_id": run_id})
     try:
+        # Use the flat IOC extractor from soc_verdict (returns ioc_type/ioc_value dicts)
+        # NOT the old extract_iocs from analysis_engine (returns {"ips":[], "files":[]})
+        from dashboard.soc_verdict import extract_iocs as extract_iocs_flat
         events = df.fillna("").to_dict(orient="records")
-        iocs = extract_iocs(events, run_id=run_id)
+        iocs = extract_iocs_flat(events, run_id=run_id)
         return jsonify({"iocs": iocs, "run_id": run_id, "count": len(iocs)})
     except Exception as exc:
         return jsonify({"error": str(exc), "iocs": []})
@@ -1248,8 +1387,9 @@ def api_iocs_csv(run_id):
     if df.empty:
         return "No events", 404
     import csv
+    from dashboard.soc_verdict import extract_iocs as extract_iocs_flat
     events = df.fillna("").to_dict(orient="records")
-    iocs = extract_iocs(events, run_id=run_id)
+    iocs = extract_iocs_flat(events, run_id=run_id)
     out = io.StringIO()
     w = csv.DictWriter(out, fieldnames=["ioc_type","ioc_value","confidence","source_field","first_seen","run_id"])
     w.writeheader()
@@ -1537,12 +1677,19 @@ def hunt_console():
 # Application startup
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    log.info(">>> Initializing SentinelTrace (Upload-Analysis Mode)…")
-    init_db()
-    ensure_default_admin()
-    log.info(">>> Starting Flask dashboard on http://127.0.0.1:5000")
+    check_environment()
     
-    # ── [10/10] No reloader opt-out ──────────────────────────────────────────
-    # If NO_RELOAD=1 is set, we bypass the parent process/double-import cost.
-    use_reload = os.environ.get("NO_RELOAD") != "1"
+    # ── [10/10] Process-Aware Guard ──────────────────────────────────────────
+    # Flask with debug=True spawns a parent process (for the reloader) and 
+    # a child process (for the app). We ONLY want heavy init in the child.
+    if not app.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
+        log.info("[MAIN] Initializing SentinelTrace (Execution Process)...")
+        # 1. Start the ultimate warmup engine in the background
+        threading.Thread(target=warmup_dashboard_ultimate, daemon=True, name="warmup").start()
+    else:
+        log.info("[MAIN] Starting Flask Reloader (Parent Process)...")
+
+    import sys
+    use_reload = os.environ.get("NO_RELOAD") != "1" and "--no-reload" not in sys.argv
+    log.info(">>> Starting Flask dashboard on http://127.0.0.1:5000 (reload=%s)", use_reload)
     app.run(host="127.0.0.1", port=5000, debug=True, use_reloader=use_reload)

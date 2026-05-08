@@ -67,25 +67,27 @@ a:hover{text-decoration:underline}
   <div class="incident-strip">
     <div class="inc-kv">
       <label>Incident ID</label>
-      <span style="color:var(--blue)">{{ incident.incident_id }}</span>
+      <span style="color:var(--blue)">{{ incident.get('incident_id', 'Unknown') }}</span>
     </div>
     <div class="inc-kv">
       <label>Status</label>
-      <span class="badge badge-{{ (incident.severity or 'medium')|lower }}">{{ incident.status or 'Triage' }}</span>
+      <span class="badge badge-{{ (incident.get('severity', 'medium') or 'medium')|lower }}">{{ incident.get('status', 'Triage') }}</span>
     </div>
     <div class="inc-kv">
       <label>Severity</label>
-      <span class="badge badge-{{ (incident.severity or 'medium')|lower }}">{{ incident.severity or 'Medium' }}</span>
+      <span class="badge badge-{{ (incident.get('severity', 'medium') or 'medium')|lower }}">{{ incident.get('severity', 'Medium') }}</span>
     </div>
     <div class="inc-kv">
       <label>Confidence</label>
-      <span style="color:{% if (incident.confidence or 0) >= 70 %}var(--red){% elif (incident.confidence or 0) >= 40 %}var(--orange){% else %}var(--green){% endif %}">
-        {{ incident.confidence or 0 }}/100
+      {% set conf = incident.get('confidence', 0) %}
+      {% set conf_col = 'var(--red)' if conf >= 70 else ('var(--orange)' if conf >= 40 else 'var(--green)') %}
+      <span style="color:{{ conf_col }}">
+        {{ conf }}/100
       </span>
     </div>
     <div class="inc-kv">
       <label>Last Updated</label>
-      <span style="color:var(--muted)">{{ incident.updated_at or 'N/A' }}</span>
+      <span style="color:var(--muted)">{{ incident.get('updated_at', 'N/A') }}</span>
     </div>
   </div>
   {% endif %}
@@ -138,7 +140,7 @@ a:hover{text-decoration:underline}
           <td class="meta">{{ ev.execution_count or ev.count or 0 }}</td>
           <td>
             <span style="font-family:var(--mono);font-size:13px;font-weight:700;color:{{ score_col }}">{{ sc }}</span>
-            <span style="color:var(--dim);font-size:10px">/{{ ev.stage_cap or 100 }}</span>
+            <span style="color:var(--dim);font-size:10px">/{{ ev.get('stage_cap', 100) }}</span>
           </td>
           <td>
             {% if dp >= 0 %}
@@ -224,7 +226,7 @@ a:hover{text-decoration:underline}
                  style="color:var(--cyan);font-family:var(--mono);font-size:11px">{{ d.mitre_id }}</a>
             {% else %}—{% endif %}
           </td>
-          <td><span style="font-size:11px;color:{% if d.kill_chain_stage in ['Actions on Objectives','Command and Control'] %}var(--red){% elif d.kill_chain_stage in ['Persistence','Privilege Escalation'] %}var(--orange){% else %}var(--muted){% endif %}">{{ d.kill_chain_stage or '—' }}</span></td>
+          <td><span style="font-size:11px;color:{% if d.kill_chain_stage in ['Actions on Objectives','Command and Control'] %}var(--red){% elif d.kill_chain_stage in ['Persistence','Privilege Escalation','Lateral Movement'] %}var(--orange){% else %}var(--muted){% endif %}">{{ d.kill_chain_stage or '—' }}</span></td>
           <td><span class="badge badge-{{ sev }}">{{ d.severity or '—' }}</span></td>
           <td><span style="font-family:var(--mono);font-size:12px;color:{% if (d.confidence_score or 0) >= 70 %}var(--red){% elif (d.confidence_score or 0) >= 40 %}var(--orange){% else %}var(--muted){% endif %}">{{ d.confidence_score or 0 }}</span></td>
         </tr>
@@ -247,7 +249,7 @@ a:hover{text-decoration:underline}
           <td class="meta">{{ c.corr_id or c.corrid or '—' }}</td>
           <td class="meta">{{ ((c.start_time or c.starttime or '')|string)[:16] }}<br><span style="color:var(--dim)">→ {{ ((c.end_time or c.endtime or '')|string)[:16] }}</span></td>
           <td style="font-weight:600">{{ c.base_image or c.baseimage or '—' }}</td>
-          <td><span style="font-size:11px;color:{% if c.kill_chain_stage in ['Actions on Objectives','Command and Control'] %}var(--red){% elif c.kill_chain_stage in ['Persistence','Privilege Escalation'] %}var(--orange){% else %}var(--muted){% endif %}">{{ c.kill_chain_stage or c.killchainstage or '—' }}</span></td>
+          <td><span style="font-size:11px;color:{% if c.highest_kill_chain in ['Actions on Objectives','Command and Control'] %}var(--red){% elif c.highest_kill_chain in ['Persistence','Privilege Escalation','Lateral Movement'] %}var(--orange){% else %}var(--muted){% endif %}">{{ c.highest_kill_chain or '—' }}</span></td>
           <td>{% if c.confidence %}<span style="font-family:var(--mono);color:{% if (c.confidence|int) >= 70 %}var(--red){% elif (c.confidence|int) >= 40 %}var(--orange){% else %}var(--green){% endif %}">{{ c.confidence|int }}</span>{% else %}—{% endif %}</td>
           <td class="meta">{{ (c.event_ids or c.eventids or '')[:60] }}</td>
         </tr>

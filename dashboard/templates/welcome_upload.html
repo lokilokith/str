@@ -145,6 +145,7 @@
             </div>
 
             <form id="offlineForm" action="{{ url_for('setup_upload') }}" method="post" enctype="multipart/form-data" class="upload-form">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                 <hr class="form-divider">
                 <div class="form-section-title">Forensic Data Source</div>
 

@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
+<meta name="csrf-token" content="{{ csrf_token() }}">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>SentinelTrace | Threat Hunt Console</title>
 <style>
@@ -160,8 +161,9 @@ tr:hover td{background:rgba(255,255,255,.02)}
   <!-- Results -->
   <div class="card" id="resultsCard" style="display:none">
     <div class="results-header">
-      <div class="results-count">Found <span id="resultsCount">0</span> events</div>
+      <div class="results-count">Showing <span id="resultsCount">0</span> of <span id="totalCount">0</span> events</div>
       <div style="display:flex;gap:8px">
+        <button id="loadMoreBtn" class="export-btn" style="display:none; border-color:var(--cyan); color:var(--cyan)" onclick="loadMore()">Load More</button>
         <button class="export-btn" onclick="exportCSV()">Export CSV</button>
       </div>
     </div>
@@ -216,43 +218,161 @@ tr:hover td{background:rgba(255,255,255,.02)}
 
 </div>
 
-<script>
-const RUN_ID = {{ run_id | tojson }};
-let lastResults = [];
+<div id="config-params" data-run-id="{{ run_id or 'live' }}" style="display:none"></div>
 
-function setQ(q) {
-  document.getElementById('queryInput').value = q;
-  runQuery();
+  <style>
+    /* Toast System (10/10 SOC) */
+    #toast-container {
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      z-index: 9999;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .toast {
+      background: rgba(13, 21, 37, 0.95);
+      border: 1px solid var(--border2);
+      border-left: 4px solid var(--red);
+      color: var(--text);
+      padding: 14px 20px;
+      border-radius: 8px;
+      font-size: 13px;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+      backdrop-filter: blur(10px);
+      min-width: 300px;
+      animation: toastIn 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275) both;
+    }
+    @keyframes toastIn {
+      from { opacity: 0; transform: translateX(30px) scale(0.9); }
+      to { opacity: 1; transform: translateX(0) scale(1); }
+    }
+    .toast.fade-out {
+      animation: toastOut 0.3s ease forwards;
+    }
+    @keyframes toastOut {
+      to { opacity: 0; transform: translateY(20px); }
+    }
+  </style>
+
+  <div id="toast-container"></div>
+
+  <script>
+    const RUN_ID = document.getElementById('config-params').dataset.runId;
+    let lastResults = [];
+
+    function escHtml(str) {
+      if (str == null) return '';
+      return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
+    function showToast(message, type = 'error') {
+      const container = document.getElementById('toast-container');
+      if (!container) return;
+      const toast = document.createElement('div');
+      toast.className = 'toast';
+      if (type === 'success') toast.style.borderLeftColor = 'var(--green)';
+      toast.innerHTML = `
+        <div style="font-weight:700; font-size:11px; text-transform:uppercase; margin-bottom:4px; color:${type === 'success' ? 'var(--green)' : 'var(--red)'}">
+          ${type.toUpperCase()}
+        </div>
+        <div>${message}</div>
+      `;
+      container.appendChild(toast);
+      setTimeout(() => {
+        toast.classList.add('fade-out');
+        setTimeout(() => toast.remove(), 300);
+      }, 5000);
+    }
+
+    async function safeFetch(url, options = {}) {
+      try {
+        const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content || '';
+        options.headers = Object.assign({ 'X-CSRFToken': csrfToken, 'Content-Type': 'application/json' }, options.headers || {});
+        const resp = await fetch(url, options);
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
+        const data = await resp.json();
+        if (data.error) throw new Error(data.error);
+        return data;
+      } catch (e) {
+        console.error(`[Fetch Error] ${url}:`, e);
+        showToast(e.message, 'error');
+        throw e;
+      }
+    }
+
+function validateEvents(events) {
+  if (!Array.isArray(events)) return [];
+  // Basic schema validation: ensure mandatory fields exist/are strings
+  return events.map(ev => ({
+    event_time: String(ev.event_time || ev.utc_time || ''),
+    image: String(ev.image || '—'),
+    parent_image: String(ev.parent_image || '—'),
+    command_line: String(ev.command_line || '—'),
+    computer: String(ev.computer || '—'),
+    event_id: String(ev.event_id || '—'),
+    severity: String(ev.severity || 'low').toLowerCase(),
+    destination_ip: String(ev.destination_ip || ''),
+    is_lolbin: !!ev.is_lolbin,
+    cmd_high_entropy: !!ev.cmd_high_entropy
+  }));
 }
 
-function escHtml(s) {
-  if (!s) return '';
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-}
+let currentPage = 1;
+let lastHasNext = false;
 
-async function runQuery() {
+async function runQuery(append = false) {
   if (!RUN_ID) { showError('No active run — upload a Sysmon XML first.'); return; }
   const q = document.getElementById('queryInput').value.trim();
-  setLoading(true);
-  hideError();
+  
+  if (!append) {
+    currentPage = 1;
+    setLoading(true);
+    hideError();
+    document.getElementById('resultsTbody').innerHTML = ''; 
+  }
+
   try {
-    const resp = await fetch(`/api/hunt?run_id=${encodeURIComponent(RUN_ID)}&q=${encodeURIComponent(q)}`);
-    const data = await resp.json();
-    if (data.error) { showError(data.error); return; }
-    lastResults = data.results || [];
-    renderResults(lastResults);
+    const url = `/api/hunt?run_id=${encodeURIComponent(RUN_ID)}&q=${encodeURIComponent(q)}&page=${currentPage}&limit=100`;
+    const data = await safeFetch(url);
+    const validated = validateEvents(data.results || []);
+    
+    if (append) {
+      lastResults = lastResults.concat(validated);
+    } else {
+      lastResults = validated;
+    }
+
+    renderResults(validated, append);
+    
+    // Update Load More visibility
+    lastHasNext = data.has_next;
+    document.getElementById('loadMoreBtn').style.display = lastHasNext ? 'inline-block' : 'none';
+    document.getElementById('resultsCount').textContent = lastResults.length;
+    document.getElementById('totalCount').textContent = data.total || lastResults.length;
+
   } catch(e) {
-    showError('Network error: ' + e.message);
+    // Errors handled by safeFetch
   } finally {
-    setLoading(false);
+    if (!append) setLoading(false);
   }
 }
 
-function renderResults(results) {
-  document.getElementById('resultsCount').textContent = results.length;
+function loadMore() {
+  currentPage++;
+  runQuery(true);
+}
+
+function renderResults(results, append = false) {
   document.getElementById('resultsCard').style.display = 'block';
   const tbody = document.getElementById('resultsTbody');
-  tbody.innerHTML = '';
+  if (!append) tbody.innerHTML = '';
   const q = document.getElementById('queryInput').value.toLowerCase();
 
   results.forEach(ev => {
@@ -291,9 +411,11 @@ async function showTree() {
         const prefix = n.depth > 0 ? '└─ ' : '';
         const isLolbin = n.is_lolbin;
         const hasEntropy = n.cmd_high_entropy;
-        return `<div class="tree-node" style="margin-left:${(n.depth||0)*20}px">
+        const isHighRisk = n.risk_level === 'high';
+        return `<div class="tree-node" style="margin-left:${(n.depth||0)*20}px; ${isHighRisk?'border-left:2px solid var(--red); padding-left:8px; background:rgba(248,113,113,0.05);':''}">
           <span class="img${isLolbin?' lolbin':''}">${prefix}${escHtml(n.image)}</span>
           ${hasEntropy?'<span class="entropy"> 🔒 high-entropy cmd</span>':''}
+          ${isHighRisk?'<span style="color:var(--red); font-size:10px; font-weight:700;"> [HIGH RISK]</span>':''}
           <span class="ts"> [pid:${escHtml(n.pid)}] ${escHtml((n.event_time||'').slice(11,19))}</span>
           ${n.command_line?`<div style="color:var(--dim);font-size:10px;margin-left:20px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:600px">${escHtml((n.command_line||'').slice(0,120))}</div>`:''}
         </div>`;
@@ -321,7 +443,10 @@ async function showBeaconing() {
         <td>${b.hit_count}</td>
         <td>${b.mean_interval_sec}s</td>
         <td>${b.jitter_pct}%</td>
-        <td><span class="badge sev-${b.confidence>=70?'high':'medium'}">${b.confidence}%</span></td>
+        <td>
+          <span class="badge sev-${b.confidence>=90?'critical':(b.confidence>=70?'high':'medium')}">${b.confidence}%</span>
+          ${b.confidence >= 95 ? '<span style="color:var(--red); font-size:9px; font-weight:700;"> [Z-STABLE]</span>' : ''}
+        </td>
         <td style="color:var(--muted);font-size:11px">${escHtml(b.description)}</td>
       </tr>`).join('')}</tbody></table>`;
     }

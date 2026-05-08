@@ -740,13 +740,8 @@ def consumer_thread() -> None:
             try:
                 with get_db_connection("live") as conn:
                     with get_cursor(conn) as cur:
-                        # Heartbeat
-                        if time.time() - last_heartbeat > 5:
-                            cur.execute(
-                                "UPDATE collector_status SET last_seen = NOW() WHERE id = 1"
-                            )
-                            save_bookmark()
-                            last_heartbeat = time.time()
+                        # v2.9: Heartbeat and bookmarking moved to dedicated management thread
+                        # to ensure observability during silent periods.
 
                         inserted = checked_insert(
                             cur,
@@ -876,13 +871,42 @@ def analysis_thread() -> None:
 # ---------------------------------------------------------------------------
 # Thread 4 — Metrics
 # ---------------------------------------------------------------------------
-def metrics_thread() -> None:
-    log.info("Metrics thread started (interval=%ds).", METRICS_INTERVAL_SECS)
+def management_thread() -> None:
+    """v2.9: Decoupled management thread for heartbeats, metrics, and bookmarking."""
+    log.info("Management thread started (heartbeat=10s, metrics=30s, bookmark=60s).")
+    
+    last_hb = 0.0
+    last_met = 0.0
+    last_bm = 0.0
+
     while not shutdown_event.is_set():
-        shutdown_event.wait(METRICS_INTERVAL_SECS)
-        if not shutdown_event.is_set():
+        now = time.monotonic()
+        
+        # 1. Heartbeat (10s)
+        if now - last_hb >= 10:
+            try:
+                with get_db_connection("live") as conn:
+                    with get_cursor(conn) as cur:
+                        cur.execute("UPDATE collector_status SET last_seen = NOW() WHERE id = 1")
+                last_hb = now
+            except Exception as exc:
+                log.warning("[Management] Heartbeat failed: %s", exc)
+
+        # 2. Metrics (30s)
+        if now - last_met >= METRICS_INTERVAL_SECS:
             _metrics.log_summary()
-    log.info("Metrics thread exiting.")
+            last_met = now
+
+        # 3. Bookmarking (60s)
+        if now - last_bm >= 60:
+            save_bookmark()
+            last_bm = now
+
+        shutdown_event.wait(min(5, 10 - (time.monotonic() - last_hb)))
+    
+    # Final persistence on exit
+    save_bookmark()
+    log.info("Management thread exiting.")
 
 # ---------------------------------------------------------------------------
 # Windows Service wrapper
@@ -921,10 +945,10 @@ def run_collector(svc_stop_event=None) -> None:
         threading.Thread(target=_monitor, daemon=True).start()
 
     threads = [
-        threading.Thread(target=collector_thread, daemon=True, name="sysmon-collector"),
-        threading.Thread(target=consumer_thread,  daemon=True, name="sysmon-consumer"),
-        threading.Thread(target=analysis_thread,  daemon=True, name="sysmon-analysis"),
-        threading.Thread(target=metrics_thread,   daemon=True, name="sysmon-metrics"),
+        threading.Thread(target=collector_thread,  daemon=True, name="sysmon-collector"),
+        threading.Thread(target=consumer_thread,   daemon=True, name="sysmon-consumer"),
+        threading.Thread(target=analysis_thread,   daemon=True, name="sysmon-analysis"),
+        threading.Thread(target=management_thread, daemon=True, name="sysmon-mgt"),
     ]
     for t in threads:
         t.start()

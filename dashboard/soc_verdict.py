@@ -27,6 +27,12 @@ VALID_TRANSITIONS: Dict[str, set] = {
     "Closed - Benign":         set(),   # terminal
 }
 
+# ── [10/10] Exhaustive Immutable Status Set ───────────────────────────────
+VALID_STATUSES = frozenset(
+    set(VALID_TRANSITIONS.keys()) |
+    {s for v in VALID_TRANSITIONS.values() for s in v}
+)
+
 # SLA deadlines by priority (hours until breach)
 SLA_HOURS: Dict[str, int] = {
     "P1": 1,    # Critical — 1 hour
@@ -69,7 +75,7 @@ def compute_sla_deadline(priority: str, created_at: Optional[datetime.datetime] 
 def sla_status(deadline: datetime.datetime) -> Dict[str, Any]:
     """Return SLA status dict for display."""
     now = datetime.datetime.now(tz=datetime.timezone.utc)
-    if deadline.tzinfo is None:
+    if deadline.tzinfo is None or deadline.tzinfo.utcoffset(deadline) is None:
         deadline = deadline.replace(tzinfo=datetime.timezone.utc)
     remaining = deadline - now
     breached  = remaining.total_seconds() < 0
@@ -92,7 +98,8 @@ def sla_status(deadline: datetime.datetime) -> Dict[str, Any]:
 # 2. STRUCTURED VERDICT
 # ─────────────────────────────────────────────────────────────────────────────
 
-VERDICT_OPTIONS = [
+# ── [10/10] Immutable Verdict Definitions ───────────────────────────────
+VERDICT_OPTIONS = (
     "True Positive — Confirmed Attack",
     "True Positive — Attempted Attack",
     "False Positive — Legitimate Activity",
@@ -100,7 +107,7 @@ VERDICT_OPTIONS = [
     "Benign — Known Tool",
     "Benign — Authorized Test",
     "Insufficient Evidence",
-]
+)
 
 REMEDIATION_CHECKLIST = {
     "True Positive — Confirmed Attack": [

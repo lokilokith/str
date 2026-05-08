@@ -160,9 +160,16 @@ def score_command_entropy(cmd: Optional[str]) -> Dict[str, Any]:
         "-enc ", "-encodedcommand", " -e ", "-ec ",
         "frombase64string", "[convert]::frombase64", "::frombase64",
     ])
+    # Adaptive Threshold (Audit v2 Final): 4.5 baseline + length-scaled penalty
+    # Penalizes long cmd lines more strictly while ignoring trivial noise (<20 chars)
+    is_high_entropy = False
+    if len(cmd) >= 20:
+        threshold = 4.5 + min(1.5, len(cmd) / 500)
+        is_high_entropy = entropy > threshold
+
     return {
         "entropy":          round(entropy, 3),
-        "is_high_entropy":  entropy > 4.5,
+        "is_high_entropy":  is_high_entropy,
         "b64_detected":     b64_detected,
         "b64_preview":      b64_preview,
         "has_encoded_flag": has_encoded_flag,
@@ -480,94 +487,3 @@ def _match_rule(event: Dict[str, Any], rule: Dict[str, Any]) -> bool:
     if rule.get("filter_benign_parent") and parent in BENIGN_PARENTS:
         return False
     return True
-
-
-def find_detections(df: 'pd.DataFrame', rules: Optional[List[Dict]] = None) -> 'pd.DataFrame':
-    import pandas as pd
-    out_cols = [
-        "rule_id", "rule_name", "mitre_id", "mitre_tactic", "kill_chain_stage",
-        "utc_time", "event_time", "image", "event_id", "description", "severity",
-        "computer", "process_id", "parent_process_id", "parent_image", "source_ip",
-        "source_port", "destination_ip", "destination_port", "target_filename",
-        "command_line", "confidence_score",
-    ]
-    if df.empty:
-        return pd.DataFrame(columns=out_cols)
-    hits = []
-    if rules:
-        for _, row in df.iterrows():
-            ev = row.to_dict()
-            for rule in rules:
-                if not _match_rule(ev, rule):
-                    continue
-                conf = int(rule.get("confidence", 50))
-                if ev.get("cmd_high_entropy") or ev.get("is_high_entropy"):
-                    conf = min(conf + 15, 100)
-                if ev.get("cmd_b64_detected") or ev.get("b64_detected"):
-                    conf = min(conf + 10, 100)
-                if ev.get("has_encoded_flag") or ev.get("cmd_has_encoded_flag"):
-                    conf = min(conf + 10, 100)
-                lw = float(ev.get("lolbin_weight") or 0.0)
-                if lw > 0:
-                    conf = min(int(conf * (1 + lw * 0.2)), 100)
-                hits.append({
-                    "rule_id":           rule.get("rule_id"),
-                    "rule_name":         rule.get("name"),
-                    "mitre_id":          rule.get("mitre_id"),
-                    "mitre_tactic":      rule.get("mitre_tactic"),
-                    "kill_chain_stage":  rule.get("kill_chain_stage", "Execution"),
-                    "utc_time":          ev.get("utc_time") or ev.get("event_time"),
-                    "event_time":        ev.get("event_time") or ev.get("utc_time"),
-                    "image":             ev.get("image"),
-                    "event_id":          ev.get("event_id"),
-                    "description":       rule.get("description", ""),
-                    "severity":          rule.get("severity", "medium"),
-                    "computer":          ev.get("computer"),
-                    "process_id":        ev.get("process_id") or ev.get("pid"),
-                    "parent_process_id": ev.get("parent_process_id") or ev.get("ppid"),
-                    "parent_image":      ev.get("parent_image"),
-                    "source_ip":         ev.get("source_ip") or ev.get("src_ip"),
-                    "source_port":       ev.get("source_port"),
-                    "destination_ip":    ev.get("destination_ip") or ev.get("dst_ip"),
-                    "destination_port":  ev.get("destination_port") or ev.get("dst_port"),
-                    "target_filename":   ev.get("target_filename") or ev.get("file_path"),
-                    "command_line":      ev.get("command_line"),
-                    "confidence_score":  conf,
-                })
-    else:
-        for _, row in df.iterrows():
-            ev  = row.to_dict()
-            raw = ev.get("event_id")
-            try:
-                eid = int(float(raw)) if raw is not None and str(raw) not in ("", "None", "nan") else None
-            except (ValueError, TypeError):
-                eid = None
-            info = EID_MITRE_MAP.get(eid or 0)
-            if not info:
-                continue
-            hits.append({
-                "rule_id":           f"HEUR-{eid}",
-                "rule_name":         f"EID {eid}: {info['desc']}",
-                "mitre_id":          info["mitre_id"],
-                "mitre_tactic":      info["tactic"],
-                "kill_chain_stage":  info["stage"],
-                "utc_time":          ev.get("utc_time") or ev.get("event_time"),
-                "event_time":        ev.get("event_time") or ev.get("utc_time"),
-                "image":             ev.get("image"),
-                "event_id":          eid,
-                "description":       info["desc"],
-                "severity":          ev.get("severity", "low"),
-                "computer":          ev.get("computer"),
-                "process_id":        ev.get("process_id") or ev.get("pid"),
-                "parent_process_id": ev.get("parent_process_id") or ev.get("ppid"),
-                "parent_image":      ev.get("parent_image"),
-                "source_ip":         ev.get("source_ip") or ev.get("src_ip"),
-                "source_port":       ev.get("source_port"),
-                "destination_ip":    ev.get("destination_ip") or ev.get("dst_ip"),
-                "destination_port":  ev.get("destination_port") or ev.get("dst_port"),
-                "target_filename":   ev.get("target_filename") or ev.get("file_path"),
-                "command_line":      ev.get("command_line"),
-                "confidence_score":  40,
-            })
-    import pandas as pd
-    return pd.DataFrame(hits, columns=out_cols) if hits else pd.DataFrame(columns=out_cols)

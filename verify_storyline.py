@@ -17,14 +17,18 @@ def test_storyline():
     story = build_attack_story(events, detections)
     
     print("STORY STEPS:")
-    for i, step in enumerate(story["steps"]):
+    for i, step in enumerate(story["story"]):
         print(f"{i+1}. {step}")
         
-    print("\nSUMMARY:")
-    print(story["summary"])
+    print("\nATTACK TYPE:")
+    print(story["attack_type"])
     
-    print("\nKILL CHAIN:")
-    print(story["kill_chain"])
+    print("\nTIMELINE (Top 5):")
+    for t in story["timeline"][:5]:
+        print(t)
+    
+    print("\nIOCS:")
+    print(story["iocs"])
 
 if __name__ == "__main__":
     test_storyline()

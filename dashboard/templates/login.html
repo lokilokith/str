@@ -51,6 +51,7 @@ body::after{content:'';position:fixed;top:30%;left:50%;transform:translate(-50%,
   {% if error %}<div class="error">{{ error }}</div>{% endif %}
   {% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="error">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}
   <form method="POST" action="/login">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <input type="hidden" name="next" value="{{ request.args.get('next','') }}">
     <div class="field">
       <label>Username</label>

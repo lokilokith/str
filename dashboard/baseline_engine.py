@@ -141,20 +141,27 @@ class EntityProfile:
         self.seq_3: Dict[tuple, int] = defaultdict(int)
         self.seq_3_total = 0
         self.prev_image: Optional[str] = None    # rolling last-seen image
-        # Legacy alias — code that wrote seq_counts writes seq_2 now
-        self.seq_counts  = self.seq_2
-        self.seq_total   = 0   # kept for backward compat, mirrors seq_2_total
+        self.prev_image: Optional[str] = None    # rolling last-seen image
+        # Properties (seq_counts, seq_total) handle backward compatibility
+        # without manual sync overhead.
         # ── NEW: per-IP network model ─────────────────────────────────────
         self.network_counts: Dict[str, int] = defaultdict(int)
         self.network_total  = 0
         # /24 subnet model — survives IP rotation within same infrastructure
         self.network_subnet_counts: Dict[str, int] = defaultdict(int)
         self.network_subnet_total  = 0
-        # ── NEW: decay generation counter (for periodic forgetting) ───────
         self._updates = 0
         self.count = 0
         self.last_seen = None
         self.host_baseline_drift = 0.0  # % change in last N updates
+
+    @property
+    def seq_counts(self) -> Dict[tuple, int]:
+        return self.seq_2
+
+    @property
+    def seq_total(self) -> int:
+        return self.seq_2_total
 
     # ── Constants ─────────────────────────────────────────────────────────
     DECAY_FACTOR  = 0.995   # Applied every N updates to forget stale data
@@ -213,7 +220,7 @@ class EntityProfile:
         for k in list(self.seq_2):
             self.seq_2[k] = max(1, int(self.seq_2[k] * d))
         self.seq_2_total = max(1, int(self.seq_2_total * d))
-        self.seq_total   = self.seq_2_total
+        self.seq_2_total = max(1, int(self.seq_2_total * d))
         for k in list(self.seq_3):
             self.seq_3[k] = max(1, int(self.seq_3[k] * d))
         self.seq_3_total = max(1, int(self.seq_3_total * d))
@@ -252,7 +259,6 @@ class EntityProfile:
         key2 = (p, c)
         self.seq_2[key2] += 1
         self.seq_2_total += 1
-        self.seq_total    = self.seq_2_total   # keep alias in sync
 
         # Trigram — requires prev_image from last learning call
         if self.prev_image is not None:
@@ -304,12 +310,7 @@ class EntityProfile:
             return max(0.0, 1.0 - prob) * 0.5   # Dampen for known benign parents
         return float(1.0 - prob)
 
-    def entropy_anomaly(self, observed_entropy: float) -> float:
-        """Sigma-based entropy anomaly."""
-        if self.entropy_stats.n < 5:
-            return 0.10
-        z = abs(self.entropy_stats.z_score(observed_entropy))
-        return float(min(z / ENTROPY_SIGMA_THRESHOLD, 1.0))
+
 
     def network_anomaly(self, dst_ip: str) -> float:
         """
@@ -444,13 +445,7 @@ class EntityProfile:
         event: dict,
     ) -> float:
         """
-        Return the MAX of all anomaly sub-scores.
-
-        Using MAX (not average) means any single strong signal can trigger
-        alert-level behavior score — critical for catching stealth attacks
-        that score high on one dimension but low on others.
-
-        This is the metric the scoring engine uses as 'behavior_score'.
+        Calculate unified behavior score using Controlled Max blending.
         """
         f = self.frequency_anomaly(exec_count)
         p = self.parent_anomaly(parent)
@@ -459,11 +454,13 @@ class EntityProfile:
         t = self.time_anomaly(hour) if hour >= 0 else 0.05
         n = self.network_anomaly(dst_ip) if dst_ip else 0.05
 
-        # Force-alert override: any single factor at 0.85+ overrides everything
-        if max(f, p, s, e, n) >= 0.85:
-            return max(f, p, s, e, n)
-
-        return float(max(f, p, s, e, t, n))
+        signals = [f, p, s, e, t, n]
+        top = max(signals)
+        avg = sum(signals) / len(signals)
+        
+        # Controlled Max (v2.8 Micro-Lock)
+        # Blends the top signal with the general context.
+        return float(max(top * 0.7 + avg * 0.3, top * 0.85))
 
     def is_mature(self) -> bool:
         return self.exec_stats.n >= MIN_SAMPLES_FOR_CONFIDENCE
@@ -604,10 +601,9 @@ class BaselineEngine:
         t_score = profile.time_anomaly(hour) if hour >= 0 else 0.05
         n_score = profile.network_anomaly(dst_ip) if dst_ip else 0.05   # dual IP+subnet
 
-        # ── Adversarial slow-attack penalty ───────────────────────────────
-        # If execution count is LOW but other signals are HIGH, an attacker is
-        # deliberately spreading activity to evade frequency detection.
-        # Amplify the overall score in this case.
+        # ── Adversarial slow-attack (v2.8 Refinement) ─────────────────────
+        # If execution count is LOW but other signals are HIGH, ensure visibility.
+        # Fixed (v3.1): Added known_benign context gate
         slow_attack_penalty = 0.0
         high_signals_count = sum([
             e_score > 0.6,
@@ -616,10 +612,10 @@ class BaselineEngine:
             bool(event.get("has_persistence")),
             bool(event.get("has_injection")),
         ])
-        if exec_count <= 5 and high_signals_count >= 2:
-            slow_attack_penalty = 0.15   # +15% boost to expose stealthy actors
-            # Also ensure frequency score is at least moderate (don't let it suppress)
-            f_score = max(f_score, 0.35)
+        if not event.get("is_known_benign") and high_signals_count >= 2:
+            if exec_count <= 5:
+                slow_attack_penalty = 0.20   # Refined to reduce noise
+                f_score = max(f_score, 0.40) # Refined floor
 
         # ── Weighted combination ──────────────────────────────────────────
         combined = (
@@ -638,7 +634,7 @@ class BaselineEngine:
         # to prevent noisy lab data or premature baselines from lying.
         samples = profile.exec_stats.n
         if samples < 15:   # Lowered from 50 — ensure stealth attacks surive early baseline
-            combined *= 0.6 # Less aggressive dampening
+            combined = max(0.2, combined * 0.75) # Refined dampening (v3.1)
             # Ensure "No baseline" message only appears if truly zero
             if samples > 0:
                 if "No historical baseline for this entity" in anomalies:
@@ -685,6 +681,11 @@ class BaselineEngine:
             exec_count, entropy, parent, image,
             grandparent or "", dst_ip, hour, event
         )
+        
+        # ── [10/10] Score Unification ─────────────────────────────────────
+        # Ensures behavior score is never significantly weaker than deviation.
+        behavior_score = max(behavior_score, combined * 0.8)
+
         return {
             "deviation_score": combined,
             "behavior_score":  behavior_score,
@@ -703,20 +704,41 @@ class BaselineEngine:
     # ── Learning ──────────────────────────────────────────────────────────
 
     def should_learn(self, event: Dict[str, Any], deviation_score: float) -> bool:
-        """Gate: only learn from low-risk, benign-looking events."""
+        """Gate: only learn from low-risk, benign-looking events. (v3.2 Poisoning Guard)"""
+        # 10/10 SOC: Tightened thresholds to prevent slow-drip poisoning
+        if int(event.get("risk_score") or 0) > 40:
+            return False
+        
+        behavior_score = event.get("behavior_score", 0)
         image = (event.get("image") or "").lower()
         if image in NEVER_LEARN:
             return False
-        if deviation_score >= 0.45:
+        
+        # Check profile for early-stage exception
+        key = _entity_key(event)
+        profile = self.get_profile(key)
+        if profile and profile.exec_stats.n < 15:
+            # Allow early-stage learning ONLY if extremely clean
+            if deviation_score < 0.15 and behavior_score < 0.3:
+                return True
+
+        # ── [10/10] Hardened Learning Gating (Final Lock) ─────────────────
+        # Reject anomalies to prevent the baseline from "shifting" toward malicious activity
+        if deviation_score >= 0.2:
             return False
+        if behavior_score >= 0.4:
+            return False
+
         if event.get("has_persistence") or event.get("has_injection"):
             return False
-        if float(event.get("cmd_entropy") or 0.0) > 4.5:
+        if float(event.get("cmd_entropy") or 0.0) > 4.0:
             return False
-        if event.get("has_encoded_flag"):
+        if event.get("has_encoded_flag") or event.get("sequence_flag") or float(event.get("sequence_anomaly") or 0) > 0.7:
             return False
+            
         if int(event.get("network_strength", 0) or 0) >= 2:
             return False
+            
         stage = event.get("kill_chain_stage") or "Execution"
         if stage not in ("Execution", "Background"):
             return False
@@ -754,8 +776,8 @@ class BaselineEngine:
             ts = pd.to_datetime(event.get("start_time") or event.get("utc_time"), errors="coerce", utc=True)
             if pd.notna(ts):
                 profile.last_seen = ts
-        except:
-            pass
+        except Exception:
+            pass  # Non-parseable timestamp — intentional skip
         # Pass grandparent so trigram model gets populated
         if grandparent:
             profile.update_sequence(grandparent, parent)   # gp→parent bigram
@@ -784,7 +806,7 @@ class BaselineEngine:
         import json as _json
         try:
             from dashboard.db import get_engine
-            engine = get_engine("live")
+            engine = get_engine("cases")
             import pandas as pd
             df = pd.read_sql_query(
                 text("SELECT computer, process_name, user_type, avg_exec, var_exec, "
@@ -799,7 +821,7 @@ class BaselineEngine:
             # Fallback: v1 columns only (pre-migration database)
             try:
                 from dashboard.db import get_engine
-                engine = get_engine("live")
+                engine = get_engine("cases")
                 import pandas as pd
                 df = pd.read_sql_query(
                     text("SELECT computer, process_name, user_type, avg_exec, var_exec, "
@@ -816,8 +838,8 @@ class BaselineEngine:
                     df[col] = 0
             except Exception as e:
                 import traceback
-                print(f"[BaselineEngine] load_from_db failed (v2 cols): {e}")
-                print(f"[BaselineEngine] Continuing with empty baseline — next upload will build it.")
+                log.error("[BaselineEngine] load_from_db failed (v2 cols): %s", e)
+                log.debug("[BaselineEngine] Continuing with empty baseline — next upload will build it.")
                 traceback.print_exc()
                 return
 
@@ -846,9 +868,7 @@ class BaselineEngine:
                     profile.seq_2 = defaultdict(int, {
                         tuple(k.split("|", 1)): v for k, v in loaded.items()
                     })
-                    profile.seq_counts = profile.seq_2  # alias
                 profile.seq_2_total = int(row.get("seq_2_total") or 0)
-                profile.seq_total   = profile.seq_2_total
             except Exception:
                 pass
 
@@ -882,7 +902,7 @@ class BaselineEngine:
 
             self._profiles[key] = profile
 
-        print(f"[BaselineEngine] Loaded {len(self._profiles)} profiles from DB.")
+        log.info("[BaselineEngine] Loaded %d profiles from DB.", len(self._profiles))
 
     def save_to_db(self) -> None:
         """
@@ -915,13 +935,13 @@ class BaselineEngine:
         try:
             from dashboard.db import get_db_connection, get_cursor, sql_upsert, now_utc
         except Exception as e:
-            print(f"[BaselineEngine] save_to_db import failed: {e}")
+            log.error("[BaselineEngine] save_to_db import failed: %s", e)
             return
 
         # Build upsert — check if decay_updates column exists first
         try:
             from dashboard.db import get_db_connection as _gdbc, get_cursor as _gcur, get_table_columns as _gtc
-            with _gdbc("live") as _chk_conn:
+            with _gdbc("cases") as _chk_conn:
                 with _gcur(_chk_conn) as _chk_cur:
                     _bb_cols = set(_gtc(_chk_cur, "behavior_baseline"))
             _has_decay = "decay_updates" in _bb_cols
@@ -962,7 +982,7 @@ class BaselineEngine:
         try:
             for i in range(0, len(items), BATCH):
                 batch = items[i: i + BATCH]
-                with get_db_connection("live") as conn:
+                with get_db_connection("cases") as conn:
                     with get_cursor(conn) as cur:
                         for (computer, user_type, image), profile in batch:
                             n   = profile.exec_stats.n
@@ -1100,7 +1120,7 @@ def get_baseline_engine() -> BaselineEngine:
         try:
             _engine.load_from_db()
         except Exception as e:
-            print(f"[BaselineEngine] load_from_db failed in get_baseline_engine: {e}")
+            log.error("[BaselineEngine] load_from_db failed in get_baseline_engine: %s", e)
     return _engine
 
 
@@ -1110,4 +1130,4 @@ def reset_baseline_engine() -> None:
     """
     global _engine
     _engine = None
-    print("[BaselineEngine] Engine reset — will reload from DB on next call")
+    log.info("[BaselineEngine] Engine reset — will reload from DB on next call")

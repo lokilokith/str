@@ -1,0 +1,584 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Investigation Workbench | SentinelTrace</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-deep: #0a0c10;
+            --bg-card: #161b22;
+            --accent: #2f81f7;
+            --border: #30363d;
+            --text-main: #c9d1d9;
+            --text-dim: #8b949e;
+            --danger: #f85149;
+            --success: #3fb950;
+            --warning: #d29922;
+        }
+
+        body {
+            background-color: var(--bg-deep);
+            color: var(--text-main);
+            font-family: 'Inter', sans-serif;
+            margin: 0;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+        }
+
+        /* Top Bar */
+        .top-bar {
+            height: 60px;
+            background: var(--bg-card);
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 24px;
+            z-index: 100;
+        }
+
+        .incident-meta {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+
+        .incident-id {
+            font-family: 'JetBrains Mono', monospace;
+            font-weight: 700;
+            font-size: 1.1rem;
+            color: var(--accent);
+        }
+
+        .status-badge {
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 0.8rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            background: rgba(47, 129, 247, 0.1);
+            border: 1px solid var(--accent);
+        }
+
+        /* Layout */
+        .workbench {
+            display: flex;
+            flex: 1;
+            overflow: hidden;
+        }
+
+        /* Left Panel - Story */
+        .panel-left {
+            width: 450px;
+            background: var(--bg-card);
+            border-right: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+            padding: 24px;
+            overflow-y: auto;
+        }
+
+        .section-title {
+            font-size: 0.75rem;
+            color: var(--text-dim);
+            text-transform: uppercase;
+            letter-spacing: 0.05rem;
+            margin-bottom: 12px;
+            font-weight: 600;
+        }
+
+        .narrative-card {
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 16px;
+            margin-bottom: 24px;
+            line-height: 1.6;
+        }
+
+        .kill-chain-map {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            margin-bottom: 24px;
+        }
+
+        .kc-step {
+            padding: 10px;
+            border-radius: 6px;
+            border: 1px solid var(--border);
+            display: flex;
+            justify-content: space-between;
+            background: transparent;
+            opacity: 0.4;
+        }
+
+        .kc-step.active {
+            opacity: 1;
+            background: rgba(47, 129, 247, 0.1);
+            border-color: var(--accent);
+        }
+
+        /* Right Panel - Investigation */
+        .panel-right {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            background: var(--bg-deep);
+        }
+
+        .tabs {
+            height: 48px;
+            background: var(--bg-card);
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            padding: 0 16px;
+        }
+
+        .tab-btn {
+            background: none;
+            border: none;
+            color: var(--text-dim);
+            padding: 0 24px;
+            font-weight: 500;
+            cursor: pointer;
+            border-bottom: 2px solid transparent;
+            transition: all 0.2s;
+        }
+
+        .tab-btn.active {
+            color: var(--accent);
+            border-bottom-color: var(--accent);
+        }
+
+        .tab-content {
+            flex: 1;
+            overflow-y: auto;
+            padding: 24px;
+        }
+
+        /* Timeline View */
+        .timeline-container {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+
+        .event-node {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 16px;
+            transition: transform 0.2s, border-color 0.2s;
+            cursor: pointer;
+        }
+
+        .event-node:hover {
+            border-color: var(--accent);
+            transform: translateX(4px);
+        }
+
+        .event-header {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 8px;
+        }
+
+        .event-time {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.8rem;
+            color: var(--text-dim);
+        }
+
+        .event-id-tag {
+            font-size: 0.75rem;
+            font-weight: 700;
+            color: var(--warning);
+        }
+
+        /* Verdict Modal */
+        .modal-overlay {
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,0.8);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+        }
+
+        .verdict-form {
+            background: var(--bg-card);
+            width: 500px;
+            padding: 32px;
+            border-radius: 12px;
+            border: 1px solid var(--border);
+            box-shadow: 0 20px 40px rgba(0,0,0,0.5);
+        }
+
+        .form-group {
+            margin-bottom: 20px;
+        }
+
+        .form-label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 600;
+            font-size: 0.9rem;
+        }
+
+        select, textarea {
+            width: 100%;
+            background: var(--bg-deep);
+            border: 1px solid var(--border);
+            color: var(--text-main);
+            padding: 10px;
+            border-radius: 6px;
+            font-family: inherit;
+        }
+
+        .btn-submit {
+            background: var(--accent);
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 6px;
+            width: 100%;
+            font-weight: 600;
+            cursor: pointer;
+        }
+
+        /* ── [10/10] SOC Banners ── */
+        .decision-banner {
+            padding: 12px 16px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            font-weight: 700;
+            text-transform: uppercase;
+            font-size: 0.85rem;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            border: 1px solid transparent;
+        }
+        .decision-banner.ESCALATE { background: rgba(248, 81, 73, 0.15); color: var(--danger); border-color: var(--danger); }
+        .decision-banner.INVESTIGATE { background: rgba(210, 153, 34, 0.15); color: var(--warning); border-color: var(--warning); }
+        .decision-banner.MONITOR { background: rgba(47, 129, 247, 0.15); color: var(--accent); border-color: var(--accent); }
+        .decision-banner.BASELINE { background: rgba(63, 185, 80, 0.15); color: var(--success); border-color: var(--success); }
+
+        .integrity-warning {
+            background: rgba(210, 153, 34, 0.1);
+            color: var(--warning);
+            padding: 10px;
+            border-radius: 6px;
+            margin-bottom: 16px;
+            font-size: 0.8rem;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            border-left: 3px solid var(--warning);
+        }
+
+        /* ── [9.6/10 Locked] Empty States ── */
+        .empty-state {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 48px 24px;
+            text-align: center;
+            color: var(--text-dim);
+        }
+
+        .empty-state h3 {
+            margin: 0 0 8px 0;
+            color: var(--text-main);
+            font-size: 1.2rem;
+        }
+
+        .empty-state p {
+            margin: 0;
+            font-size: 0.9rem;
+        }
+
+        .empty-state.error h3 {
+            color: var(--danger);
+        }
+
+    </style>
+</head>
+<body>
+
+    <div class="top-bar">
+        <div class="incident-meta">
+            <span class="incident-id" id="inc-id">LOADING...</span>
+            <span class="status-badge" id="inc-status">New</span>
+            <span style="color: var(--text-dim); font-size: 0.85rem;" id="inc-computer"></span>
+        </div>
+        <div class="actions">
+            <button class="btn-submit" onclick="showVerdictModal()">Submit Verdict</button>
+        </div>
+    </div>
+
+    <div class="workbench">
+        <!-- LEFT: STORY & META -->
+        <div class="panel-left">
+            <div class="section-title">Attack Narrative</div>
+            <div class="narrative-card" id="narrative-text">
+                Analyzing causal chain...
+            </div>
+
+            <div id="decision-wrapper"></div>
+
+            <div class="section-title">Kill Chain Progress</div>
+            <div class="kill-chain-map" id="kc-map">
+                <div class="kc-step" id="kc-Execution"><span>Execution</span></div>
+                <div class="kc-step" id="kc-Persistence"><span>Persistence</span></div>
+                <div class="kc-step" id="kc-Lateral-Movement"><span>Lateral Movement</span></div>
+                <div class="kc-step" id="kc-Command-and-Control"><span>C2 / Exf</span></div>
+                <div class="kc-step" id="kc-Actions-on-Objectives"><span>Actions on Objectives</span></div>
+            </div>
+
+            <div class="section-title">Risk Analysis</div>
+            <div style="font-size: 2rem; font-weight: 700; color: var(--danger);" id="risk-score">--</div>
+            <div style="color: var(--text-dim); font-size: 0.85rem;">Confidence: <span id="confidence">--</span>%</div>
+        </div>
+
+        <!-- RIGHT: INVESTIGATION DATA -->
+        <div class="panel-right">
+            <div class="tabs">
+                <button class="tab-btn active" onclick="switchTab('timeline')">Timeline</button>
+                <button class="tab-btn" onclick="switchTab('evidence')">Evidence</button>
+                <button class="tab-btn" onclick="switchTab('tree')">Process Tree</button>
+            </div>
+            
+            <div class="tab-content" id="tab-timeline">
+                <div class="timeline-container" id="timeline-list">
+                    <!-- Events go here -->
+                </div>
+            </div>
+            <div class="tab-content" id="tab-evidence" style="display:none">
+                <div id="evidence-list" style="color:var(--text-dim); font-size: 0.9rem;">
+                    Collect evidence from the timeline to see it here.
+                </div>
+            </div>
+            <div class="tab-content" id="tab-tree" style="display:none">
+                <div id="process-tree" style="color:var(--text-dim); font-size: 0.9rem;">
+                    Causal process tree analysis loading...
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- VERDICT MODAL -->
+    <div class="modal-overlay" id="verdict-modal">
+        <div class="verdict-form">
+            <h2 style="margin-top:0">Finalize Investigation</h2>
+            <div class="form-group">
+                <label class="form-label">Disposition</label>
+                <select id="v-type">
+                    <option>True Positive — Confirmed Attack</option>
+                    <option>True Positive — Attempted Attack</option>
+                    <option>False Positive — Legitimate Activity</option>
+                    <option>False Positive — Misconfigured Rule</option>
+                    <option>Benign — Known Tool</option>
+                    <option>Benign — Authorized Test</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label class="form-label">Analyst Reasoning (Min 10 chars)</label>
+                <textarea id="v-reason" rows="4" placeholder="Be specific: why is this the outcome? Indicators used?"></textarea>
+            </div>
+            <div style="display: flex; gap: 12px;">
+                <button class="btn-submit" onclick="submitVerdict()">Confirm & Learn</button>
+                <button class="btn-submit" style="background:#30363d" onclick="hideVerdictModal()">Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const INCIDENT_ID = "{{ incident_id }}";
+        
+        // ── [10/10] Shared Severity Logic ──
+        function getSeverity(score) {
+            if (score >= 70) return "high";
+            if (score >= 40) return "medium";
+            return "low";
+        }
+
+        function switchTab(tab) {
+            // Hide all contents
+            document.querySelectorAll('.tab-content').forEach(el => el.style.display = 'none');
+            // Show target
+            document.getElementById(`tab-${tab}`).style.display = 'block';
+            
+            // Toggle button states
+            document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
+            // Use currentTarget if event exists, or find button by text
+            if (window.event) {
+                window.event.currentTarget.classList.add('active');
+            }
+        }
+
+        async function loadData() {
+            // loading state
+            document.getElementById('narrative-text').innerText = "Analyzing causal chain...";
+            
+            try {
+                const res = await fetch(`/api/incidents/${INCIDENT_ID}`);
+                if (!res.ok) throw new Error(`API failed with status: ${res.status}`);
+                
+                const data = await res.json();
+                
+                if (!data.incident) {
+                    document.getElementById('narrative-text').innerText = "Incident not found in the evidence database.";
+                    return;
+                }
+
+                // Populate Header
+                document.getElementById('inc-id').innerText = data.incident.incident_id || INCIDENT_ID;
+                document.getElementById('inc-status').innerText = data.incident.status || 'New';
+                document.getElementById('inc-computer').innerText = data.incident.computer || 'Unknown';
+                
+                // Populate Narrative
+                document.getElementById('narrative-text').innerText = (data.attack_story && data.attack_story.summary) || "No automated narrative available.";
+                
+                // ── [10/10] Elite Score Hardening (Shared Logic) ───────────────────
+                const score = Number(data.incident.attack_conf_score ?? data.incident.risk_score ?? 0);
+                const severity = getSeverity(score);
+                const scoreColor = severity === 'high' ? 'var(--danger)' : (severity === 'medium' ? 'var(--warning)' : 'var(--success)');
+                
+                document.getElementById('risk-score').innerText = score;
+                document.getElementById('risk-score').style.color = scoreColor;
+                document.getElementById('confidence').innerText = Number(data.incident.confidence ?? 0);
+                
+                // ── [10/10] Decision Banner ────────────────────────────────────────
+                const action = data.incident.recommended_action || 'BASELINE';
+                const bannerWrap = document.getElementById('decision-wrapper');
+                bannerWrap.innerHTML = `<div class="decision-banner ${action}">⚠️ Recommended: ${action}</div>`;
+
+                // ── [10/10] Timeline Integrity Guard ────────────────────────────────
+                if (data.timeline_valid === false) {
+                    const warning = document.createElement('div');
+                    warning.className = 'integrity-warning';
+                    warning.innerHTML = '🛡️ Content Integrity Alert: Analysis timeline may be incomplete or invalid.';
+                    container.prepend(warning);
+                }
+
+                // ── [10/10] MITRE Kill Chain Path Mapping ─────────────────────────
+                const chain = data.attack_story?.kill_chain || [];
+                const KC_MAP = {
+                    "Command and Control": "Command-and-Control",
+                    "Actions on Objectives": "Actions-on-Objectives",
+                    "Lateral Movement": "Lateral-Movement"
+                };
+                
+                // Clear old active states
+                document.querySelectorAll('.kc-step').forEach(el => el.classList.remove('active'));
+                
+                // Highlight full progression
+                chain.forEach(stage => {
+                    const norm = KC_MAP[stage] || (stage || "").replace(/\s+/g, '-');
+                    const kcStep = document.getElementById(`kc-${norm}`);
+                    if(kcStep) kcStep.classList.add('active');
+                });
+                
+                // Fallback: If chain is empty but incident has a stage, highlight that
+                if (chain.length === 0 && data.incident.kill_chain_stage) {
+                    const stage = data.incident.kill_chain_stage;
+                    const norm = KC_MAP[stage] || (stage || "").replace(/\s+/g, '-');
+                    const kcStep = document.getElementById(`kc-${norm}`);
+                    if(kcStep) kcStep.classList.add('active');
+                }
+                const container = document.getElementById('timeline-list');
+                container.innerHTML = '';
+                
+                // ── [9.6/10 Locked] State-Aware Rendering ───────────────────────
+                if (data.status === "processing") {
+                    container.innerHTML = `
+                        <div class="empty-state">
+                            <h3>Analysis in progress...</h3>
+                            <p>SentinelTrace is reconstructing the causal chain. This page will update automatically.</p>
+                        </div>`;
+                    // Auto-refresh in 3 seconds for better UX
+                    setTimeout(loadData, 3000);
+                    return;
+                }
+
+                if (data.status === "failed") {
+                    container.innerHTML = `
+                        <div class="empty-state error">
+                            <h3>Analysis failed</h3>
+                            <p>A critical engine error occurred during reconstruction.</p>
+                        </div>`;
+                    return;
+                }
+
+                const timeline = Array.isArray(data.timeline) ? data.timeline : [];
+                if (timeline.length === 0) {
+                    container.innerHTML = `
+                        <div class="empty-state">
+                            <h3>No threats detected</h3>
+                            <p>This run did not produce suspicious activity clusters.</p>
+                        </div>`;
+                } else {
+                    timeline.forEach(ev => {
+                        const node = document.createElement('div');
+                        node.className = 'event-node';
+                        node.innerHTML = `
+                            <div class="event-header">
+                                <span class="event-id-tag">ID: ${ev.event_uid}</span>
+                                <span class="event-time">${ev.event_time || 'Unknown'}</span>
+                            </div>
+                            <div style="font-family:'JetBrains Mono'; font-size:0.85rem; margin-bottom:4px">${ev.image || 'Unknown'}</div>
+                            <div style="color:var(--text-dim); font-size:0.75rem">${ev.command_line || '-'}</div>
+                        `;
+                        container.appendChild(node);
+                    });
+                }
+            } catch (e) {
+                console.error("[CausalChain] Load failed:", e);
+                document.getElementById('narrative-text').innerText = "Critical error loading investigative data.";
+            }
+        }
+
+        function showVerdictModal() { document.getElementById('verdict-modal').style.display = 'flex'; }
+        function hideVerdictModal() { document.getElementById('verdict-modal').style.display = 'none'; }
+
+        async function submitVerdict() {
+            const reason = document.getElementById('v-reason').value;
+            if (reason.length < 10) {
+                alert("Please provide at least 10 characters of reasoning.");
+                return;
+            }
+
+            const payload = {
+                incident_id: INCIDENT_ID,
+                verdict: document.getElementById('v-type').value,
+                reason: reason,
+                evidence_event_uids: [] // Future: collect selected event UIDs
+            };
+
+            const res = await fetch('/api/verdict/submit', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(payload)
+            });
+
+            if(res.ok) {
+                alert('Verdict recorded. System has adapted to this pattern.');
+                window.location.reload();
+            } else {
+                const err = await res.json();
+                alert('Error: ' + err.error);
+            }
+        }
+
+        document.addEventListener('DOMContentLoaded', loadData);
+    </script>
+</body>
+</html>

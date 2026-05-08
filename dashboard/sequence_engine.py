@@ -54,6 +54,7 @@ class SequenceStep:
     cmd_contains: Optional[str] = None           # command line substring
     event_id: Optional[int] = None               # Sysmon event ID filter
     max_gap_seconds: int = 3600                  # max time to next step
+    max_skip_steps: int = 1                      # max intermediate events to ignore (Audit v2 Final)
 
 
 @dataclass
@@ -332,12 +333,13 @@ def _step_matches(event: Dict[str, Any], step: SequenceStep) -> bool:
 
 class _ChainState:
     """One in-progress chain match attempt."""
-    __slots__ = ("step_idx", "last_time", "matched_evs")
+    __slots__ = ("step_idx", "last_time", "matched_evs", "skip_count")
 
-    def __init__(self, step_idx: int, last_time: datetime, matched_evs: list):
+    def __init__(self, step_idx: int, last_time: datetime, matched_evs: list, skip_count: int = 0):
         self.step_idx   = step_idx
         self.last_time  = last_time
         self.matched_evs = matched_evs
+        self.skip_count  = skip_count # Tracks skipped events since last step
 
 
 class _HostTracker:
@@ -407,20 +409,27 @@ class _HostTracker:
             # Step 2 + 3: try to advance each existing chain
             for chain in self._state[pid]:
                 current_step = pat.steps[chain.step_idx]
+                
+                # Check max_skip_steps constraint (Audit v2 Final)
+                if chain.skip_count > current_step.max_skip_steps:
+                    # This chain has skipped too many events, let it time out or be pruned
+                    continue
+
                 if _step_matches(event, current_step):
                     new_idx  = chain.step_idx + 1
                     new_evs  = chain.matched_evs + [event]
-                    if new_idx >= len(pat.steps):
-                        # Chain complete!
-                        newly_completed.append(_ChainState(new_idx, now, new_evs))
-                    else:
-                        still_active.append(_ChainState(new_idx, now, new_evs))
-                else:
-                    still_active.append(chain)  # no progress, keep alive
+                    if new_idx >= 2:
+                        # Partial or complete match (Audit v2 Final)
+                        completed.append(_build_sequence_detection(pat, new_evs))
 
-            # Emit completed detections
-            for done in newly_completed:
-                completed.append(_build_sequence_detection(pat, done.matched_evs))
+                    if new_idx >= len(pat.steps):
+                        # Chain complete, don't keep tracking this specific instance
+                        pass
+                    else:
+                        still_active.append(_ChainState(new_idx, now, new_evs, skip_count=0))
+                else:
+                    # No progress match at this step, increment skip_count and keep alive (Audit v2 Final)
+                    still_active.append(_ChainState(chain.step_idx, chain.last_time, chain.matched_evs, chain.skip_count + 1))
 
             # Step 4: check if step 0 matches → start fresh chain
             # This runs regardless of whether we advanced existing chains,
@@ -432,14 +441,18 @@ class _HostTracker:
                         _build_sequence_detection(pat, [event])
                     )
                 else:
-                    new_chain = _ChainState(1, now, [event])
+                    new_chain = _ChainState(1, now, [event], skip_count=0)
                     still_active.append(new_chain)
 
-            # Cap concurrent chains to avoid unbounded memory growth
-            if len(still_active) > self.MAX_CHAINS_PER_PATTERN:
+            # --- Adaptive Memory Limit (Audit v2 Final) ---
+            # host_event_rate isn't explicitly passed, we use the backlog length as a proxy
+            # or we assume a high-load system if many chains are active.
+            host_event_rate = len(still_active) * 100 # Rough heuristic for adaptive scaling
+            max_chains = min(50, max(8, host_event_rate // 200))
+            if len(still_active) > max_chains:
                 # Keep most-advanced chains (highest step_idx)
                 still_active.sort(key=lambda c: c.step_idx, reverse=True)
-                still_active = still_active[:self.MAX_CHAINS_PER_PATTERN]
+                still_active = still_active[:max_chains]
 
             self._state[pid] = still_active
 
@@ -466,7 +479,7 @@ def _build_sequence_detection(
         "mitre_id":         pat.mitre_id,
         "mitre_tactic":     pat.mitre_tactic,
         "kill_chain_stage": pat.kill_chain_stage,
-        "confidence_score": pat.base_confidence,
+        "confidence_score": int(pat.base_confidence * (len(matched_events) / len(pat.steps))),
         "severity":         _confidence_to_severity(pat.base_confidence),
         "chain_depth":      len(matched_events),
         "chain_str":        chain_str,
@@ -596,6 +609,18 @@ class SequenceEngine:
                     self._evict_fired_cache()
                     self._fired_sequences[f_key] = now.timestamp()
                     detections.append(det)
+
+        # Performance cap: excessive sequences → O(N²) downstream processing
+        MAX_SEQUENCES = 1000
+        if len(detections) > MAX_SEQUENCES:
+            import logging as _logging
+            _logging.getLogger("sequence_engine").warning(
+                "[SeqEngine] Capping %d sequence detections to %d for performance",
+                len(detections), MAX_SEQUENCES
+            )
+            # Keep highest-confidence detections
+            detections.sort(key=lambda d: d.get("confidence_score", 0), reverse=True)
+            detections = detections[:MAX_SEQUENCES]
 
         return detections
 

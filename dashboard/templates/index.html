@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
+<meta name="csrf-token" content="{{ csrf_token() }}">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>SentinelTrace — Dashboard</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -244,10 +245,9 @@ select option{background:#0b1220}
   <nav class="topbar-nav">
     <a href="{{ url_for('welcome_page') }}" class="nav-a">Home</a>
     <a href="{{ url_for('dashboard', run_id=run_id) }}" class="nav-a active">Dashboard</a>
-    <a href="{{ url_for('details') }}" class="nav-a">Investigation</a>
+    <a href="{{ url_for('triage_queue') }}" class="nav-a">Investigation</a>
     <a href="{{ url_for('triage_queue') }}" class="nav-a">Triage</a>
     <a href="{{ url_for('hunt_console') }}" class="nav-a">Hunt</a>
-    <a href="{{ url_for('live_dashboard') }}" class="nav-a">Live</a>
   </nav>
   <div class="topbar-right">
     <span style="color:var(--dim)">run:</span>
@@ -312,11 +312,11 @@ select option{background:#0b1220}
 
   {# ── Situation Strip ── #}
   <div class="situation fade-up d1">
-    <div class="sit-card c-{% if attack_conf_score >= 75 %}red{% elif attack_conf_score >= 45 %}amber{% else %}cyan{% endif %}">
+    <div class="sit-card c-{% if (attack_conf_score or 0) >= 75 %}red{% elif (attack_conf_score or 0) >= 45 %}amber{% else %}cyan{% endif %}">
       <div class="sit-label">Threat Posture</div>
       <div class="sit-value">{{ attack_conf_level | default('None') }}</div>
       <div class="sit-sub">{{ attack_conf_score | default(0) }}/100 confidence</div>
-      <span class="sit-badge b-{% if attack_conf_score >= 75 %}red{% elif attack_conf_score >= 45 %}amber{% else %}cyan{% endif %}">
+      <span class="sit-badge b-{% if (attack_conf_score or 0) >= 75 %}red{% elif (attack_conf_score or 0) >= 45 %}amber{% else %}cyan{% endif %}">
         {{ highest_kill_chain | default('No kill chain') }}
       </span>
     </div>
@@ -330,12 +330,12 @@ select option{background:#0b1220}
       </div>
     </div>
     <div class="sit-card">
-      <div class="sit-label">Detections</div>
-      <div class="sit-value" style="color:{% if detections_count > 0 %}var(--amber){% else %}var(--dim){% endif %}">{{ detections_count | default(0) }}</div>
+      <div class="sit-label">Active Incidents</div>
+      <div class="sit-value" style="color:{% if incidents %}var(--amber){% else %}var(--dim){% endif %}">{{ incidents | length }}</div>
       <div class="sit-sub">
-        {{ sequence_detections | default([]) | length }} chain detections
+        {{ incidents | selectattr('status', 'defined') | selectattr('status', 'equalto', 'New') | list | length }} unreviewed
       </div>
-      {% if correlation_campaigns %}<span class="sit-badge b-purple">{{ correlation_campaigns|length }} campaigns</span>{% endif %}
+      <span class="sit-badge b-purple">{{ sequence_detections | length }} chain logic</span>
     </div>
     <div class="sit-card c-{% if action == 'ESCALATE' %}red{% elif action == 'INVESTIGATE' %}amber{% elif action == 'MONITOR' %}cyan{% else %}green{% endif %}">
       <div class="sit-label">Analyst Action</div>
@@ -343,30 +343,68 @@ select option{background:#0b1220}
         {{ action }}
       </div>
       <div class="sit-sub">Priority {{ action_priority | default('P4') }}</div>
-      {% if incident %}<span class="sit-badge b-cyan">{{ incident.incident_id }}</span>{% endif %}
     </div>
   </div>
 
-  {# ── Incident Panel ── #}
-  {% if incident and incident.incident_id %}
-  <div class="inc-panel fade-up d2">
-    <div class="inc-meta">
-      <div class="inc-kv"><label>Incident</label><span>{{ incident.incident_id }}</span></div>
-      <div class="inc-kv"><label>Status</label><span class="sit-badge b-cyan">{{ incident.status | default('Triage') }}</span></div>
-      <div class="inc-kv"><label>Severity</label><span class="sit-badge b-{% if incident.severity == 'High' %}red{% elif incident.severity == 'Medium' %}amber{% else %}gray{% endif %}">{{ incident.severity | default('Medium') }}</span></div>
-      <div class="inc-kv"><label>Confidence</label><span>{{ attack_conf_score }}/100</span></div>
+  {# ── Top Incidents (Phase 1 Hardened) ── #}
+  {% if pipeline_error %}
+    <div class="alert alert-danger" style="margin: 10px 0; padding: 10px; background: rgba(248, 113, 113, 0.1); border: 1px solid var(--red); border-radius: 4px; color: var(--red); font-weight: 500;">
+      ⚠️ {{ pipeline_error }}
     </div>
-    <div class="inc-actions">
-      <form method="post" action="{{ url_for('update_incident') }}" style="display:contents">
-        <input type="hidden" name="incident_id" value="{{ incident.incident_id }}">
-        <button type="submit" name="action" value="escalate" class="btn btn-danger">Escalate</button>
-        <button type="submit" name="action" value="false_positive" class="btn">False Positive</button>
-        <button type="submit" name="action" value="close_benign" class="btn btn-success">Close Benign</button>
-      </form>
-      <a href="{{ url_for('details') }}" class="btn btn-primary">→ Full Investigation</a>
+  {% endif %}
+
+  <div class="section-hdr fade-up d2"><h2>Top Incidents</h2></div>
+  <div class="card fade-up d2" style="margin-bottom:20px">
+    <div class="card-body" style="padding:0">
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Host</th>
+            <th>Process</th>
+            <th>Risk</th>
+            <th>Status</th>
+            <th>Priority</th>
+            <th>Action</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for inc in incidents[:10] %}
+          <tr>
+            <td class="mono" style="color:var(--cyan)">{{ inc.incident_id }}</td>
+            <td>{{ inc.computer or 'Unknown' }}</td>
+            <td style="font-weight:500">
+              {{ (inc.get('image') or 'Unknown').split('\\')[-1].split('/')[-1] }}
+              <div style="font-size:10px;color:var(--dim);font-weight:400">{{ inc.kill_chain_stage or 'Unknown' }}</div>
+            </td>
+            <td>
+              {% set score = inc.get('attack_conf_score') or inc.get('risk_score') | default(0, true) %}
+              <span class="score-pill score-{% if score >= 70 %}critical{% elif score >= 40 %}high{% else %}med{% endif %}">
+                {{ score|round(0)|int }}/100
+              </span>
+            </td>
+            <td>
+              {% set st = inc.status or '' %}
+              <span class="sit-badge b-{% if st == 'New' %}cyan{% elif 'Closed' in st %}green{% else %}amber{% endif %}">
+                {{ st or 'Unknown' }}
+              </span>
+            </td>
+            <td><span class="sit-badge b-gray">{{ inc.priority or 'P4' }}</span></td>
+            <td class="link"><a href="{{ url_for('details') }}">Investigate →</a></td>
+          </tr>
+          {% else %}
+          <tr>
+            <td colspan="7" style="text-align:center; padding: 48px; color: var(--dim); opacity: 0.7;">
+              <div style="font-size: 32px; margin-bottom: 12px; opacity: 0.5;">🔍</div>
+              <div style="font-weight: 500; color: var(--text-main);">No incidents detected in the current queue</div>
+              <div style="font-size: 13px; margin-top: 4px;">Run a new analysis or adjust your filters to see results.</div>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
     </div>
   </div>
-  {% endif %}
 
   {# ── Filter Bar ── #}
   <form class="filter-bar fade-up d2">
@@ -409,10 +447,10 @@ select option{background:#0b1220}
               {% endfor %}
             </div>
           </td>
-          <td><span class="score-pill score-{% if sd.kill_chain_stage in ['Actions on Objectives','Command and Control'] %}critical{% elif sd.kill_chain_stage in ['Persistence','Privilege Escalation','Credential Access'] %}high{% else %}med{% endif %}">{{ sd.kill_chain_stage }}</span></td>
+          <td><span class="score-pill score-{% if sd.kill_chain_stage in ['Actions on Objectives','Command and Control'] %}critical{% elif sd.kill_chain_stage in ['Persistence','Privilege Escalation','Lateral Movement'] %}high{% else %}med{% endif %}">{{ sd.kill_chain_stage }}</span></td>
           <td>
             <div class="conf-wrap">
-              <div class="conf-bar"><div class="conf-fill fill-{% if sc >= 75 %}red{% elif sc >= 45 %}amber{% else %}cyan{% endif %}" style="width:{{ sc }}%"></div></div>
+              <div class="conf-bar"><div class="conf-fill fill-{% if sc >= 70 %}red{% elif sc >= 40 %}amber{% else %}cyan{% endif %}" style="width:{{ sc }}%"></div></div>
               <div class="conf-num">{{ sc }}</div>
             </div>
           </td>
@@ -429,7 +467,7 @@ select option{background:#0b1220}
   <div class="section-hdr fade-up d2"><h2>Kill chain progression</h2></div>
   {% set kc_map = {} %}{% for kc in kill_chain_summary %}{% set _ = kc_map.update({kc.stage: kc.count}) %}{% endfor %}
   <div class="killchain fade-up d3">
-    {% for stage in ['Execution','Persistence','Privilege Escalation','Command and Control','Actions on Objectives'] %}
+    {% for stage in ['Execution','Persistence','Lateral Movement','Command and Control','Actions on Objectives'] %}
     {% set cnt = kc_map.get(stage, 0) %}
     <div class="kc-step {% if cnt %}has-data{% endif %} {% if stage == highest_kill_chain %}active{% endif %}" onclick="location.href='?kill_chain_stage={{ stage | urlencode }}'">
       <div class="kc-stage">{{ stage }}</div>
@@ -510,10 +548,10 @@ select option{background:#0b1220}
         <tr>
           <td class="mono">{{ c.corr_id[:24] }}</td>
           <td>{{ c.base_image }}</td>
-          <td><span class="score-pill score-{% if c.highest_kill_chain in ['Actions on Objectives','Command and Control'] %}critical{% elif c.highest_kill_chain in ['Persistence','Privilege Escalation'] %}high{% else %}med{% endif %}">{{ c.highest_kill_chain }}</span></td>
+          <td><span class="score-pill score-{% if c.highest_kill_chain in ['Actions on Objectives','Command and Control'] %}critical{% elif c.highest_kill_chain in ['Persistence','Privilege Escalation','Lateral Movement'] %}high{% else %}med{% endif %}">{{ c.highest_kill_chain }}</span></td>
           <td>
             <div class="conf-wrap">
-              <div class="conf-bar"><div class="conf-fill fill-{% if c.max_confidence >= 75 %}red{% elif c.max_confidence >= 45 %}amber{% else %}cyan{% endif %}" style="width:{{ c.max_confidence }}%"></div></div>
+              <div class="conf-bar"><div class="conf-fill fill-{% if c.max_confidence >= 70 %}red{% elif c.max_confidence >= 40 %}amber{% else %}cyan{% endif %}" style="width:{{ c.max_confidence }}%"></div></div>
               <div class="conf-num">{{ c.max_confidence }}</div>
             </div>
           </td>
@@ -532,49 +570,62 @@ select option{background:#0b1220}
     <div class="card-body" style="padding:0">
       {% if burst_aggregates %}
       <table class="data-table">
-        <thead><tr><th>Image</th><th>Kill Chain</th><th>Events</th><th>Score</th><th>Deviation</th><th>Chain</th><th></th></tr></thead>
+        <thead><tr><th>Image</th><th>Kill Chain</th><th>Events</th><th>Score</th><th>Primary Driver</th><th>Context</th><th></th></tr></thead>
         <tbody>
         {% for b in burst_aggregates %}
         {% set sc = b.peak_score | default(0) %}
-        {% set sc_cls = 'critical' if sc >= 75 else 'high' if sc >= 45 else 'med' if sc > 0 else 'low' %}
+        {% set sc_cls = 'critical' if sc >= 70 else 'high' if sc >= 40 else 'med' if sc > 0 else 'low' %}
         {% set dev = ((b.deviation_score | default(0)) * 100) | int %}
         <tr class="burst-row" onclick="toggleBurst('ba{{ loop.index }}')">
           <td style="font-weight:500">
             {{ b.image }}
             {% if b._never_learn %}<span class="sit-badge b-red" style="margin-left:4px;font-size:9px">🔒</span>{% endif %}
             {% if b.has_correlation %}<span class="sit-badge b-purple" style="margin-left:4px;font-size:9px">Campaign</span>{% endif %}
-            {% if b.has_sequence_detection | default(false) %}<span class="sit-badge" style="background:rgba(168,85,247,.15);color:#c084fc;margin-left:4px;font-size:9px">Chain</span>{% endif %}
           </td>
           <td>
-            <span class="score-pill score-{{ 'critical' if sc >= 75 else 'high' if sc >= 45 else 'med' if sc > 0 else 'low' }}">
+            <span class="score-pill score-{{ sc_cls }}">
               {{ b.kill_chain_stage or 'Exec' }}
             </span>
-            {% if b.stage_hint %}
-            <span class="sit-badge b-purple" style="font-size:9px;margin-left:4px">Hint: {{ b.stage_hint }}</span>
-            {% endif %}
           </td>
           <td class="mono">{{ b.total_count }}</td>
           <td>
-            <span class="score-pill score-{{ sc_cls }}">{{ sc }}/{{ b.stage_cap | default(100) }}</span>
+            <span class="score-pill score-{{ sc_cls }}">{{ sc }}/100</span>
           </td>
           <td>
-            {% if b.baseline_count and b.baseline_count > 0 %}
-            <div class="conf-wrap">
-              <div class="conf-bar"><div class="conf-fill fill-{% if dev >= 70 %}red{% elif dev >= 40 %}amber{% else %}cyan{% endif %}" style="width:{{ dev }}%"></div></div>
-              <span class="conf-num" style="color:var(--muted)">{{ b.baseline_count }}</span>
-            </div>
-            {% else %}
-            <span style="color:var(--dim);font-size:10px">No baseline</span>
-            {% endif %}
+            {% set driver_map = {
+              'behavior': 'Behavioral Anomaly',
+              'correlation': 'Campaign Correlation',
+              'rarity': 'Rare Execution',
+              'sequence': 'Attack Pattern',
+              'rule': 'Static Detection',
+              'stealth': 'Stealth Pattern',
+              'mixed': 'Mixed Signals'
+            } %}
+            <span class="sit-badge {% if b.primary_driver == 'behavior' %}b-amber{% elif b.primary_driver == 'rule' %}b-cyan{% elif b.primary_driver == 'rarity' %}b-purple{% elif b.primary_driver == 'correlation' %}b-green{% elif b.primary_driver == 'stealth' %}b-red{% elif b.primary_driver == 'sequence' %}b-purple{% else %}b-gray{% endif %}" style="text-transform:uppercase;font-size:10px">
+              {{ driver_map.get(b.primary_driver, b.primary_driver | default('Mixed')) }}
+            </span>
           </td>
-          <td>{% if b.chain_depth and b.chain_depth > 1 %}<span class="sit-badge b-purple">{{ b.chain_depth }}×</span>{% else %}<span style="color:var(--dim)">—</span>{% endif %}</td>
+          <td>
+            <div style="font-size:11px;color:var(--muted)">
+              {% if b.baseline_count %}{{ b.baseline_count }} samples{% else %}New Host{% endif %}
+              {% if b.chain_depth and b.chain_depth > 1 %} · <span style="color:var(--purple)">{{ b.chain_depth }}× chain</span>{% endif %}
+            </div>
+          </td>
           <td style="color:var(--cyan);font-size:11px">▾</td>
         </tr>
         <tr id="ba{{ loop.index }}" class="burst-detail">
           <td colspan="7">
             <div class="burst-inner">
-              {% if b.score_ledger %}
-              <div style="font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.8px;margin-bottom:8px">Score ledger</div>
+              <div style="font-size:10px;color:var(--cyan);text-transform:uppercase;letter-spacing:1px;margin-bottom:8px;font-weight:700">Why this alert fired (Primary Driver: {{ b.primary_driver | default('Mixed') | upper }})</div>
+              {% if b.score_why %}
+                <ul style="list-style:none;padding:0;margin-bottom:12px">
+                {% for line in b.score_why %}
+                  <li style="font-size:12px;color:var(--text);margin-bottom:4px;line-height:1.4">{{ line }}</li>
+                {% endfor %}
+                </ul>
+              {% endif %}
+              
+              <div style="font-size:9px;color:var(--dim);text-transform:uppercase;letter-spacing:.8px;margin-bottom:8px">Detailed Contribution Ledger</div>
               {% for entry in b.score_ledger %}{% if entry.delta and entry.delta != 0 %}
               <div class="ledger-item">
                 <div class="ledger-label">{{ entry.label }}</div>
@@ -582,7 +633,6 @@ select option{background:#0b1220}
                 <div class="ledger-val" style="color:{% if entry.delta >= 20 %}var(--red){% elif entry.delta >= 10 %}var(--amber){% elif entry.delta > 0 %}var(--cyan){% else %}var(--dim){% endif %}">{{ entry.delta | round(1) }}</div>
               </div>
               {% endif %}{% endfor %}
-              {% endif %}
               {% if b.baseline_anomalies and b.baseline_anomalies|length > 0 %}
               <div style="margin-top:10px;background:rgba(255,184,0,.06);border:1px solid rgba(255,184,0,.2);border-radius:6px;padding:8px 10px">
                 <div style="font-size:9px;color:var(--amber);font-weight:700;text-transform:uppercase;margin-bottom:5px">Behavioral Anomalies</div>
@@ -627,26 +677,7 @@ select option{background:#0b1220}
   </div>
   {% endif %}
 
-  {# ── Live Alert Feed ── #}
-  <div class="section-hdr fade-up d5" style="margin-top:20px"><h2>Live alert feed</h2></div>
-  <div class="card fade-up d5" style="margin-bottom:14px">
-    <div class="card-body" style="padding:0">
-      <table class="data-table" id="alertsTable">
-        <thead><tr><th>Time</th><th>Host</th><th>Image</th><th>Rule</th><th>Severity</th><th>MITRE</th></tr></thead>
-        <tbody id="alertsBody"><tr><td colspan="6" style="color:var(--dim);font-style:italic;padding:20px">Listening…</td></tr></tbody>
-      </table>
-    </div>
-  </div>
-
-  <div class="section-hdr fade-up d5"><h2>Live shell executions</h2></div>
-  <div class="card fade-up d5" style="margin-bottom:32px">
-    <div class="card-body" style="padding:0">
-      <table class="data-table" id="recentEventsTable">
-        <thead><tr><th>Time</th><th>Process</th><th>Command line</th><th>User</th><th>Computer</th></tr></thead>
-        <tbody id="recentEventsBody"><tr><td colspan="5" style="color:var(--dim);font-style:italic;padding:20px">Listening…</td></tr></tbody>
-      </table>
-    </div>
-  </div>
+  {# Live Feed Removed in Phase 1 #}
 
 </div><!-- /page -->
 
@@ -692,50 +723,7 @@ document.addEventListener('DOMContentLoaded',function(){
     }
   }
 
-  const runId="{{ run_id }}";
-  function esc(s){return s?String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'):''}
-
-  async function pollAlerts(){
-    try{
-      const r=await fetch(`/api/alerts/latest?run_id=${runId}`);
-      const d=await r.json();
-      const tbody=document.getElementById('alertsBody');
-      if(!tbody)return;
-      if(d.alerts&&d.alerts.length){
-        tbody.innerHTML='';
-        d.alerts.forEach(al=>{
-          const sc=(al.severity||'low').toLowerCase();
-          const cl=sc==='critical'?'score-critical':sc==='high'?'score-high':sc==='medium'?'score-med':'score-low';
-          const tr=document.createElement('tr');
-          tr.innerHTML=`<td class="mono">${esc((al.utc_time||'').slice(11,19))}</td><td class="mono">${esc(al.computer)}</td><td style="font-weight:500">${esc(al.image)}</td><td>${esc(al.rule_name)}</td><td><span class="score-pill ${cl}">${esc(al.severity)}</span></td><td>${al.mitre_id?`<span class="mitre-pill">${esc(al.mitre_id)}</span>`:'—'}</td>`;
-          tbody.insertBefore(tr,tbody.firstChild);
-          if(tbody.children.length>20)tbody.removeChild(tbody.lastChild);
-        });
-      }
-    }catch(e){}
-  }
-
-  async function pollEvents(){
-    try{
-      const r=await fetch(`/api/events/latest?run_id=${runId}`);
-      const d=await r.json();
-      const tbody=document.getElementById('recentEventsBody');
-      if(!tbody||!d.events||!d.events.length)return;
-      tbody.innerHTML='';
-      d.events.forEach(ev=>{
-        const img=(ev.image||'').split('/').pop().split('\\').pop();
-        const isShell=/powershell|cmd\.exe|pwsh|wscript|cscript|mshta|rundll|certutil|bitsadmin/i.test(img);
-        const tr=document.createElement('tr');
-        tr.innerHTML=`<td class="mono">${esc((ev.utc_time||'').slice(11,19))}</td><td style="color:${isShell?'var(--red)':'var(--text)'};font-weight:500">${esc(img)}</td><td style="color:var(--muted);font-family:var(--mono);font-size:10px;max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc((ev.command_line||'—').slice(0,140))}</td><td class="mono">${esc(ev.user||'')}</td><td class="mono">${esc(ev.computer||'')}</td>`;
-        tbody.insertBefore(tr,tbody.firstChild);
-        if(tbody.children.length>20)tbody.removeChild(tbody.lastChild);
-      });
-    }catch(e){}
-  }
-
-  pollAlerts();pollEvents();
-  setInterval(pollAlerts,4000);
-  setInterval(pollEvents,4000);
+  // Polling scripts removed in Phase 1 (Offline SOC Mode)
 });
 </script>
 </body>

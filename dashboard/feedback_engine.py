@@ -29,7 +29,10 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+# Type alias used by apply_feedback_adjustment return annotation
+Tuple_int = Tuple[int, Optional[str]]
 
 log = logging.getLogger("feedback_engine")
 
@@ -42,33 +45,7 @@ def _get_db():
     return get_db_connection, get_cursor, now_utc
 
 
-def _ensure_table() -> None:
-    """Create feedback_suppressions table if it doesn't exist."""
-    get_db_connection, get_cursor, _ = _get_db()
-    try:
-        with get_db_connection("live") as conn:
-            with get_cursor(conn) as cur:
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS `feedback_suppressions` (
-                        `id`               INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-                        `image`            VARCHAR(512) DEFAULT NULL,
-                        `parent_image`     VARCHAR(512) DEFAULT NULL,
-                        `kill_chain_stage` VARCHAR(64)  DEFAULT NULL,
-                        `rule_id`          VARCHAR(64)  DEFAULT NULL,
-                        `computer`         VARCHAR(256) DEFAULT NULL,
-                        `verdict`          VARCHAR(64)  NOT NULL,
-                        `confidence_adj`   INT NOT NULL DEFAULT -20,
-                        `reason`           TEXT,
-                        `created_at`       DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-                        `hit_count`        INT NOT NULL DEFAULT 0,
-                        INDEX idx_fb_image  (`image`(64)),
-                        INDEX idx_fb_rule   (`rule_id`),
-                        INDEX idx_fb_stage  (`kill_chain_stage`)
-                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-                """)
-            conn.commit()
-    except Exception as e:
-        log.warning("feedback_suppressions table creation failed: %s", e)
+# Feedack suppression table is handled by dashboard.db.initialize_db_schema()
 
 
 # ---------------------------------------------------------------------------
@@ -138,8 +115,8 @@ def record_verdict_feedback(
                     "`confidence_adj` = VALUES(`confidence_adj`), "
                     "`reason` = VALUES(`reason`)",
                     (
-                        (image or "")[:512],
-                        (parent_image or "")[:512],
+                        (image or "").lower()[:512],
+                        (parent_image or "").lower()[:512],
                         (kill_chain_stage or "")[:64],
                         (rule_id or "")[:64],
                         (computer or "")[:256],
@@ -176,7 +153,6 @@ def _load_suppressions_cached() -> List[Dict[str, Any]]:
     global _suppressions_cache
     if _suppressions_cache is not None:
         return _suppressions_cache
-    _ensure_table()
     get_db_connection, get_cursor, _ = _get_db()
     try:
         with get_db_connection("live") as conn:
@@ -198,9 +174,14 @@ def _load_suppressions_cached() -> List[Dict[str, Any]]:
         return []
 
 
+import threading
+_cache_lock = threading.Lock()
+
 def invalidate_suppressions_cache() -> None:
     global _suppressions_cache
-    _suppressions_cache = None
+    with _cache_lock:
+        _suppressions_cache = None
+    log.info("[Feedback] Cache invalidated")
 
 
 def apply_feedback_adjustment(
@@ -239,6 +220,9 @@ def apply_feedback_adjustment(
         "Lateral Movement",
     }
 
+    # 10/10 SOC: Enforcement of suppression bounds and high-risk guards
+    HIGH_STRICT_STAGES = {"Credential Access", "Command and Control", "Actions on Objectives", "Exfiltration"}
+
     for sup in suppressions:
         sup_img   = (sup.get("image") or "").lower()
         sup_par   = (sup.get("parent_image") or "").lower()
@@ -248,8 +232,9 @@ def apply_feedback_adjustment(
         adj       = int(sup.get("confidence_adj") or 0)
 
         is_high_risk = stage in HIGH_RISK_STAGES
+        is_strict    = stage in HIGH_STRICT_STAGES
 
-        # Match scoring — each criterion earns points
+        # Match scoring
         score = 0
         img_match   = sup_img   and sup_img   in img
         par_match   = sup_par   and sup_par   in par
@@ -263,16 +248,20 @@ def apply_feedback_adjustment(
         if rid_match:   score += 3
         if host_match:  score += 1
 
-        # STRICT MODE for high-risk stages:
-        # Require rule_id match OR (image + stage) to prevent over-suppression
-        # This stops attackers from slightly modifying a command to bypass suppression
+        # 10/10 LOCK: High-Strict stages (C2, Creds) CANNOT be suppressed 
+        # without an EXACT rule_id match. No generic process suppression.
+        if is_strict and adj < 0 and not rid_match:
+            continue
+
+        # STRICT MODE for high-risk stages general consistency:
         if is_high_risk:
             required = rid_match or (img_match and stage_match)
             if not required:
-                continue   # skip — not specific enough for high-risk stage
+                continue
 
-        # LOW-RISK threshold: need 2 points
-        # HIGH-RISK threshold: need 5 points (image+stage minimum = 5)
+        # Global Suppression Clamp [-20, 15] - Hard Logic Lock
+        adj = max(-20, min(15, adj))
+
         threshold = 5 if is_high_risk else 2
         if score >= threshold and abs(adj) > abs(best_adj):
             best_adj    = adj
@@ -280,14 +269,10 @@ def apply_feedback_adjustment(
                 f"Feedback rule ({sup.get('verdict')}) matched: "
                 f"image={sup_img or '*'} stage={sup_stage or '*'} "
                 f"{'[STRICT]' if is_high_risk else ''} "
-                f"(score={score}, hit {sup.get('hit_count',0)}×)"
+                f"(score={score}, delta={adj})"
             )
 
     return best_adj, best_reason
-
-
-# Type alias for return type hint
-Tuple_int = tuple   # (int, Optional[str])
 
 
 # ---------------------------------------------------------------------------

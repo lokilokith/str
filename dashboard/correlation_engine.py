@@ -17,6 +17,9 @@ import uuid
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+# Defer heavy imports to first use or module level if safe
+import pandas as pd
+
 # ---------------------------------------------------------------------------
 # Kill Chain Ordering
 # ---------------------------------------------------------------------------
@@ -123,7 +126,7 @@ class EventNode:
         "uid", "image", "parent_image", "computer", "user",
         "kill_chain_stage", "confidence", "ts", "event_id",
         "has_network", "has_persistence", "has_injection",
-        "process_guid", "parent_process_guid",
+        "process_guid", "parent_process_guid", "high_risk",
     )
 
     def __init__(self, event: Dict[str, Any]):
@@ -140,15 +143,14 @@ class EventNode:
         self.event_id        = int(event.get("event_id") or 0)
         self.process_guid    = _safe(event.get("process_guid"), "")
         self.parent_process_guid = _safe(event.get("parent_process_guid"), "")
+        self.high_risk       = (self.confidence >= 60.0) # Default invariant (Audit v2 Final)
 
         ts_raw = event.get("start_time") or event.get("utc_time") or event.get("event_time")
-        import pandas as pd
         try:
             self.ts = pd.to_datetime(ts_raw, errors="coerce", utc=True)
             if pd.isna(self.ts):
                 self.ts = pd.Timestamp.utcnow() if ts_raw else pd.NaT
         except Exception:
-            import pandas as pd
             self.ts = pd.Timestamp.utcnow()
 
 
@@ -193,26 +195,42 @@ class CorrelationGraph:
 
         for host, evts in events_by_host.items():
             # Sort by time
-            import pandas as pd
             evts.sort(key=lambda x: x.ts if pd.notna(x.ts) else pd.Timestamp.min.tz_localize("UTC"))
 
-            for i in range(len(evts)):
-                e1 = evts[i]
+        from collections import deque
+        for host, evts in events_by_host.items():
+            # Sort by time
+            evts.sort(key=lambda x: x.ts if pd.notna(x.ts) else pd.Timestamp.min.tz_localize("UTC"))
 
-                for j in range(i + 1, len(evts)):
-                    e2 = evts[j]
+            # ── [9.8 PROD] O(N*K) Sliding Window Implementation ────────────
+            # Uses a deque to maintain only nodes within the 'time_window'.
+            # Drastically reduces comparisons in dense datasets.
+            active: deque[EventNode] = deque()
 
-                    # TIME WINDOW FIX
-                    import pandas as pd
-                    if pd.notna(e1.ts) and pd.notna(e2.ts):
-                        delta = (e2.ts - e1.ts).total_seconds()
-                        if delta < 0:
-                            continue
+            for e2 in evts:
+                # 1. Prune the window: Remove nodes too old to correlate with e2
+                while active and pd.notna(e2.ts) and pd.notna(active[0].ts):
+                    if (e2.ts - active[0].ts).total_seconds() > self.time_window:
+                        active.popleft()
                     else:
-                        delta = 100
+                        break
+
+                # 2. Check global analysis timeout (safe — check_cancelled removed)
+                try:
+                    from dashboard.analysis_engine import check_timeout
+                    check_timeout("correlation_build")
+                except ImportError:
+                    pass
+
+                # 3. Compare current node e2 against all active candidates e1
+                for e1 in active:
+                    # Risk Invariant (Audit v2 Final)
+                    e1.high_risk = (getattr(e1, "confidence", 0) >= 60)
+                    e2.high_risk = (getattr(e2, "confidence", 0) >= 60)
+
+                    delta = (e2.ts - e1.ts).total_seconds() if (pd.notna(e1.ts) and pd.notna(e2.ts)) else 100
 
                     # BASIC STAGE PROGRESSION
-                    # VALID CHAINS PROGRESSION ENFORCEMENT
                     VALID_CHAINS = {
                         "Execution": ["Persistence", "Privilege Escalation", "Defense Evasion", "Command and Control"],
                         "Persistence": ["Privilege Escalation", "Command and Control", "Lateral Movement"],
@@ -222,17 +240,11 @@ class CorrelationGraph:
                         "Command and Control": ["Exfiltration", "Actions on Objectives"],
                     }
                     
-                    # Same-stage correlation is now allowed but weighted lower
                     is_same_stage = (e1.kill_chain_stage == e2.kill_chain_stage)
                     is_valid_progression = e2.kill_chain_stage in VALID_CHAINS.get(e1.kill_chain_stage, [])
-                    
-                    if not (is_same_stage or is_valid_progression):
-                        continue
+                    is_background = "Background" in (e1.kill_chain_stage, e2.kill_chain_stage)
 
-                    if "Background" in (e1.kill_chain_stage, e2.kill_chain_stage):
-                        continue
-
-                    # PROCESS RELATIONSHIP (CORE FIX)
+                    # PROCESS RELATIONSHIP
                     is_structural = False
                     if e1.process_guid and e1.process_guid == e2.parent_process_guid:
                         is_structural = True
@@ -262,15 +274,16 @@ class CorrelationGraph:
                         edge_type = "same_stage_user"
                         reason = f"Same-stage clustering ({e1.kill_chain_stage})"
                     else:
-                        # Weak temporal link (same host, same user, close in time)
-                        if e1.user == e2.user:
+                        if e1.user == e2.user and not is_background:
                             w = 1.0
                             edge_type = "temporal_user"
                             reason = f"Temporal user proximity ({delta:.0f}s)"
 
                     if w > 0:
-                        # BACKWARD PENALTY (Phase 8: 0.5x)
-                        # If e2 comes BEFORE e1 in kill chain, penalize
+                        is_high_risk = (e1.confidence >= 70 or e2.confidence >= 70)
+                        if w < EDGE_WEIGHT_THRESHOLD and not is_high_risk:
+                            continue
+
                         if _kc_index(e2.kill_chain_stage) < _kc_index(e1.kill_chain_stage):
                             w *= 0.5
                             reason += " (Backward Penalty 0.5x)"
@@ -288,6 +301,9 @@ class CorrelationGraph:
                             "confidence_type": "structural" if is_structural else "behavioral",
                             "direction": "forward" if _kc_index(e2.kill_chain_stage) >= _kc_index(e1.kill_chain_stage) else "backward"
                         })
+                
+                # 4. Add current node to active window for future nodes
+                active.append(e2)
 
     def connected_components(self) -> List[Set[str]]:
         """Union-Find connected components with path compression + union-by-rank."""
@@ -313,7 +329,7 @@ class CorrelationGraph:
             if rank[rx] == rank[ry]:
                 rank[rx] += 1            # only increment when ranks were equal
 
-        for edge in self.edges:
+        for i, edge in enumerate(self.edges):
             if edge["from"] in parent and edge["to"] in parent:
                 union(edge["from"], edge["to"])
 
@@ -403,10 +419,16 @@ class CampaignBuilder:
         direction_bonus = 0.0
         if forward_count > 0 and backward_count == 0:
             direction_bonus = min(forward_count * 5.0, 15.0)
-            # Perfect forward chain is a very strong attack indicator
 
-        # ── Final score ───────────────────────────────────────────────────
-        final = min((base + bonus + edge_bonus + direction_bonus) * multiplier, 100.0)
+        # ── Final score (Audit v2: Hybrid Rebalance) ───────────────────────
+        # confidence = max(10, structural_score * 0.5 + signal_score)
+        # Prevents "hallucinations" from purely structural overlaps.
+        
+        signal_score     = base + bonus
+        structural_score = min(edge_bonus + direction_bonus, 50.0) # Cap structural contribution (Audit v2 Final)
+        
+        final = max(10.0, structural_score * 0.5 + signal_score)
+        final = min(final * multiplier, 100.0)
 
         # ── Temporal metadata ─────────────────────────────────────────────
         import pandas as pd
@@ -532,7 +554,7 @@ def persist_campaigns(campaigns: List[Dict[str, Any]]) -> None:
         return
 
     try:
-        from dashboard.db import get_db_connection, get_cursor, checked_insert, now_utc, sanitize_datetime
+        from dashboard.db import get_db_connection, get_cursor, checked_insert, now_utc, sanitize_datetime, get_table_columns
 
         run_id = campaigns[0].get("run_id", "live")
         mode   = "live" if run_id == "live" else "cases"
@@ -587,29 +609,34 @@ def persist_campaigns(campaigns: List[Dict[str, Any]]) -> None:
                             identity_hint=f"corr_id={cid}",
                         )
 
-                    # Detail row in correlations table
-                    cur.execute(
-                        "INSERT INTO `correlations` "
-                        "(`corr_id`,`run_id`,`base_image`,`start_time`,`end_time`,"
-                        "`description`,`event_ids`,`computer`,`kill_chain_stage`,"
-                        "`severity`,`confidence`, `from_stage`, `to_stage`, `id_burst`) "
-                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                        (
-                            cid, run_id,
-                            camp.get("base_image"),
-                            sanitize_datetime(camp.get("first_seen")),
-                            sanitize_datetime(camp.get("last_seen")),
-                            camp.get("narrative", ""),
-                            ",".join(camp.get("node_uids", [])[:20]),
-                            camp.get("computers", ["unknown"])[0],
-                            new_stage,
-                            "high" if new_conf >= 70 else "medium" if new_conf >= 40 else "low",
-                            new_conf,
-                            None, # from_stage
-                            None, # to_stage
-                            None, # id_burst
-                        ),
-                    )
+                    # Detail row in correlations table (Audit v2: Dynamic Column Check)
+                    try:
+                        all_cols = get_table_columns(cur, "correlations")
+                        data_map = {
+                            "corr_id":    cid,
+                            "run_id":     run_id,
+                            "base_image": camp.get("base_image"),
+                            "start_time": sanitize_datetime(camp.get("first_seen")),
+                            "end_time":   sanitize_datetime(camp.get("last_seen")),
+                            "description": camp.get("narrative", ""),
+                            "event_ids":  ",".join(camp.get("node_uids", [])[:20]),
+                            "computer":   camp.get("computers", ["unknown"])[0],
+                            "kill_chain_stage": new_stage,
+                            "severity":   "high" if new_conf >= 70 else "medium" if new_conf >= 40 else "low",
+                            "confidence": new_conf,
+                        }
+                        # Only insert columns that actually exist in the DB
+                        final_cols = [c for c in data_map.keys() if c in all_cols]
+                        final_vals = [data_map[c] for c in final_cols]
+                        placeholders = ", ".join(["%s"] * len(final_cols))
+                        col_str = ", ".join([f"`{c}`" for c in final_cols])
+                        
+                        cur.execute(
+                            f"INSERT INTO `correlations` ({col_str}) VALUES ({placeholders})",
+                            tuple(final_vals)
+                        )
+                    except Exception as ins_exc:
+                        log.warning("Correlations detail insert failed: %s", ins_exc)
             conn.commit()
     except Exception as e:
         import traceback
@@ -648,6 +675,16 @@ def correlate_events(
     valid_events = [e for e in events if e.get("image") or e.get("event_uid")]
     if not valid_events:
         return []
+
+    # 9.8: Hard cap — build_edges() is O(N²); cap prevents runaway on large logs
+    MAX_CORR_EVENTS = 500
+    if len(valid_events) > MAX_CORR_EVENTS:
+        import logging as _logging
+        _logging.getLogger("correlation").warning(
+            "[CorrEngine] Capping %d events to %d before graph build",
+            len(valid_events), MAX_CORR_EVENTS
+        )
+        valid_events = valid_events[:MAX_CORR_EVENTS]
 
     graph = CorrelationGraph(time_window_seconds=time_window_seconds)
     graph.add_nodes_bulk(valid_events)

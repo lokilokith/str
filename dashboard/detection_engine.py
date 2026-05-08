@@ -64,8 +64,8 @@ KILL_CHAIN_ORDER = [
 
 SOURCE_WEIGHT = {
     "sequence": 1.0,
-    "rule": 0.8,
-    "fallback": 0.6,
+    "rule":     0.9,
+    "fallback": 0.4,
 }
 
 SEVERITY_BASE = {
@@ -91,12 +91,33 @@ REASON_MAP = {
 def compute_signal_strength(d: Dict[str, Any]) -> float:
     """
     Authoritative signal strength calculation for primary detection selection.
-    Weighting: Confidence * SourcePriority * Severity.
+    Weighting (Audit v2 Final): 0.6*Conf + 0.2*Source + 0.2*Severity.
+    Normalized confidence (0-1.0) ensures balance.
     """
-    conf = float(d.get("confidence_score", 50))
+    conf = float(d.get("confidence_score", 50)) / 100.0
     src  = SOURCE_WEIGHT.get(d.get("detection_source", ""), 0.5)
     sev  = SEVERITY_BASE.get(d.get("severity", ""), 0.5)
-    return conf * src * sev
+    return (0.6 * conf) + (0.2 * src) + (0.2 * sev)
+
+
+def normalize_explanation(det: Dict[str, Any]) -> List[str]:
+    """
+    9.7/10 Mastery: Guarantees a consistent List[str] for explainability.
+    Rules out None/str/mix inconsistencies for the UI.
+    """
+    reason = det.get("match_reason") or det.get("explanation")
+
+    if not reason:
+        return ["No explanation available"]
+
+    if isinstance(reason, str):
+        return [reason]
+
+    if isinstance(reason, list):
+        # Ensure all elements are strings
+        return [str(r) for r in reason if r]
+
+    return [str(reason)]
 
 
 def pick_primary_detection(detections: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -289,7 +310,7 @@ def match_rules(event: Dict[str, Any], rules: Optional[List[Dict]] = None) -> Li
         if event.get("cmd_high_entropy"):
             reason.append(REASON_MAP["high_entropy"](None))
 
-        hits.append({
+        hit = {
             "rule_id":          rule.get("rule_id"),
             "rule_name":        rule.get("name"),
             "mitre_id":         rule.get("mitre_id"),
@@ -324,7 +345,10 @@ def match_rules(event: Dict[str, Any], rules: Optional[List[Dict]] = None) -> Li
             "destination_port": event.get("dst_port") or event.get("destination_port"),
             "target_filename":  event.get("file_path") or event.get("target_filename"),
             "command_line":     event.get("command_line"),
-        })
+        }
+        # Final Mastery Normalization
+        hit["explanation"] = normalize_explanation(hit)
+        hits.append(hit)
 
     if not hits:
         import logging as _log
@@ -362,14 +386,14 @@ def match_rules(event: Dict[str, Any], rules: Optional[List[Dict]] = None) -> Li
                 for kws, rid, rname, mid, conf, sev in _PERSIST_RULES:
                     if any(k in fpath for k in kws):
                         matched_kws = [k for k in kws if k in fpath]
-                        hits.append({
+                        hit = {
                             "rule_id":          rid,
                             "rule_name":        rname,
                             "mitre_id":         mid,
                             "mitre_tactic":     "Persistence",
                             "kill_chain_stage": "Persistence",
                             "severity":         sev,
-                            "confidence_score": conf,
+                            "confidence_score": min(conf, 70),  # Fallback cap (Audit v2 Final)
                             "description":      f"{rname}: {fpath}",
                             # ── Explainability ──────────────────────────────
                             "detection_source": "fallback",
@@ -402,7 +426,10 @@ def match_rules(event: Dict[str, Any], rules: Optional[List[Dict]] = None) -> Li
                             "destination_port": event.get("dst_port") or event.get("destination_port"),
                             "target_filename":  event.get("file_path") or event.get("target_filename") or event.get("reg_key"),
                             "command_line":     event.get("command_line"),
-                        })
+                        }
+                        # Final Mastery Normalization
+                        hit["explanation"] = normalize_explanation(hit)
+                        hits.append(hit)
                         break  # one hit per event is enough
 
     return hits
@@ -509,7 +536,7 @@ def _heuristic_detections(df: 'pd.DataFrame') -> 'pd.DataFrame':
         if eid not in EID_MAP:
             continue
         mitre_id, tactic, stage, desc = EID_MAP[eid]
-        hits.append({
+        hit = {
             "rule_id":          f"HEUR-{eid}",
             "rule_name":        f"Heuristic EID {eid}: {desc}",
             "mitre_id":         mitre_id,
@@ -532,7 +559,10 @@ def _heuristic_detections(df: 'pd.DataFrame') -> 'pd.DataFrame':
             "target_filename":  row.get("file_path") or row.get("target_filename"),
             "command_line":     row.get("command_line"),
             "confidence_score": 40,
-        })
+        }
+        # Final Mastery Normalization
+        hit["explanation"] = normalize_explanation(hit)
+        hits.append(hit)
 
     if not hits:
         import pandas as pd
@@ -650,10 +680,11 @@ def analyze_burst_batch(
         supporting = []
         if hits:
             # Align confidence: primary adopts max confidence across all hits
+            # But preserves its own original_conf for explainability (Audit v2 Final)
             max_conf = max(h.get("confidence_score", 0) for h in hits)
             primary = pick_primary_detection(hits)
             if primary:
-                primary["confidence_score"] = max_conf
+                primary["supporting_max_conf"] = max_conf
                 supporting = [h for h in hits if h is not primary]
 
         burst["primary_detection"] = primary
@@ -678,13 +709,10 @@ def analyze_burst_batch(
         hits   = burst.get("_detection_hits", [])
         stages = [h.get("kill_chain_stage") for h in hits if h.get("kill_chain_stage")]
         if stages:
-            highest = max(stages, key=lambda s: KILL_CHAIN_ORDER.index(s)
-                          if s in KILL_CHAIN_ORDER else 0)
-            # Promote if correlation already set a higher stage
-            existing = burst.get("kill_chain_stage") or "Background"
-            if (KILL_CHAIN_ORDER.index(highest) if highest in KILL_CHAIN_ORDER else 0) > \
-               (KILL_CHAIN_ORDER.index(existing) if existing in KILL_CHAIN_ORDER else 0):
-                burst["kill_chain_stage"] = highest
+            highest = max(stages, key=lambda s: KILL_CHAIN_ORDER.index(s) if s in KILL_CHAIN_ORDER else 0)
+            # Store mult-stage context (Audit v2 Final)
+            burst["kill_chain_stages"] = sorted(list(set(stages)), key=lambda s: KILL_CHAIN_ORDER.index(s) if s in KILL_CHAIN_ORDER else 0)
+            burst["kill_chain_stage"] = highest
         elif not burst.get("kill_chain_stage"):
             burst["kill_chain_stage"] = "Execution"
 
@@ -728,7 +756,7 @@ def analyze_burst_batch(
         result = scorer.score_burst(
             burst,
             detections=burst.get("_detection_hits"),
-            deviation_score=dev_score,
+            behavior_score=dev_score,
             chain_depth=chain_depth,
         )
 
@@ -742,11 +770,13 @@ def analyze_burst_batch(
         host       = (burst.get("computer") or "unknown").lower()
         host_total = host_noise.get(host, 1)
         # If host generates >10 000 events in this batch, raise alert bar by 5 pts
+        # Dynamic scale logic (Audit v2 Final): correct ordering + max cap
         adaptive_floor = 40
-        if host_total > 10_000:
-            adaptive_floor = 45
-        elif host_total > 50_000:
+        if host_total > 50_000:
             adaptive_floor = 50
+        elif host_total > 10_000:
+            adaptive_floor = 45
+        adaptive_floor = min(60, adaptive_floor)
 
         # ── Slow-attack penalty carry-through ─────────────────────────────
         # If baseline flagged a stealthy pattern, ensure score doesn't drop

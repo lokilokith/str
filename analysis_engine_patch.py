@@ -118,7 +118,7 @@ def patched_run_full_analysis(run_id: str) -> Dict[str, Any]:
     from dashboard.pipeline import run_full_pipeline
 
     log.info("[Patch] Running original analysis for run_id=%s", run_id)
-    context = _original(run_id)
+    context = _original(run_id, run_correlation=False)
 
     if not context:
         log.warning("[Patch] run_full_analysis returned empty context")

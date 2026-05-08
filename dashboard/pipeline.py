@@ -113,32 +113,40 @@ def pick_primary_detection(detections: List[Dict[str, Any]]) -> Optional[Dict[st
 # ---------------------------------------------------------------------------
 # 1. Decision layer
 # ---------------------------------------------------------------------------
-
 DECISION_RULES = [
     # (condition_fn, action, reason)
-    (lambda c: c["attack_conf_score"] >= 75 or c.get("has_injection"),
+
+    # 🔴 HARD ATTACK CONDITIONS (must override score)
+    # Tightened: Requires at least medium confidence (45) for multiple sequence hits
+    (lambda c: c.get("sequence_hits", 0) >= 2 and c.get("attack_conf_score", 0) >= 45,
      "ESCALATE",
-     "High-confidence attack or process injection detected — escalate immediately"),
+     "Multiple attack chains detected with significant confidence"),
 
-    (lambda c: c["attack_conf_score"] >= 45
+    (lambda c: c.get("highest_kill_chain") in ("Lateral Movement", "Command and Control"),
+     "ESCALATE",
+     "Critical kill-chain stage reached"),
+
+    # 🟠 High score
+    (lambda c: c["attack_conf_score"] >= 70,
+     "ESCALATE",
+     "High-confidence attack detected"),
+
+    # 🟡 Medium risk
+    (lambda c: c.get("attack_conf_score", 0) >= 45
                or c.get("has_persistence")
-               or c.get("highest_kill_chain") in ("Persistence", "Privilege Escalation",
-                                                     "Credential Access"),
+               or c.get("has_injection")
+               or c.get("sequence_hits", 0) >= 1,
      "INVESTIGATE",
-     "Persistence or privilege escalation evidence — full investigation required"),
+     "Suspicious behavior or multi-stage activity requiring investigation"),
 
-    (lambda c: c["attack_conf_score"] >= 40
-               or c.get("highest_kill_chain") in ("Command and Control", "Lateral Movement"),
-     "INVESTIGATE",
-     "Suspicious multi-stage activity — review C2/lateral movement indicators"),
-
-    (lambda c: c["attack_conf_score"] >= 20 or c.get("detections_count", 0) > 0,
+    # 🟢 Low risk
+    (lambda c: c["attack_conf_score"] >= 20,
      "MONITOR",
-     "Low-confidence detections — monitor for escalation and correlate with other sources"),
+     "Low-confidence activity — monitor"),
 
     (lambda c: True,
      "BASELINE",
-     "Activity consistent with known baseline — no immediate action required"),
+     "Normal activity"),
 ]
 
 
@@ -308,7 +316,7 @@ def prioritise_bursts(bursts: List[Dict[str, Any]], limit: int = 10) -> List[Dic
             (5  if b.get("has_correlation") else 0) +
             (5  if b.get("has_net")         else 0)
         )
-        return sc + kc * 2 + bonus
+        return sc + kc * 2 + bonus + (20 if b.get("has_sequence_detection") else 0)
 
     return sorted(bursts, key=_priority_score, reverse=True)[:limit]
 
@@ -324,7 +332,8 @@ def group_sessions(bursts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             if isinstance(ts, (int, float)): return float(ts)
             import pandas as pd
             return pd.to_datetime(ts, utc=True).timestamp()
-        except: return 0.0
+        except Exception:
+            return 0.0
 
     sessions = []
     # Sort by time for sequential grouping
@@ -369,10 +378,15 @@ def collapse_bursts(bursts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     Collapses multiple bursts belonging to the same semantic attack chain.
     Ensures 1 chain = 1 UI row, preserving the strongest signal.
     """
-    collapsed = {}
+    def parse_ts(ts):
+        import pandas as pd
+        try:
+            return pd.to_datetime(ts, utc=True).timestamp()
+        except Exception:
+            return 0
 
+    collapsed = {}
     for b in bursts:
-        # Key: (chain_tuple, host, stage)
         chain = tuple(b.get("attack_chain", []))
         if not chain:
             continue
@@ -380,9 +394,12 @@ def collapse_bursts(bursts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         comp  = str(b.get("computer") or "unknown").lower().strip()
         stage = str(b.get("kill_chain_stage") or "Background").strip()
         
-        key = (chain, comp, stage)
+        # 300s Time Bucket to prevent merging temporal stages (v3.3)
+        time_bucket = int(parse_ts(b.get("start_time") or b.get("event_time")) // 300)
+        
+        key = (chain, comp, stage, time_bucket)
 
-        if key not in collapsed or (float(b.get("attack_conf_score", 0)) > float(collapsed[key].get("attack_conf_score", 0))):
+        if key not in collapsed or (float(b.get("risk_score", 0)) > float(collapsed[key].get("risk_score", 0))):
             collapsed[key] = b
 
     return list(collapsed.values())
@@ -392,26 +409,48 @@ def run_full_pipeline(
     events_df: 'pd.DataFrame',
     detections_df: 'pd.DataFrame',
     run_id: str,
-    partial_context: Dict[str, Any],
+    context: Dict[str, Any] = None,
 ) -> Dict[str, Any]:
     """
     Given raw events + detections already stored in DB (by analysis_engine),
     run the full enrichment pipeline and augment the context dict.
     """
     import pandas as pd
-    ctx = dict(partial_context)
-    log.info("[Pipeline] Starting full analysis for run_id=%s", run_id)
+    import copy as _copy
 
+    # 9.8 IMMUTABILITY: Deep-copy the input context so mutations don't
+    # corrupt the caller's reference if the pipeline fails partway through.
+    # This is correct functional engineering — pipelines must be side-effect-free.
+    if not isinstance(context, dict):
+        context = {}
+    context = _copy.deepcopy(context)
+
+    # Ensure required keys exist (prevents downstream key errors)
+    context.setdefault("kill_chain_path", [])
+    context.setdefault("meta", {"pipeline_stage": "init", "errors": [], "warnings": []})
+
+    context["meta"]["pipeline_stage"] = "analysis_started"
+    log.info("[Pipeline] Starting full analysis for run_id=%s", run_id)
+    
+    # ── [10/10] Formal Scope Initialization ───────────────────────────────
+    KILL_CHAIN_ORDER = [
+        "Background", "Delivery", "Execution", "Defense Evasion",
+        "Persistence", "Privilege Escalation", "Credential Access",
+        "Discovery", "Lateral Movement", "Collection",
+        "Command and Control", "Exfiltration", "Actions on Objectives",
+    ]
+    kc_rank = {k: i for i, k in enumerate(KILL_CHAIN_ORDER)}
+    
     try:
         # ── [10/10] Component Health Registry ─────────────────────────────────
-        ctx.setdefault("analysis_integrity", {
+        context.setdefault("analysis_integrity", {
             "rule": "OK",
             "sequence": "OK",
             "correlation": "OK",
             "scoring": "OK",
             "baseline": "OK"
         })
-        ctx.setdefault("health_trend", "STABLE") # Mocked for now, needs historical comparison
+        context.setdefault("health_trend", "STABLE") # Mocked for now, needs historical comparison
 
         # ── A. Sequence engine ──────────────────────────────────────────────
         sequence_detections: List[Dict[str, Any]] = []
@@ -480,24 +519,24 @@ def run_full_pipeline(
                 sequence_detections = deduplicate_chains(deduped_seqs)
 
                 if sequence_detections:
-                    ctx.setdefault("detections", [])
-                    ctx["detections"] = list(ctx["detections"]) + sequence_detections
-                    ctx["detections_count"] = len(ctx["detections"])
+                    context.setdefault("detections", [])
+                    context["detections"] = list(context["detections"]) + sequence_detections
+                    context["detections_count"] = len(context["detections"])
 
             except Exception as exc:
                 log.error("[Pipeline] [STAGE] Sequence engine failed: %s", exc, exc_info=True)
             
         # --- Ensure sequence detections are visible to UI ---
-        detections = ctx.get("detections", [])
-        ctx["sequence_detections"] = [
+        detections = context.get("detections", [])
+        context["sequence_detections"] = [
             d for d in detections if d.get("detection_source") == "sequence" or d.get("is_sequence")
         ]
-        if not ctx["sequence_detections"] and ctx.get("detections_count", 0) > 0:
+        if not context["sequence_detections"] and context.get("detections_count", 0) > 0:
             # We have rules but no sequences; this is normal but we track it
             pass
 
         # ── B. Apply feedback suppressions ─────────────────────────────────
-        bursts = list(ctx.get("timeline", []) or [])
+        bursts = list(context.get("timeline", []) or [])
         if bursts:
             try:
                 from dashboard.feedback_engine import load_suppressions, apply_feedback_adjustment
@@ -506,17 +545,16 @@ def run_full_pipeline(
                     for burst in bursts:
                         delta, reason = apply_feedback_adjustment(burst, suppressions)
                         if delta != 0:
-                            old = burst.get("risk_score", 0)
-                            burst["risk_score"] = max(0, min(100, old + delta))
+                            burst["feedback_delta"] = delta
                             burst.setdefault("confidence_reasons", [])
                             burst["confidence_reasons"].append(f"Feedback adjustment {delta:+d}: {reason}")
             except Exception as exc:
                 log.warning("[Pipeline] Feedback engine failed: %s", exc)
 
-        ctx["timeline"] = bursts
+        context["timeline"] = bursts
 
         # ── C. Re-prioritise burst aggregates with sequence boost ───────────
-        burst_aggregates = list(ctx.get("burst_aggregates", []) or [])
+        burst_aggregates = list(context.get("burst_aggregates", []) or [])
         seq_by_image: Dict[str, int] = {}
         for sd in sequence_detections:
             img  = (sd.get("image") or "").lower()
@@ -528,29 +566,32 @@ def run_full_pipeline(
             seq_boost = seq_by_image.get(img, 0)
             if seq_boost > 0:
                 old = float(ba.get("peak_score") or ba.get("risk_score") or 0.0)
-                ba["peak_score"] = min(100.0, old + seq_boost // 5)
+                behavior = float(ba.get("behavior_score", 0))
+                # Normalized + Bounded Sequence Boost (v3.1)
+                boost = min(10.0, (seq_boost / 10.0) * (0.5 + behavior))
+                ba["peak_score"] = min(100.0, old + boost)
                 ba["has_sequence_detection"] = True
 
-        ctx["burst_aggregates"] = prioritise_bursts(burst_aggregates)
+        context["burst_aggregates"] = prioritise_bursts(burst_aggregates)
 
         # --- Execute correlation (FIX 8) ---
         try:
             from dashboard.correlation_engine import correlate_bursts, deduplicate_chains
-            all_dets = ctx.get("detections", [])
+            all_dets = context.get("detections", [])
             _, campaigns = correlate_bursts(all_dets, run_id=run_id)
             campaigns = deduplicate_chains(campaigns)
-            ctx["correlation_campaigns"] = campaigns
+            context["correlation_campaigns"] = campaigns
         except Exception as exc:
             log.error("[Pipeline] [STAGE] Correlation engine failed: %s", exc, exc_info=True)
             campaigns = []
-            ctx["analysis_integrity"]["correlation"] = "FAILED"
-            ctx["correlation_status"] = "failed"
+            context["analysis_integrity"]["correlation"] = "FAILED"
+            context["correlation_status"] = "failed"
             
         # --- Qualified SUSPICIOUS_EMPTY check (10/10) ---
-        det_count = ctx.get("detections_count", 0)
-        seq_count = len(ctx.get("sequence_detections", []))
+        det_count = context.get("detections_count", 0)
+        seq_count = len(context.get("sequence_detections", []))
         if det_count > 5 and seq_count > 0 and len(campaigns) == 0:
-            ctx["correlation_status"] = "SUSPICIOUS_EMPTY"
+            context["correlation_status"] = "SUSPICIOUS_EMPTY"
             log.warning("[Pipeline] Correlation is SUSPICIOUS_EMPTY (dets=%d, seqs=%d)", det_count, seq_count)
 
         # ── E. Burst-Level De-duplication (The UI Truth Fix) ──────────────────
@@ -566,83 +607,144 @@ def run_full_pipeline(
             if kc_rank.get(stage, 0) > kc_rank.get(highest_stage, 0):
                 highest_stage = stage
         
-        ctx["events_by_severity"] = dict(kill_chain_counts)
-        ctx["highest_kill_chain"] = highest_stage
+        context["events_by_severity"] = dict(kill_chain_counts)
+        context["highest_kill_chain"] = highest_stage
         
         # ── F. Sigmoid Confidence Decay (The 10/10 Truth) ───────────────────
         try:
             import math
-            burst_aggregates = ctx.get("burst_aggregates", [])
-            
-            # 1. Normalize and sync risk scores
+            # 1. Feedback Integration & Score Normalization (v3.1)
             valid_scores = []
             for b in burst_aggregates:
-                # Sync peak/risk score
-                bs = float(b.get("peak_score") or b.get("risk_score") or 0.0)
-                bs = min(max(bs, 0.0), 100.0)
-                b["risk_score"] = bs
-                if bs >= 45:
-                    valid_scores.append(bs)
+                # Use adjusted_score (feedback-aware) if available (v3.3)
+                base_score = float(
+                    b["adjusted_score"] if b.get("adjusted_score") is not None
+                    else (b.get("peak_score") or b.get("risk_score") or 0.0)
+                )
+                feedback = float(b.get("feedback_delta", 0.0))
+                
+                adjusted_score = max(0.0, min(100.0, base_score + feedback))
+                b["adjusted_score"] = adjusted_score # Sync for UI aggregation
+                
+                if adjusted_score >= 45:
+                    valid_scores.append(adjusted_score)
 
-            # 2. Sigmoid Decay Calculation
-            n = Decimal(str(len(valid_scores)))
-            if n == 0:
-                avg_top = Decimal(str(max([float(b.get("risk_score", 0)) for b in burst_aggregates], default=0.0)))
-                attack_conf_score_dec = avg_top * Decimal("0.5")
+            # 2. Sigmoid Decay Calculation (v3.3 Standards)
+            n_val = Decimal(str(len(valid_scores)))
+            if n_val == 0:
+                max_risk = max([float(b.get("adjusted_score") or b.get("risk_score", 0)) for b in burst_aggregates], default=0.0)
+                avg_top = Decimal(str(max_risk))
+                raw_score_dec = avg_top * Decimal("0.5")
             else:
                 top_3 = sorted(valid_scores, reverse=True)[:3]
                 avg_top = Decimal(str(sum(top_3))) / Decimal(str(len(top_3)))
-                decay = Decimal("1.0") - (Decimal("1.0") / (Decimal("1.0") + n))
-                attack_conf_score_dec = avg_top * decay
+                decay = Decimal("1.0") - (Decimal("1.0") / (Decimal("1.0") + n_val))
+                raw_score_dec = avg_top * decay
 
             # 3. Finite & Non-negative guards
-            attack_conf_score_dec = attack_conf_score_dec.quantize(Decimal("0.0001"), ROUND_HALF_UP)
-            attack_conf_score = float(attack_conf_score_dec)
+            raw_score_dec = raw_score_dec.quantize(Decimal("0.0001"), ROUND_HALF_UP)
             
-            # 4. Global constraints
-            max_any = Decimal(str(max([float(b.get("risk_score", 0)) for b in burst_aggregates], default=0.0)))
-            attack_conf_score = float(min(attack_conf_score_dec, max_any))
+            # 4. Consistency & Pattern Boost (Driver-Specific v3.3)
+            drivers = [b.get("primary_driver", "rule") for b in burst_aggregates if float(b.get("adjusted_score") or b.get("risk_score", 0)) >= 30]
+            if drivers:
+                from collections import Counter
+                counts = Counter(drivers)
+                dominant, count = counts.most_common(1)[0]
+                consistency = count / max(1, len(drivers))
+                
+                # Standardized Evidence filtering (v3.3)
+                relevant = [b for b in burst_aggregates if float(b.get("adjusted_score") or b.get("risk_score", 0)) >= 30]
+                
+                # Signal-specific strength
+                if dominant == "behavior":
+                    avg_strength = sum(b.get("behavior_score", 0) for b in relevant) / max(1, len(relevant))
+                elif dominant == "correlation" or dominant == "campaign":
+                    avg_strength = sum(b.get("correlation_strength", 0) for b in relevant) / (100 * max(1, len(relevant)))
+                else:
+                    avg_strength = 0.5
+                
+                if consistency > 0.7 and avg_strength > 0.5:
+                    raw_score_dec += Decimal("5.0")
+                    context["pattern_consistency"] = "STRONG"
 
-            # ── [10/10] Hierarchical Integrity Multipliers ─────────────────────
-            integrity = ctx["analysis_integrity"]
-            multiplier = Decimal("1.0")
+            # 5. Global Constraint (Bounded by max burst)
+            max_any = Decimal(str(max([float(b.get("adjusted_score") or b.get("risk_score", 0)) for b in burst_aggregates], default=0.0)))
+            bounded_score = max(raw_score_dec, max_any)
+
+            # 6. Weighted Confidence Modifier (Trimmed-Min v3.1)
+            conf_mods = [float(b.get("confidence_modifier", 1.0)) for b in burst_aggregates]
+            if conf_mods:
+                mods = sorted(conf_mods)
+                avg_mod = sum(mods) / len(mods)
+                trimmed_min = mods[1] if len(mods) > 2 else min(mods)
+                effective_mod = (0.8 * avg_mod) + (0.2 * trimmed_min)
+            else:
+                effective_mod = 1.0
+
+            # 7. Final Pipeline Hierarchy Multipliers
+            integrity = context["analysis_integrity"]
+            multiplier = Decimal(str(effective_mod))
             
             if integrity.get("rule") == "FAILED": multiplier *= Decimal("0.5")
             if integrity.get("sequence") == "FAILED": multiplier *= Decimal("0.7")
             if integrity.get("correlation") == "FAILED": multiplier *= Decimal("0.85")
             
-            if ctx.get("correlation_status") == "SUSPICIOUS_EMPTY":
+            if context.get("correlation_status") == "SUSPICIOUS_EMPTY":
                 scaler = Decimal(str(min(1.0, (det_count + seq_count) / 20.0)))
                 multiplier *= (Decimal("1.0") - (Decimal("0.15") * scaler))
 
-            attack_conf_score = float((Decimal(str(attack_conf_score)) * multiplier).quantize(Decimal("1"), ROUND_HALF_UP))
+            final_score_dec = (bounded_score * multiplier).quantize(Decimal("1"), ROUND_HALF_UP)
             
             # Catastrophic Override (10/10)
             critical_fails = sum(1 for k, v in integrity.items() if v == "FAILED" and k in ["rule", "sequence"])
             if critical_fails >= 2:
-                attack_conf_score = min(attack_conf_score, 50.0)
-                ctx["severity_label_override"] = "UNTRUSTWORTHY_RESULT"
+                final_score_dec = min(final_score_dec, Decimal("50"))
+                context["severity_label_override"] = "UNTRUSTWORTHY_RESULT"
 
-            ctx["attack_conf_score"] = int(attack_conf_score)
+            context["attack_conf_score"] = int(final_score_dec)
+            attack_conf_score = int(final_score_dec) # Local for narrative
             
-            # Calculate confidence score based on detections and correlations
-            conf = float(len(ctx.get("detections", [])) * 5.0 + len(campaigns or []) * 5.0)
-            if len(ctx.get("baseline_execution_context", [])) >= 100: conf += 20.0
-            confidence = min(100.0, conf)
-            ctx["confidence_score"]  = int(confidence)
+            # 8. Confidence Score (v2.8 Integration)
+            conf_val = float(len(context.get("detections", [])) * 5.0 + len(campaigns or []) * 5.0)
+            if len(context.get("baseline_execution_context", [])) >= 100: conf_val += 20.0
+            confidence_final = min(100.0, conf_val * effective_mod)
+            context["confidence_score"]  = int(confidence_final)
+            confidence_score = int(confidence_final) # Local for narrative
 
-            if ctx.get("incident"):
-                ctx["incident"]["score"] = int(attack_conf_score)
+            # ── [10/10] System Health Integration ─────────────────────────
+            # Dampen all final scores if bursts indicate degraded engine health (v3.3)
+            low_health = [b for b in burst_aggregates if float(b.get("system_health", 100)) < 70]
+            if low_health and burst_aggregates:
+                ratio = len(low_health) / len(burst_aggregates)
+                penalty = 0.9 - (0.1 * ratio)  # dynamic penalty (scaling from 0.8 to 0.9)
+                
+                # Apply penalty to both signal strength and reliability
+                attack_conf_score = int(float(attack_conf_score) * penalty)
+                confidence_score  = int(float(confidence_score) * penalty)
+                
+                context["attack_conf_score"] = attack_conf_score
+                context["confidence_score"]  = confidence_score
+                
+                log.warning("[Pipeline] 10/10 Lock: Scores dampened by %.1f%% due to engine health issues (%d/%d bursts degraded)", 
+                            (1.0 - float(penalty)) * 100, len(low_health), len(burst_aggregates))
+
+            # Metadata for decision logic
+            behaviors = [float(b.get("behavior_score", 0)) for b in burst_aggregates]
+            context["max_behavior"] = max(behaviors) if behaviors else 0.0
+            context["avg_behavior"] = sum(behaviors) / max(1, len(behaviors))
+
+            if context.get("incident"):
+                context["incident"]["score"] = attack_conf_score
                 _lvl = "High" if attack_conf_score >= 75 else "Medium" if attack_conf_score >= 50 else "Low" if attack_conf_score > 0 else "None"
-                ctx["incident"]["severity"] = _lvl
+                context["incident"]["severity"] = _lvl
                 try:
                     from dashboard.analysis_engine import upsert_incident_row
-                    upsert_incident_row(ctx["incident"]["incident_id"], "Open", _lvl.lower(), int(attack_conf_score), str(ctx.get("analysis_run_id") or run_id))
+                    upsert_incident_row(context["incident"]["incident_id"], "Open", _lvl.lower(), attack_conf_score, str(context.get("analysis_run_id") or run_id))
                 except Exception as e: log.warning("[Pipeline] Failed to update incident: %s", e)
         except Exception as exc:
             log.error("[Pipeline] [STAGE] Scoring engine failed: %s", exc, exc_info=True)
-            ctx.setdefault("attack_conf_score", 0)
-            ctx.setdefault("confidence_score", 0)
+            context.setdefault("attack_conf_score", 0)
+            context.setdefault("confidence_score", 0)
 
         # ── [10/10 EXPERT] Adaptive Link Depth & Breadth ───────────────────
         # Limit incident_links by both depth (max 3) and total nodes (breadth)
@@ -691,12 +793,18 @@ def run_full_pipeline(
                 if edge.get("from_stage") and edge.get("from_stage") != "Background": kill_chain_progression.add(edge["from_stage"])
                 if edge.get("to_stage") and edge.get("to_stage") != "Background": kill_chain_progression.add(edge["to_stage"])
         
-        kill_chain_path = sorted(list(kill_chain_progression), key=lambda x: kc_rank.get(x, 0))
+        # 9.8/10 Mastery: Proactive Fallback
+        kill_chain_path = context.get("kill_chain_path")
+        if kill_chain_path is None:
+            log.warning("[Pipeline] kill_chain_path missing - using empty fallback")
+            kill_chain_path = []
+
         if kill_chain_path:
-            ctx["highest_kill_chain"] = " → ".join(kill_chain_path)
+            context["kill_chain_path"] = kill_chain_path
+            context["highest_kill_chain"] = kill_chain_path[-1]
             global_stage = kill_chain_path[-1]
         else:
-            ctx["highest_kill_chain"] = "Background"
+            context["highest_kill_chain"] = "Background"
             global_stage = "Background"
 
         # Non-destructive alignment (stage_hint)
@@ -708,7 +816,7 @@ def run_full_pipeline(
                 b["stage_hint"] = None
             
         # ── F. Timeline reasoning injection ─────────────────────────────────
-        total_baseline_events = len(ctx.get("baseline_execution_context", []))
+        total_baseline_events = len(context.get("baseline_execution_context", []))
         suspicious_processes = {"cmd.exe", "powershell.exe", "schtasks.exe", "wmic.exe", "certutil.exe", "mshta.exe"}
         
         for burst in bursts:
@@ -729,21 +837,31 @@ def run_full_pipeline(
             burst["reason"] = reason
 
         # ── G. Decision layer ───────────────────────────────────────────────
-        ctx["correlation_count"] = sum(len(c.get("edges", [])) for c in campaigns)
-        dec_input  = {
-            "attack_conf_score":   ctx.get("attack_conf_score", 0),
+        context["correlation_count"] = sum(len(c.get("edges", [])) for c in campaigns)
+        dec_input = {
+            "attack_conf_score":   context.get("attack_conf_score", 0),
             "highest_kill_chain":  global_stage,
             "has_persistence":     any(b.get("has_persistence") for b in bursts),
             "has_injection":       any(b.get("has_injection") for b in bursts),
-            "detections_count":    ctx.get("detections_count", 0),
-            "correlation_count":   ctx["correlation_count"],
+            "detections_count":    context.get("detections_count", 0),
+            "correlation_count":   context["correlation_count"],
             "sequence_hits":       len(sequence_detections),
+            "campaigns":           len(campaigns),
         }
+
+        log.info(
+            "[DecisionInput] score=%s seq_hits=%s stage=%s campaigns=%s",
+            dec_input.get("attack_conf_score"),
+            dec_input.get("sequence_hits"),
+            dec_input.get("highest_kill_chain"),
+            dec_input.get("campaigns"),
+        )
+
         decision = compute_decision(dec_input)
-        ctx["recommended_action"] = decision["action"]
-        ctx["action_reason"]      = decision["reason"]
-        ctx["action_priority"]    = decision["priority"]
-        ctx["response_tasks"]     = decision["response_tasks"]
+        context["recommended_action"] = decision["action"]
+        context["action_reason"]      = decision["reason"]
+        context["action_priority"]    = decision["priority"]
+        context["response_tasks"]     = decision["response_tasks"]
 
         # ── H. Pattern-aware IOC Extraction (FIX 12 refined) ──────────────────
         try:
@@ -765,20 +883,25 @@ def run_full_pipeline(
                         if len(c) > 20 or "enc" in c.lower() or "-nop" in c.lower()
                     ]
                 }
-                ctx["iocs"] = filtered
+                context["iocs"] = filtered
         except Exception as e: log.warning("[Pipeline] IOC extraction failed: %s", e)
 
         # ── I. Attack narrative & Sessions ─────────────────────────────────────
-        narrative = build_attack_narrative(bursts, campaigns, sequence_detections, ctx)
-        _stats = f"Confidence: {int(confidence)}\nScore: {int(attack_conf_score)}\nReason:"
+        narrative = build_attack_narrative(bursts, campaigns, sequence_detections, context)
+        # Use localized variables from scoring block (v3.1)
+        conf_val = context.get("confidence_score", 0)
+        score_val = context.get("attack_conf_score", 0)
+        _stats = f"Confidence: {int(conf_val)}\nScore: {int(score_val)}\nReason:"
         narrative["full_text"] = _stats + "\n- " + "\n- ".join(narrative["bullets"])
-        ctx["attack_narrative"] = narrative
+        # ── [10/10] Kill Chain Guarantee ──────────────────────────────────
+        narrative["kill_chain"] = kill_chain_path or []
+        context["attack_narrative"] = narrative
         
         # Session Grouping (FIX 14)
-        ctx["attack_sessions"] = group_sessions(bursts)
+        context["attack_sessions"] = group_sessions(bursts)
 
         # [10/10 EXPERT] Global Component Health (Hard Overrides)
-        integrity = ctx["analysis_integrity"]
+        integrity = context["analysis_integrity"]
         rule_failed = integrity.get("rule") == "FAILED"
         seq_failed = integrity.get("sequence") == "FAILED"
         corr_failed = integrity.get("correlation") == "FAILED"
@@ -791,35 +914,35 @@ def run_full_pipeline(
         if corr_failed: health_pct -= 20.0
         
         if rule_failed:
-            ctx["system_health_label"] = "CRITICAL DEGRADED"
-            ctx["urgency"] = "HIGH"
-            ctx["require_manual_confirmation"] = True
+            context["system_health_label"] = "CRITICAL DEGRADED"
+            context["urgency"] = "HIGH"
+            context["require_manual_confirmation"] = True
         elif seq_failed or corr_failed:
-            ctx["system_health_label"] = "DEGRADED"
+            context["system_health_label"] = "DEGRADED"
         else:
-            ctx["system_health_label"] = "HEALTHY"
+            context["system_health_label"] = "HEALTHY"
             
-        ctx["final_system_health_pct"] = max(0, int(health_pct))
-        ctx["final_system_confidence"] = float(ctx.get("confidence_score", 100)) * (health_pct / 100.0)
+        context["final_system_health_pct"] = max(0, int(health_pct))
+        context["final_system_confidence"] = float(context.get("confidence_score", 100)) * (health_pct / 100.0)
 
-        score = ctx.get("attack_conf_score", 0)
+        score = context.get("attack_conf_score", 0)
         level = ("High" if score >= 75 else "Medium" if score >= 45 else "Low" if score > 0 else "None")
         
         # Catastrophic Label override
-        if ctx.get("severity_label_override"):
-            level = f"{level} ({ctx['severity_label_override']})"
+        if context.get("severity_label_override"):
+            level = f"{level} ({context['severity_label_override']})"
             
-        ctx["attack_conf_level"] = level
-        ctx["is_alertable"] = score >= 45
+        context["attack_conf_level"] = level
+        context["is_alertable"] = score >= 45
 
         log.info("[Pipeline] Complete: score=%d level=%s action=%s health=%d%s", 
-                 ctx.get("attack_conf_score", 0), level, decision["action"], 
-                 ctx.get("confidence_score", 0), ctx.get("system_health_label", ""))
+                 context.get("attack_conf_score", 0), level, decision["action"], 
+                 context.get("confidence_score", 0), context.get("system_health_label", ""))
 
     except Exception as exc:
         log.error("[Pipeline] FATAL: Pipeline crashed: %s", exc, exc_info=True)
-        ctx["pipeline_status"] = "CRASHED"
-        ctx["system_health_label"] = "PIELINE CRITICAL FAILURE"
+        context["pipeline_status"] = "CRASHED"
+        context["system_health_label"] = "PIELINE CRITICAL FAILURE"
         # Ensure we don't hide the crash from calling layers if they expect it
         raise
     finally:
@@ -834,11 +957,11 @@ def run_full_pipeline(
 
     # ── [10/10] Formal Proof: Minimal Sufficiency ─────────────────────────
     try:
-        validate_minimal_truth(ctx)
+        validate_minimal_truth(context)
         log.info("[Pipeline] Formal Correctness Proof: VERIFIED for run_id=%s", run_id)
     except AssertionError as ae:
         log.error("[Pipeline] Formal Correctness Proof: FAILED for run_id=%s: %s", run_id, ae)
-        ctx["pipeline_status"] = "INVALID"
-        ctx["system_health_label"] = "LOGICAL INVARIANT VIOLATION"
+        context["pipeline_status"] = "INVALID"
+        context["system_health_label"] = "LOGICAL INVARIANT VIOLATION"
 
-    return ctx
+    return context

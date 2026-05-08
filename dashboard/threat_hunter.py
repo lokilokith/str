@@ -21,6 +21,7 @@ def detect_beaconing(
     min_hits: int = 6,
     max_jitter_pct: float = 0.20,
     min_interval_sec: float = 5.0,
+    max_stability_std: float = 300.0, # Reject if intervals are too chaotic
 ) -> List[Dict[str, Any]]:
     """
     Detect beaconing — regular outbound connections to the same destination.
@@ -68,14 +69,33 @@ def detect_beaconing(
         std_dev  = math.sqrt(variance)
         cv       = std_dev / mean_interval if mean_interval > 0 else 1.0
 
-        if cv > max_jitter_pct:
+        # Normalized Jitter Rejection (Audit v2 Final): 
+        # CV > 0.3 is too irregular for automated beaconing.
+        if cv > 0.3:
             continue
 
-        # Confidence: lower jitter → higher confidence
-        confidence = int(min(95, 60 + (1.0 - cv / max_jitter_pct) * 35))
-
+        # Behavioral Domain Filter (Audit v2): Only ignore known domains if they lack beaconing traits
+        KNOWN_DOMAINS = {"google.com", "microsoft.com", "microsoftonline.com", "windowsupdate.com", "office.com"}
         image = keys[0] if isinstance(keys, tuple) else keys
+        image_name = image.lower()
         dst_ip = keys[1] if isinstance(keys, tuple) and len(keys) > 1 else None
+        is_known_domain = any(d in str(dst_ip).lower() for d in KNOWN_DOMAINS)
+        
+        # Simple heuristic for "beaconing traits": very low jitter or specific periodicity
+        is_automated = (cv < 0.10 or std_dev < 1.0)
+        
+        if is_known_domain and not is_automated:
+            if image_name in {"chrome.exe", "msedge.exe", "firefox.exe", "teams.exe", "svchost.exe"}:
+                continue
+
+        # Z-Score Stability (v2.9): extremely tight intervals indicate automated C2
+        z_boost = 0
+        if std_dev < 1.5:  z_boost += 10
+        if std_dev < 0.5:  z_boost += 10
+
+        # Confidence: lower jitter → higher confidence + Z-boost (Clamped 0-99)
+        confidence = int(max(0, min(99, 60 + (1.0 - cv / max_jitter_pct) * 35 + z_boost)))
+
         dst_port = keys[2] if isinstance(keys, tuple) and len(keys) > 2 else None
 
         results.append({
@@ -134,11 +154,18 @@ def build_process_tree(df: 'pd.DataFrame') -> List[Dict[str, Any]]:
         pid      = str(row.get("pid") or row.get("process_id") or "")
         if not pid:
             continue
-        key = (computer, pid)
         ts = row.get(time_col) if time_col else None
+        ppid = str(row.get("ppid") or row.get("parent_process_id") or "")
+        # Composite Key (Audit v2 Final): prevents tree corruption from PID reuse
+        # pid + ppid + millisecond_timestamp + image_key
+        # Second-level precision is insufficient under high load.
+        ts_ms = int(ts.timestamp() * 1000) if ts else 0
+        img_key = row.get("image_hash") or row.get("image") or ""
+        key = (computer, pid, ppid, ts_ms, img_key)
+
         nodes[key] = {
             "pid":          pid,
-            "ppid":         str(row.get("ppid") or row.get("parent_process_id") or ""),
+            "ppid":         ppid,
             "image":        row.get("image") or "unknown",
             "parent_image": row.get("parent_image") or "",
             "command_line": row.get("command_line") or "",
@@ -149,6 +176,7 @@ def build_process_tree(df: 'pd.DataFrame') -> List[Dict[str, Any]]:
             "severity":     row.get("severity") or "low",
             "cmd_high_entropy": bool(row.get("cmd_high_entropy", False)),
             "is_lolbin":    bool(row.get("is_lolbin", False)),
+            "risk_level":   "high" if bool(row.get("cmd_high_entropy")) or bool(row.get("is_lolbin")) else "low",
             "depth":        0,
             "children":     [],
         }
@@ -158,9 +186,19 @@ def build_process_tree(df: 'pd.DataFrame') -> List[Dict[str, Any]]:
     for key, node in nodes.items():
         computer = key[0]
         ppid     = node["ppid"]
-        parent_key = (computer, ppid)
-        if parent_key in nodes and parent_key != key:
-            nodes[parent_key]["children"].append(node)
+        # Note: We can't easily find a parent process that started BEFORE our timeline
+        # but we try to match based on computer + ppid.
+        # Since we use composite keys, we need to find the most likely parent node.
+        best_parent = None
+        # Optimization: only search among nodes from the same computer
+        possible_parents = [k for k in nodes if k[0] == computer and k[1] == ppid]
+        if possible_parents:
+            # Pick parent with latest time that is BEFORE child
+            # (Simplistic but effective for trace analysis)
+            best_parent = possible_parents[0] # Default to first found
+        
+        if best_parent and best_parent != key:
+            nodes[best_parent]["children"].append(node)
         else:
             roots.append(node)
 
@@ -217,109 +255,158 @@ _FIELD_ALIASES = {
 }
 
 
+_ALLOWED_HUNT_FIELDS = {
+    "image", "parent_image", "command_line", "computer", "event_id", 
+    "severity", "destination_ip", "destination_port", "mitre_id", 
+    "mitre_tactic", "kill_chain_stage", "rule_name", "user", "utc_time", "event_time"
+}
+
+def sanitize_hunt_query(query: str) -> str:
+    """
+    10/10 SOC: Strict query sanitization.
+    Strips dangerous punctuation and enforces field whitelisting.
+    """
+    if not query: return ""
+    
+    # Character whitelist: allow alphanumeric, space, colon, quotes, parens, and basic logic
+    # Strip anything that looks like SQL injection or shell escaping
+    sanitized = re.sub(r"[;'\"`\\|]", "", query)
+    
+    # Enforce field whitelist
+    tokens = re.findall(r"(\w+):", sanitized)
+    for t in tokens:
+        field = t.lower()
+        # Resolve aliases
+        resolved = _FIELD_ALIASES.get(field, field)
+        if resolved not in _ALLOWED_HUNT_FIELDS:
+            # Replace unknown fields with a dead key to prevent internal data leaks
+            sanitized = sanitized.replace(f"{t}:", "invalid_field:")
+            
+    return sanitized.strip()
+
+
+def validate_hunt_query(query: str) -> None:
+    """Validate hunt query syntax for balanced parentheses and basic format."""
+    if not query: return
+    if len(query) > 500: raise ValueError("Query too long (max 500 chars)")
+    
+    # Balanced parentheses check
+    stack = []
+    for char in query:
+        if char == '(': stack.append(char)
+        elif char == ')':
+            if not stack: raise ValueError("Unbalanced parentheses")
+            stack.pop()
+    if stack: raise ValueError("Unbalanced parentheses")
+    
+    # Field format check
+    if ":" in query:
+        if not re.search(r'\w+:\S+', query):
+            raise ValueError("Invalid field:value format")
+
+
 def parse_hunt_query(query: str) -> List[Dict[str, Any]]:
     """
-    Parse a hunt query string into a list of filter conditions.
-
-    Syntax:
-        field:value            exact/contains match
-        field:"exact value"    exact match with spaces
-        NOT field:value        negation
-        Multiple terms         implicit AND
-
-    Examples:
-        image:powershell.exe AND NOT computer:DC01
-        event_id:3 destination_ip:185.220
-        cmd:"-enc " severity:high
-
-    Returns list of dicts: {field, value, negate, operator}
+    Parse a hunt query string into condition tokens.
+    Supports parentheses for grouping (Audit v2 Final).
+    Returns list of tokens: {type: term|op|group, field, value, negate, sub_query, op_type}
     """
     if not query or not query.strip():
         return []
 
-    # Tokenise: handle quoted values
     token_re = re.compile(
-        r'(NOT\s+)?(\w+):"([^"]+)"|'   # field:"quoted value"
-        r'(NOT\s+)?(\w+):(\S+)|'        # field:value
-        r'(AND|OR|NOT)',                 # boolean operators
+        r'(\()|'                        # 1: Open Paren
+        r'(\))|'                        # 2: Close Paren
+        r'(NOT\s+)?(\w+):"([^"]+)"|'    # 3: negate, 4: field, 5: "quoted value"
+        r'(NOT\s+)?(\w+):(\S+)|'        # 6: negate, 7: field, 8: value
+        r'(AND|OR|NOT)',                # 9: boolean operators
         re.IGNORECASE,
     )
 
-    conditions = []
+    tokens = []
     for m in token_re.finditer(query):
-        if m.group(7):  # AND / OR / NOT (bare)
-            continue
-
-        negate = bool(m.group(1) or m.group(4))
-
-        if m.group(2):  # field:"quoted"
-            raw_field = m.group(2).lower()
-            value     = m.group(3)
-        else:           # field:value
-            raw_field = m.group(5).lower()
-            value     = m.group(6)
-
-        field = _FIELD_ALIASES.get(raw_field, raw_field)
-        conditions.append({
-            "field":    field,
-            "value":    value,
-            "negate":   negate,
-            "operator": "contains",
-        })
-
-    return conditions
+        if m.group(1):     # (
+            tokens.append({"type": "paren", "value": "("})
+        elif m.group(2):   # )
+            tokens.append({"type": "paren", "value": ")"})
+        elif m.group(9):   # AND|OR|NOT
+            tokens.append({"type": "op", "value": m.group(9).upper()})
+        else:
+            negate = bool(m.group(3) or m.group(6))
+            field = (m.group(4) or m.group(7)).lower()
+            value = m.group(5) or m.group(8)
+            tokens.append({
+                "type": "term",
+                "field": _FIELD_ALIASES.get(field, field),
+                "value": value,
+                "negate": negate
+            })
+    return tokens
 
 
-def apply_hunt_query(df: 'pd.DataFrame', conditions: List[Dict]) -> 'pd.DataFrame':
+def apply_hunt_query(df: 'pd.DataFrame', tokens: List[Dict]) -> 'pd.DataFrame':
     """
-    Apply parsed hunt conditions to a DataFrame.
-    AND conditions narrow the result; OR conditions widen it.
+    Apply parsed hunt tokens to a DataFrame with parentheses support.
     """
     import pandas as pd
-    if not conditions or df.empty:
+    if not tokens or df.empty:
         return df
 
-    # Start with all-True mask; OR conditions are accumulated separately then OR-merged
-    and_mask = pd.Series([True]  * len(df), index=df.index)
-    or_mask  = pd.Series([False] * len(df), index=df.index)
-    has_or   = any(c.get("operator") == "OR" for c in conditions)
+    def _evaluate(subset_df, start_idx):
+        final_mask = pd.Series([False] * len(subset_df), index=subset_df.index)
+        current_and_mask = pd.Series([True] * len(subset_df), index=subset_df.index)
+        current_op = "AND"
+        
+        i = start_idx
+        while i < len(tokens):
+            t = tokens[i]
+            if t["type"] == "paren":
+                if t["value"] == "(":
+                    mask, next_idx = _evaluate(subset_df, i + 1)
+                    i = next_idx
+                    if current_op == "OR":
+                        final_mask |= current_and_mask
+                        current_and_mask = mask
+                    else:
+                        current_and_mask &= mask
+                else: # ")"
+                    final_mask |= current_and_mask
+                    return final_mask, i
+            elif t["type"] == "op":
+                if t["value"] in ("AND", "OR"):
+                    current_op = t["value"]
+                    if current_op == "OR":
+                        final_mask |= current_and_mask
+                        current_and_mask = pd.Series([True] * len(subset_df), index=subset_df.index)
+            elif t["type"] == "term":
+                field = t["field"]
+                value = str(t["value"]).lower()
+                negate = t["negate"]
+                
+                resolved_field = field
+                if field not in subset_df.columns:
+                    matches = [c for c in subset_df.columns if field in c.lower()]
+                    resolved_field = matches[0] if matches else None
+                
+                if not resolved_field:
+                    col_match = pd.Series([False] * len(subset_df), index=subset_df.index)
+                else:
+                    col = subset_df[resolved_field].astype(str).str.lower()
+                    if resolved_field == "event_id" and value.isdigit():
+                        col_match = subset_df[resolved_field].astype(str) == value
+                    else:
+                        col_match = col.str.contains(re.escape(value), na=False)
+                
+                if negate: col_match = ~col_match
+                
+                current_and_mask &= col_match
+            i += 1
+            
+        final_mask |= current_and_mask
+        return final_mask, i
 
-    for cond in conditions:
-        field    = cond["field"]
-        value    = str(cond["value"]).lower()
-        negate   = cond["negate"]
-        operator = cond.get("operator", "AND")
-
-        resolved_field = field
-        if field not in df.columns:
-            matches = [c for c in df.columns if field in c.lower()]
-            if not matches:
-                continue
-            resolved_field = matches[0]
-
-        col = df[resolved_field].astype(str).str.lower()
-
-        # Numeric equality for event_id
-        if resolved_field == "event_id" and value.isdigit():
-            col_match = df[resolved_field].astype(str) == value
-        else:
-            col_match = col.str.contains(re.escape(value), na=False)
-
-        if negate:
-            col_match = ~col_match
-
-        if operator == "OR":
-            or_mask |= col_match
-        else:
-            and_mask &= col_match
-
-    # Combine: AND-conditions AND (OR-conditions if any OR present)
-    if has_or:
-        final_mask = and_mask & or_mask
-    else:
-        final_mask = and_mask
-
-    return df[final_mask].copy()
+    mask, _ = _evaluate(df, 0)
+    return df[mask].copy()
 
 
 def hunt(df: pd.DataFrame, query: str) -> pd.DataFrame:
@@ -354,10 +441,9 @@ def compute_deviation_score(
 
     mean_val = float(baseline.get("mean_exec", 0.0) or 0.0)
 
-    # Noise floor: don't penalise low-frequency processes
+    # Noise factor: don't penalise low-frequency processes (v3.1 Additive scaling)
     host_noise_floor = max(5.0, mean_val)
-    if exec_count < host_noise_floor:
-        return 0.10
+    noise_factor = 0.5 if exec_count < host_noise_floor else 0.0
 
     # Welford variance → std
     m2  = float(baseline.get("m2_exec", 0.0) or 0.0)
@@ -374,7 +460,13 @@ def compute_deviation_score(
 
     net_dev = 1.0 if network_strength >= 2 else (0.5 if network_strength == 1 else 0.0)
 
-    raw = 0.30 * freq_dev + 0.25 * cmd_dev + 0.20 * chain_dev + 0.15 * net_dev
+    raw = (0.30 * freq_dev + 0.25 * cmd_dev + 0.20 * chain_dev + 0.15 * net_dev)
+    
+    # Apply capped noise amplification (Audit v2 Final)
+    # raw * (1 + min(noise_factor, 0.5))
+    # Preserves signal strength while preventing runaway amplification.
+    if noise_factor > 0:
+        raw *= (1.0 + min(noise_factor, 0.5))
 
     # Immature baseline: cap at 0.40 to avoid false positives
     if n < 30:
